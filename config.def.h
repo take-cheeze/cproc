@@ -10,29 +10,10 @@ static char *endfiles[] = {
 	"-l", ":crtn.o",
 	"-l", "c",
 };
-
-static char *preprocesscmd[] = {
-		"cpp", "-P",
-
-		/* specify the GNU C extensions we support */
-		"-U", "__GNUC__", "-D", "__GNUC__=3",
-		"-U", "__GNUC_MINOR__", "-D", "__GNUC_MINOR__=3",
-
-		/* prevent glibc from using statement expressions for assert */
-		"-D", "__STRICT_ANSI__",
-
-		/* required for glibc headers */
-		"-D", "__restrict=restrict",
-		"-D", "__extension__=",
-		"-D", "__attribute__(x)=",
-		"-D", "__asm__(x)=",
-
-		/* required for kernel headers */
-		"-D", "__signed__=signed",
-
-		/* required for binutils */
-		"-D", "__alignof__=_Alignof",
+static char *incdirs[] = {
+	"/usr/include",
 };
+
 static char *compilecmd[] = {"cc-qbe"};
 static char *codegencmd[] = {"qbe"};
 static char *assemblecmd[] = {"as"};

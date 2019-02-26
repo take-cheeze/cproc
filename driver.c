@@ -118,7 +118,6 @@ spawnphase(struct phase *phase, int *fd, char *input, char *output, bool last)
 	int ret, pipefd[2];
 	posix_spawn_file_actions_t actions;
 
-	phase->cmd.len = phase->cmdbase;
 	if (output) {
 		arrayaddptr(&phase->cmd, "-o");
 		arrayaddptr(&phase->cmd, output);
@@ -150,6 +149,7 @@ spawnphase(struct phase *phase, int *fd, char *input, char *output, bool last)
 		close(pipefd[1]);
 	}
 	posix_spawn_file_actions_destroy(&actions);
+	phase->cmd.len = phase->cmdbase;
 
 	return 0;
 
@@ -192,6 +192,11 @@ buildobj(struct input *input, char *output, enum phaseid last)
 
 	if (input->phase > last || input->phase == LINK)
 		return;
+
+	if (first == PREPROCESS)
+		first = COMPILE;
+	else
+		; /* XXX: pass something like -fpreprocessed? */
 	if (last == LINK) {
 		last = ASSEMBLE;
 		output = strdup("/tmp/cc-XXXXXX");
@@ -204,7 +209,10 @@ buildobj(struct input *input, char *output, enum phaseid last)
 	} else if (output) {
 		if (strcmp(output, "-") == 0)
 			output = NULL;
-	} else if (last != PREPROCESS) {
+	} else if (last == PREPROCESS) {
+		arrayaddptr(&phases[COMPILE].cmd, "-E");
+		last = COMPILE;
+	} else {
 		switch (last) {
 		case COMPILE:  ext = "qbe"; break;
 		case CODEGEN:  ext = "s";   break;
@@ -332,7 +340,6 @@ main(int argc, char *argv[])
 	struct input *input;
 	size_t i;
 
-	arrayaddbuf(&phases[PREPROCESS].cmd, preprocesscmd, sizeof(preprocesscmd));
 	arrayaddbuf(&phases[COMPILE].cmd, compilecmd, sizeof(compilecmd));
 	arrayaddbuf(&phases[CODEGEN].cmd, codegencmd, sizeof(codegencmd));
 	arrayaddbuf(&phases[ASSEMBLE].cmd, assemblecmd, sizeof(assemblecmd));
@@ -340,6 +347,10 @@ main(int argc, char *argv[])
 	arg = compilecommand();
 	if (arg)
 		*(char **)phases[COMPILE].cmd.val = arg;
+	for (i = 0; i < LEN(incdirs); ++i) {
+		arrayaddptr(&phases[COMPILE].cmd, "-I");
+		arrayaddptr(&phases[COMPILE].cmd, incdirs[i]);
+	}
 
 	argv0 = progname(argv[0], "cc");
 	for (;;) {
@@ -367,10 +378,7 @@ main(int argc, char *argv[])
 		} else if (strcmp(arg, "-emit-qbe") == 0) {
 			last = COMPILE;
 		} else if (strcmp(arg, "-include") == 0 || strcmp(arg, "-idirafter") == 0) {
-			if (!--argc)
-				usage(NULL);
-			arrayaddptr(&phases[PREPROCESS].cmd, arg);
-			arrayaddptr(&phases[PREPROCESS].cmd, *++argv);
+			usage("option '%s' not yet supported", arg);
 		} else if (strcmp(arg, "-pipe") == 0) {
 			/* ignore */
 		} else if (strncmp(arg, "-std=", 5) == 0) {
@@ -385,8 +393,8 @@ main(int argc, char *argv[])
 				last = ASSEMBLE;
 				break;
 			case 'D':
-				arrayaddptr(&phases[PREPROCESS].cmd, "-D");
-				arrayaddptr(&phases[PREPROCESS].cmd, nextarg(&argv));
+				arrayaddptr(&phases[COMPILE].cmd, "-D");
+				arrayaddptr(&phases[COMPILE].cmd, nextarg(&argv));
 				break;
 			case 'E':
 				last = PREPROCESS;
@@ -395,8 +403,8 @@ main(int argc, char *argv[])
 				/* ignore */
 				break;
 			case 'I':
-				arrayaddptr(&phases[PREPROCESS].cmd, "-I");
-				arrayaddptr(&phases[PREPROCESS].cmd, nextarg(&argv));
+				arrayaddptr(&phases[COMPILE].cmd, "-I");
+				arrayaddptr(&phases[COMPILE].cmd, nextarg(&argv));
 				break;
 			case 'L':
 				arrayaddptr(&phases[LINK].cmd, "-L");
@@ -429,13 +437,13 @@ main(int argc, char *argv[])
 				arrayaddptr(&phases[LINK].cmd, "-s");
 				break;
 			case 'U':
-				arrayaddptr(&phases[PREPROCESS].cmd, "-U");
-				arrayaddptr(&phases[PREPROCESS].cmd, nextarg(&argv));
+				arrayaddptr(&phases[COMPILE].cmd, "-U");
+				arrayaddptr(&phases[COMPILE].cmd, nextarg(&argv));
 				break;
 			case 'W':
 				if (arg[2] && arg[3] == ',') {
 					switch (arg[2]) {
-					case 'p': cmd = &phases[PREPROCESS].cmd; break;
+					case 'p': cmd = &phases[COMPILE].cmd; break;
 					case 'a': cmd = &phases[ASSEMBLE].cmd; break;
 					case 'l': cmd = &phases[LINK].cmd; break;
 					default: usage(NULL);

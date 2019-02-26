@@ -16,12 +16,14 @@ struct buffer {
 struct scanner {
 	int chr;
 	bool usebuf;
+	bool sawspace;
 	FILE *file;
 	struct location loc;
 	struct buffer buf;
 	struct scanner *next;
 };
 
+enum scanflags scanflags;
 static struct scanner *scanner;
 
 static void
@@ -245,16 +247,36 @@ comment(struct scanner *s)
 	case '/':  /* C++-style comment */
 		do nextchar(s);
 		while (s->chr != '\n');
-		return true;
+		break;
 	case '*':  /* C-style comment */
 		nextchar(s);
 		do last = s->chr, nextchar(s);
 		while (last != '*' || s->chr != '/');
 		nextchar(s);
-		return true;
+		break;
 	default:
 		return false;
 	}
+	s->sawspace = true;
+	return true;
+}
+
+static int
+header(struct scanner *s)
+{
+	enum tokenkind tok;
+	int chr;
+
+	s->usebuf = true;
+	if (s->chr == '<')
+		tok = TSYSHDR, chr = '>';
+	else
+		tok = TLOCHDR, chr = '"';
+	do nextchar(s);
+	while (s->chr != chr);
+	nextchar(s);
+
+	return tok;
 }
 
 static int
@@ -269,12 +291,13 @@ again:
 	case '\t':
 	case '\f':
 	case '\v':
+		s->sawspace = true;
 		nextchar(s);
 		goto again;
 	case '!':
 		return op2(s, TLNOT, TNEQ);
 	case '"':
-		return stringlit(s);
+		return scanflags & SCANHEADER ? header(s) : stringlit(s);
 	case '#':
 		nextchar(s);
 		if (s->chr != '#')
@@ -285,7 +308,6 @@ again:
 		return op2(s, TMOD, TMODASSIGN);
 	case '&':
 		return op3(s, TBAND, TBANDASSIGN, TLAND);
-	// TODO: u8, U, and L string literals
 	case '\'':
 		return charconst(s);
 	case '*':
@@ -304,7 +326,7 @@ again:
 			goto again;
 		return tok;
 	case '<':
-		return op4(s, TLESS, TLEQ, TSHL, TSHLASSIGN);
+		return scanflags & SCANHEADER ? header(s) : op4(s, TLESS, TLEQ, TSHL, TSHLASSIGN);
 	case '=':
 		return op2(s, TASSIGN, TEQL);
 	case '>':
@@ -365,6 +387,17 @@ again:
 		return TCOMMA;
 	case EOF:
 		return TEOF;
+	/* XXX: u8 string literals */
+	case 'L':
+	case 'U':
+	case 'u':
+		s->usebuf = true;
+		nextchar(s);
+		switch (s->chr) {
+		case '\'': return charconst(s);
+		case '"':  return stringlit(s);
+		}
+		return ident(s);
 	default:
 		if (isdigit(s->chr))
 			return number(s);
@@ -408,6 +441,7 @@ scanfrom(const char *name)
 void
 scan(struct token *t)
 {
+	scanner->sawspace = false;
 	for (;;) {
 		t->loc = scanner->loc;
 		t->kind = scankind(scanner);
@@ -421,4 +455,6 @@ scan(struct token *t)
 	} else {
 		t->lit = NULL;
 	}
+	t->space = scanner->sawspace;
+	t->expand = true;
 }

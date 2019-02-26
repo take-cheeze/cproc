@@ -3,6 +3,8 @@ enum tokenkind {
 
 	TEOF,
 	TNEWLINE,
+	TSYSHDR,
+	TLOCHDR,
 
 	TIDENT,
 	TNUMBER,
@@ -114,6 +116,10 @@ struct location {
 
 struct token {
 	enum tokenkind kind;
+	/* whether or not the token was preceded by whitespace */
+	_Bool space;
+	/* whether or not the token is elligible for expansion */
+	_Bool expand;
 	struct location loc;
 	char *lit;
 };

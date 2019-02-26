@@ -28,6 +28,9 @@ main(int argc, char *argv[])
 	case 'E':
 		pponly = true;
 		break;
+	case 'I':
+		arrayaddptr(&incdirs, EARGF(usage()));
+		break;
 	case 'o':
 		output = EARGF(usage());
 		break;
@@ -40,7 +43,7 @@ main(int argc, char *argv[])
 	if (output && !freopen(output, "w", stdout))
 		fatal("open %s:", output);
 
-	ppinit(argv[0]);
+	ppinit(argv[0], pponly);
 	if (pponly) {
 		while (tok.kind != TEOF) {
 			tokprint(&tok);

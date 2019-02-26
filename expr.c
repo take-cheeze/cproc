@@ -250,12 +250,14 @@ inttype(uint64_t val, bool decimal, char *end)
 	struct type *t;
 	size_t i, step;
 
+	/*
 	for (i = 0; end[i]; ++i)
 		end[i] = tolower(end[i]);
+	*/
 	for (i = 0; i < LEN(limits); ++i) {
-		if (strcmp(end, limits[i].end1) == 0)
+		if (strcasecmp(end, limits[i].end1) == 0)
 			break;
-		if (limits[i].end2 && strcmp(end, limits[i].end2) == 0)
+		if (limits[i].end2 && strcasecmp(end, limits[i].end2) == 0)
 			break;
 	}
 	if (i == LEN(limits))
@@ -321,6 +323,7 @@ primaryexpr(struct scope *s)
 {
 	struct expression *e;
 	struct declaration *d;
+	struct type *t;
 	char *src, *dst, *end;
 	int base;
 
@@ -352,7 +355,15 @@ primaryexpr(struct scope *s)
 		e = decay(e);
 		break;
 	case TCHARCONST:
-		src = tok.lit + 1;
+		src = tok.lit;
+		switch (*src) {
+		case 'L': t = &typeint; ++src; break;
+		case 'U': t = &typeuint; ++src; break;
+		case 'u': t = &typeushort; ++src; break;
+		case '\'': t = &typeint; break;
+		default: fatal("invalid character constant");
+		}
+		++src;
 		e = mkconstexpr(&typeint, unescape(&src));
 		if (*src != '\'')
 			error(&tok.loc, "character constant contains more than one character: %c", *src);
