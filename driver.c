@@ -16,7 +16,7 @@
 
 #include "util.h"
 
-extern int pipe2(int[2], int);
+extern int pipe2(int[2], int);  /* accepted for next POSIX */
 
 enum phaseid {
 	PREPROCESS = 1,
