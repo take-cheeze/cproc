@@ -1,4 +1,4 @@
-enum declarationkind {
+enum declkind {
 	DECLTYPE,
 	DECLOBJECT,
 	DECLFUNC,
@@ -13,19 +13,20 @@ enum linkage {
 };
 
 enum builtinkind {
-	BUILTINVALIST,
-	BUILTINVASTART,
+	BUILTINALLOCA,
+	BUILTINCONSTANTP,
+	BUILTININFF,
+	BUILTINNANF,
+	BUILTINOFFSETOF,
 	BUILTINVAARG,
 	BUILTINVACOPY,
 	BUILTINVAEND,
-	BUILTINOFFSETOF,
-	BUILTINALLOCA,
-	BUILTINNANF,
-	BUILTININFF,
+	BUILTINVALIST,
+	BUILTINVASTART,
 };
 
-struct declaration {
-	enum declarationkind kind;
+struct decl {
+	enum declkind kind;
 	enum linkage linkage;
 	struct type *type;
 	struct value *value;
@@ -40,13 +41,13 @@ struct declaration {
 };
 
 struct scope;
-struct function;
+struct func;
 
-struct declaration *mkdecl(enum declarationkind, struct type *, enum linkage);
-_Bool decl(struct scope *, struct function *);
+struct decl *mkdecl(enum declkind, struct type *, enum linkage);
+_Bool decl(struct scope *, struct func *);
 struct type *typename(struct scope *);
 
-struct expression;
-struct declaration *stringdecl(struct expression *);
+struct expr;
+struct decl *stringdecl(struct expr *);
 
 void emittentativedefns(void);

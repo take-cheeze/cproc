@@ -124,8 +124,8 @@ static int
 ident(struct scanner *s)
 {
 	s->usebuf = true;
-	do nextchar(s);
-	while (isalnum(s->chr) || s->chr == '_');
+	while (isalnum(s->chr) || s->chr == '_')
+		nextchar(s);
 
 	return TIDENT;
 }
@@ -358,6 +358,10 @@ again:
 		return TRBRACE;
 	case '.':
 		nextchar(s);
+		if (isdigit(s->chr)) {
+			bufadd(&s->buf, '.');
+			return number(s);
+		}
 		if (s->chr != '.')
 			return TPERIOD;
 		loc = s->loc;
@@ -385,19 +389,27 @@ again:
 	case ',':
 		nextchar(s);
 		return TCOMMA;
-	case EOF:
-		return TEOF;
-	/* XXX: u8 string literals */
 	case 'L':
 	case 'U':
 	case 'u':
 		s->usebuf = true;
 		nextchar(s);
 		switch (s->chr) {
-		case '\'': return charconst(s);
-		case '"':  return stringlit(s);
+		case '\'':
+			return charconst(s);
+		case '8':
+			if (s->buf.str[0] != 'u')
+				break;
+			nextchar(s);
+			if (s->chr != '"')
+				break;
+			/* fallthrough */
+		case '"':
+			return stringlit(s);
 		}
 		return ident(s);
+	case EOF:
+		return TEOF;
 	default:
 		if (isdigit(s->chr))
 			return number(s);

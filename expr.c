@@ -17,10 +17,10 @@
 #include "token.h"
 #include "type.h"
 
-static struct expression *
-mkexpr(enum expressionkind k, struct type *t, enum expressionflags flags)
+static struct expr *
+mkexpr(enum exprkind k, struct type *t, enum exprflags flags)
 {
-	struct expression *e;
+	struct expr *e;
 
 	e = xmalloc(sizeof(*e));
 	e->type = flags & EXPRFLAG_LVAL || !t ? t : typeunqual(t, NULL);
@@ -31,10 +31,10 @@ mkexpr(enum expressionkind k, struct type *t, enum expressionflags flags)
 	return e;
 }
 
-static struct expression *
+static struct expr *
 mkconstexpr(struct type *t, uint64_t n)
 {
-	struct expression *e;
+	struct expr *e;
 
 	e = mkexpr(EXPRCONST, t, 0);
 	e->constant.i = n;
@@ -43,19 +43,19 @@ mkconstexpr(struct type *t, uint64_t n)
 }
 
 void
-delexpr(struct expression *e)
+delexpr(struct expr *e)
 {
 	free(e);
 }
 
-static struct expression *mkunaryexpr(enum tokenkind, struct expression *);
+static struct expr *mkunaryexpr(enum tokenkind, struct expr *);
 
 /* 6.3.2.1 Conversion of arrays and function designators */
-static struct expression *
-decay(struct expression *e)
+static struct expr *
+decay(struct expr *e)
 {
 	struct type *t;
-	enum typequalifier tq = QUALNONE;
+	enum typequal tq = QUALNONE;
 
 	// XXX: combine with decl.c:adjust in some way?
 	t = typeunqual(e->type, &tq);
@@ -75,16 +75,16 @@ decay(struct expression *e)
 }
 
 static void
-lvalueconvert(struct expression *e)
+lvalueconvert(struct expr *e)
 {
 	e->type = typeunqual(e->type, NULL);
 	e->flags &= ~EXPRFLAG_LVAL;
 }
 
-static struct expression *
-mkunaryexpr(enum tokenkind op, struct expression *base)
+static struct expr *
+mkunaryexpr(enum tokenkind op, struct expr *base)
 {
-	struct expression *expr;
+	struct expr *expr;
 
 	switch (op) {
 	case TBAND:
@@ -110,7 +110,7 @@ mkunaryexpr(enum tokenkind op, struct expression *base)
 }
 
 static struct type *
-commonreal(struct expression **e1, struct expression **e2)
+commonreal(struct expr **e1, struct expr **e2)
 {
 	struct type *t;
 
@@ -121,12 +121,12 @@ commonreal(struct expression **e1, struct expression **e2)
 	return t;
 }
 
-static struct expression *
-mkbinaryexpr(struct location *loc, enum tokenkind op, struct expression *l, struct expression *r)
+static struct expr *
+mkbinaryexpr(struct location *loc, enum tokenkind op, struct expr *l, struct expr *r)
 {
-	struct expression *e;
+	struct expr *e;
 	struct type *t = NULL;
-	enum typeproperty lp, rp;
+	enum typeprop lp, rp;
 
 	lvalueconvert(l);
 	lvalueconvert(r);
@@ -241,12 +241,6 @@ inttype(uint64_t val, bool decimal, char *end)
 		{&typellong,  "ll",  NULL},
 		{&typeullong, "ull", "llu"},
 	};
-	static const uint64_t max[] = {
-		[1] = 0xff,
-		[2] = 0xffff,
-		[4] = 0xffffffff,
-		[8] = 0xffffffffffffffff,
-	};
 	struct type *t;
 	size_t i, step;
 
@@ -265,7 +259,7 @@ inttype(uint64_t val, bool decimal, char *end)
 	step = i % 2 || decimal ? 2 : 1;
 	for (; i < LEN(limits); i += step) {
 		t = limits[i].type;
-		if (val <= max[t->size] >> t->basic.issigned)
+		if (val <= (uint64_t)-1 >> (8 - t->size << 3) + t->basic.issigned)
 			return t;
 	}
 	error(&tok.loc, "no suitable type for constant '%s'", tok.lit);
@@ -318,11 +312,11 @@ unescape(char **p)
 }
 
 /* 6.5 Expressions */
-static struct expression *
+static struct expr *
 primaryexpr(struct scope *s)
 {
-	struct expression *e;
-	struct declaration *d;
+	struct expr *e;
+	struct decl *d;
 	struct type *t;
 	char *src, *dst, *end;
 	int base;
@@ -345,7 +339,10 @@ primaryexpr(struct scope *s)
 		do {
 			e->string.data = xreallocarray(e->string.data, e->string.size + strlen(tok.lit), 1);
 			dst = e->string.data + e->string.size;
-			for (src = tok.lit + 1; *src != '"'; ++dst)
+			src = tok.lit;
+			if (*src != '"')
+				fatal("wide string literal not yet implemented");
+			for (++src; *src != '"'; ++dst)
 				*dst = unescape(&src);
 			e->string.size = dst - e->string.data;
 			next();
@@ -364,7 +361,7 @@ primaryexpr(struct scope *s)
 		default: fatal("invalid character constant");
 		}
 		++src;
-		e = mkconstexpr(&typeint, unescape(&src));
+		e = mkconstexpr(t, unescape(&src));
 		if (*src != '\'')
 			error(&tok.loc, "character constant contains more than one character: %c", *src);
 		next();
@@ -410,22 +407,49 @@ primaryexpr(struct scope *s)
 	return e;
 }
 
-static struct expression *
+static struct expr *condexpr(struct scope *);
+
+static struct expr *
 builtinfunc(struct scope *s, enum builtinkind kind)
 {
-	struct expression *e;
+	struct expr *e;
 	struct type *t;
 	char *name;
 	uint64_t offset;
 
 	switch (kind) {
-	case BUILTINVASTART:
-		e = mkexpr(EXPRBUILTIN, &typevoid, 0);
-		e->builtin.kind = BUILTINVASTART;
-		e->builtin.arg = exprconvert(assignexpr(s), &typevalistptr);
-		expect(TCOMMA, "after va_list");
-		free(expect(TIDENT, "after ','"));
-		// XXX: check that this was actually a parameter name?
+	case BUILTINALLOCA:
+		e = mkexpr(EXPRBUILTIN, mkpointertype(&typevoid), 0);
+		e->builtin.kind = BUILTINALLOCA;
+		e->builtin.arg = exprconvert(assignexpr(s), &typeulong);
+		break;
+	case BUILTINCONSTANTP:
+		e = mkconstexpr(&typeint, eval(condexpr(s))->kind == EXPRCONST);
+		break;
+	case BUILTININFF:
+		e = mkexpr(EXPRCONST, &typefloat, 0);
+		/* TODO: use INFINITY here when we can handle musl's math.h */
+		e->constant.f = strtod("inf", NULL);
+		break;
+	case BUILTINNANF:
+		e = assignexpr(s);
+		if (!(e->flags & EXPRFLAG_DECAYED) || e->unary.base->kind != EXPRSTRING || e->unary.base->string.size > 0)
+			error(&tok.loc, "__builtin_nanf currently only supports empty string literals");
+		e = mkexpr(EXPRCONST, &typefloat, 0);
+		/* TODO: use NAN here when we can handle musl's math.h */
+		e->constant.f = strtod("nan", NULL);
+		break;
+	case BUILTINOFFSETOF:
+		t = typename(s);
+		expect(TCOMMA, "after type name");
+		name = expect(TIDENT, "after ','");
+		if (t->kind != TYPESTRUCT && t->kind != TYPEUNION)
+			error(&tok.loc, "type is not a struct/union type");
+		offset = 0;
+		if (!typemember(t, name, &offset))
+			error(&tok.loc, "struct/union has no member named '%s'", name);
+		e = mkconstexpr(&typeulong, offset);
+		free(name);
 		break;
 	case BUILTINVAARG:
 		e = mkexpr(EXPRBUILTIN, NULL, 0);
@@ -446,35 +470,13 @@ builtinfunc(struct scope *s, enum builtinkind kind)
 		e->builtin.kind = BUILTINVAEND;
 		exprconvert(assignexpr(s), &typevalistptr);
 		break;
-	case BUILTINOFFSETOF:
-		t = typename(s);
-		expect(TCOMMA, "after type name");
-		name = expect(TIDENT, "after ','");
-		if (t->kind != TYPESTRUCT && t->kind != TYPEUNION)
-			error(&tok.loc, "type is not a struct/union type");
-		offset = 0;
-		if (!typemember(t, name, &offset))
-			error(&tok.loc, "struct/union has no member named '%s'", name);
-		e = mkconstexpr(&typeulong, offset);
-		free(name);
-		break;
-	case BUILTINALLOCA:
-		e = mkexpr(EXPRBUILTIN, mkpointertype(&typevoid), 0);
-		e->builtin.kind = BUILTINALLOCA;
-		e->builtin.arg = exprconvert(assignexpr(s), &typeulong);
-		break;
-	case BUILTINNANF:
-		e = assignexpr(s);
-		if (!(e->flags & EXPRFLAG_DECAYED) || e->unary.base->kind != EXPRSTRING || e->unary.base->string.size > 0)
-			error(&tok.loc, "__builtin_nanf currently only supports empty string literals");
-		e = mkexpr(EXPRCONST, &typefloat, 0);
-		/* TODO: use NAN here when we can handle musl's math.h */
-		e->constant.f = strtod("nan", NULL);
-		break;
-	case BUILTININFF:
-		e = mkexpr(EXPRCONST, &typefloat, 0);
-		/* TODO: use INFINITY here when we can handle musl's math.h */
-		e->constant.f = strtod("inf", NULL);
+	case BUILTINVASTART:
+		e = mkexpr(EXPRBUILTIN, &typevoid, 0);
+		e->builtin.kind = BUILTINVASTART;
+		e->builtin.arg = exprconvert(assignexpr(s), &typevalistptr);
+		expect(TCOMMA, "after va_list");
+		free(expect(TIDENT, "after ','"));
+		// XXX: check that this was actually a parameter name?
 		break;
 	default:
 		fatal("internal error; unknown builtin");
@@ -482,13 +484,13 @@ builtinfunc(struct scope *s, enum builtinkind kind)
 	return e;
 }
 
-static struct expression *
-postfixexpr(struct scope *s, struct expression *r)
+static struct expr *
+postfixexpr(struct scope *s, struct expr *r)
 {
-	struct expression *e, *arr, *idx, *tmp, **end;
+	struct expr *e, *arr, *idx, *tmp, **end;
 	struct type *t;
-	enum typequalifier tq;
-	struct parameter *p;
+	enum typequal tq;
+	struct param *p;
 	uint64_t offset;
 	enum tokenkind op;
 	bool lvalue;
@@ -600,13 +602,13 @@ postfixexpr(struct scope *s, struct expression *r)
 	}
 }
 
-static struct expression *castexpr(struct scope *);
+static struct expr *castexpr(struct scope *);
 
-static struct expression *
+static struct expr *
 unaryexpr(struct scope *s)
 {
 	enum tokenkind op;
-	struct expression *e, *l;
+	struct expr *e, *l;
 	struct type *t;
 
 	op = tok.kind;
@@ -694,11 +696,11 @@ unaryexpr(struct scope *s)
 	return e;
 }
 
-static struct expression *
+static struct expr *
 castexpr(struct scope *s)
 {
 	struct type *t;
-	struct expression *r, *e, **end;
+	struct expr *r, *e, **end;
 
 	end = &r;
 	while (consume(TLPAREN)) {
@@ -728,75 +730,55 @@ castexpr(struct scope *s)
 }
 
 static int
-isequality(enum tokenkind t)
+precedence(enum tokenkind t)
 {
-	return t == TEQL || t == TNEQ;
+	switch (t) {
+	case TLOR:     return 0;
+	case TLAND:    return 1;
+	case TBOR:     return 2;
+	case TXOR:     return 3;
+	case TBAND:    return 4;
+	case TEQL:
+	case TNEQ:     return 5;
+	case TLESS:
+	case TGREATER:
+	case TLEQ:
+	case TGEQ:     return 6;
+	case TSHL:
+	case TSHR:     return 7;
+	case TADD:
+	case TSUB:     return 8;
+	case TMUL:
+	case TDIV:
+	case TMOD:     return 9;
+	}
+	return -1;
 }
 
-static int
-isrelational(enum tokenkind t)
+static struct expr *
+binaryexpr(struct scope *s, struct expr *l, int i)
 {
-	return t == TLESS || t == TGREATER || t == TLEQ || t == TGEQ;
-}
-
-static int
-isshift(enum tokenkind t)
-{
-	return t == TSHL || t == TSHR;
-}
-
-static int
-isadditive(enum tokenkind t)
-{
-	return t == TADD || t == TSUB;
-}
-
-static int
-ismultiplicative(enum tokenkind t)
-{
-	return t == TMUL || t == TDIV || t == TMOD;
-}
-
-static struct expression *
-binaryexpr(struct scope *s, size_t i)
-{
-	static const struct {
-		int tok;
-		int (*fn)(enum tokenkind);
-	} prec[] = {
-		// XXX: bitmask?
-		{.tok = TLOR},
-		{.tok = TLAND},
-		{.tok = TBOR},
-		{.tok = TXOR},
-		{.tok = TBAND},
-		{.fn = isequality},
-		{.fn = isrelational},
-		{.fn = isshift},
-		{.fn = isadditive},
-		{.fn = ismultiplicative},
-	};
-	struct expression *e, *l, *r;
+	struct expr *r;
 	struct location loc;
 	enum tokenkind op;
+	int j, k;
 
-	if (i >= LEN(prec))
-		return castexpr(s);
-	l = binaryexpr(s, i + 1);
-	while (tok.kind == prec[i].tok || (prec[i].fn && prec[i].fn(tok.kind))) {
+	if (!l)
+		l = castexpr(s);
+	while ((j = precedence(tok.kind)) >= i) {
 		op = tok.kind;
 		loc = tok.loc;
 		next();
-		r = binaryexpr(s, i + 1);
-		e = mkbinaryexpr(&loc, op, l, r);
-		l = e;
+		r = castexpr(s);
+		while ((k = precedence(tok.kind)) > j)
+			r = binaryexpr(s, r, k);
+		l = mkbinaryexpr(&loc, op, l, r);
 	}
-
 	return l;
 }
 
 static bool
-nullpointer(struct expression *e)
+nullpointer(struct expr *e)
 {
 	if (e->kind != EXPRCONST)
 		return false;
@@ -805,14 +787,14 @@ nullpointer(struct expression *e)
 	return e->constant.i == 0;
 }
 
-static struct expression *
+static struct expr *
 condexpr(struct scope *s)
 {
-	struct expression *r, *e;
+	struct expr *r, *e;
 	struct type *t, *f;
-	enum typequalifier tq;
+	enum typequal tq;
 
-	r = binaryexpr(s, 0);
+	r = binaryexpr(s, NULL, 0);
 	if (!consume(TQUESTION))
 		return r;
 	e = mkexpr(EXPRCOND, NULL, 0);
@@ -860,7 +842,7 @@ condexpr(struct scope *s)
 uint64_t
 intconstexpr(struct scope *s, bool allowneg)
 {
-	struct expression *e;
+	struct expr *e;
 
 	e = eval(condexpr(s));
 	if (e->kind != EXPRCONST || !(typeprop(e->type) & PROPINT))
@@ -870,10 +852,10 @@ intconstexpr(struct scope *s, bool allowneg)
 	return e->constant.i;
 }
 
-struct expression *
+struct expr *
 assignexpr(struct scope *s)
 {
-	struct expression *e, *l, *r, *tmp = NULL, **res = &e;
+	struct expr *e, *l, *r, *tmp = NULL, **res = &e;
 	enum tokenkind op;
 
 	l = condexpr(s);
@@ -919,10 +901,10 @@ assignexpr(struct scope *s)
 	return e;
 }
 
-struct expression *
+struct expr *
 expr(struct scope *s)
 {
-	struct expression *r, *e, **end;
+	struct expr *r, *e, **end;
 
 	end = &r;
 	for (;;) {
@@ -941,10 +923,10 @@ expr(struct scope *s)
 	return e;
 }
 
-struct expression *
-exprconvert(struct expression *e, struct type *t)
+struct expr *
+exprconvert(struct expr *e, struct type *t)
 {
-	struct expression *cast;
+	struct expr *cast;
 
 	if (typecompatible(e->type, t))
 		return e;

@@ -15,17 +15,18 @@ scopeinit(void)
 {
 	static struct builtin {
 		char *name;
-		struct declaration decl;
+		struct decl decl;
 	} builtins[] = {
-		{"__builtin_va_list",  {.kind = DECLTYPE, .type = &typevalist}},
-		{"__builtin_va_start", {.kind = DECLBUILTIN, .builtin = BUILTINVASTART}},
-		{"__builtin_va_copy",  {.kind = DECLBUILTIN, .builtin = BUILTINVACOPY}},
-		{"__builtin_va_arg",   {.kind = DECLBUILTIN, .builtin = BUILTINVAARG}},
-		{"__builtin_va_end",   {.kind = DECLBUILTIN, .builtin = BUILTINVAEND}},
-		{"__builtin_offsetof", {.kind = DECLBUILTIN, .builtin = BUILTINOFFSETOF}},
-		{"__builtin_alloca",   {.kind = DECLBUILTIN, .builtin = BUILTINALLOCA}},
-		{"__builtin_nanf",     {.kind = DECLBUILTIN, .builtin = BUILTINNANF}},
-		{"__builtin_inff",     {.kind = DECLBUILTIN, .builtin = BUILTININFF}},
+		{"__builtin_alloca",     {.kind = DECLBUILTIN, .builtin = BUILTINALLOCA}},
+		{"__builtin_constant_p", {.kind = DECLBUILTIN, .builtin = BUILTINCONSTANTP}},
+		{"__builtin_inff",       {.kind = DECLBUILTIN, .builtin = BUILTININFF}},
+		{"__builtin_nanf",       {.kind = DECLBUILTIN, .builtin = BUILTINNANF}},
+		{"__builtin_offsetof",   {.kind = DECLBUILTIN, .builtin = BUILTINOFFSETOF}},
+		{"__builtin_va_arg",     {.kind = DECLBUILTIN, .builtin = BUILTINVAARG}},
+		{"__builtin_va_copy",    {.kind = DECLBUILTIN, .builtin = BUILTINVACOPY}},
+		{"__builtin_va_end",     {.kind = DECLBUILTIN, .builtin = BUILTINVAEND}},
+		{"__builtin_va_list",    {.kind = DECLTYPE, .type = &typevalist}},
+		{"__builtin_va_start",   {.kind = DECLBUILTIN, .builtin = BUILTINVASTART}},
 	};
 	struct builtin *b;
 
@@ -63,10 +64,10 @@ delscope(struct scope *s)
 	return parent;
 }
 
-struct declaration *
+struct decl *
 scopegetdecl(struct scope *s, const char *name, bool recurse)
 {
-	struct declaration *d;
+	struct decl *d;
 	struct hashtablekey k;
 
 	htabstrkey(&k, name);
@@ -94,7 +95,7 @@ scopegettag(struct scope *s, const char *name, bool recurse)
 }
 
 void
-scopeputdecl(struct scope *s, const char *name, struct declaration *d)
+scopeputdecl(struct scope *s, const char *name, struct decl *d)
 {
 	struct hashtablekey k;
 

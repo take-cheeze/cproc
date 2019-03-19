@@ -29,10 +29,10 @@ struct initparser {
 	struct object obj[32], *cur, *sub;
 };
 
-struct initializer *
-mkinit(uint64_t start, uint64_t end, struct expression *expr)
+struct init *
+mkinit(uint64_t start, uint64_t end, struct expr *expr)
 {
-	struct initializer *init;
+	struct init *init;
 
 	init = xmalloc(sizeof(*init));
 	init->start = start;
@@ -44,31 +44,26 @@ mkinit(uint64_t start, uint64_t end, struct expression *expr)
 }
 
 static void
-initadd(struct initializer **init, struct initializer *new)
+initadd(struct init **init, struct init *new)
 {
-	struct initializer *next, *sub, *last;
-	uint64_t offset;
+	struct init *old;
 
-	while (*init && new->start >= (*init)->end)
-		init = &(*init)->next;
-	next = *init;
-	if (next && next->start <= new->start && new->end < next->end) {
-		initadd(&next->subinit, new);
-		last = NULL;  /* silence gcc, we know that next->subinit has at least one member */
-		for (offset = next->start, sub = next->subinit; sub; offset = sub->end, last = sub, sub = sub->next) {
-			if (sub->start != offset)
-				return;
+	for (; old = *init; init = &old->next) {
+		if (new->start >= old->end)
+			continue;
+		/* no overlap, insert before `old` */
+		if (new->end <= old->start)
+			break;
+		/* replace any initializers that `new` covers */
+		if (new->end >= old->end) {
+			do old = old->next;
+			while (old && new->end >= old->end);
+			break;
 		}
-		if (offset == next->end) {
-			*init = next->subinit;
-			last->next = next->next;
-		}
-	} else {
-		*init = new;
-		while (next && next->start < (*init)->end)
-			next = next->next;
-		(*init)->next = next;
+		/* `old` covers `new`, keep looking */
 	}
+	new->next = old;
+	*init = new;
 }
 
 static void
@@ -208,12 +203,12 @@ advance(struct initparser *p)
 }
 
 /* 6.7.9 Initialization */
-struct initializer *
+struct init *
 parseinit(struct scope *s, struct type *t)
 {
 	struct initparser p;
-	struct initializer *init = NULL;
-	struct expression *expr;
+	struct init *init = NULL;
+	struct expr *expr;
 	struct type *base;
 
 	t = typeunqual(t, NULL);
@@ -249,7 +244,8 @@ parseinit(struct scope *s, struct type *t)
 				if (expr->flags & EXPRFLAG_DECAYED && expr->unary.base->kind == EXPRSTRING) {
 					expr = expr->unary.base;
 					base = typeunqual(t->base, NULL);
-					if (!typecompatible(expr->type->base, base))
+					/* XXX: wide string literals */
+					if (!(typeprop(base) & PROPCHAR))
 						error(&tok.loc, "array initializer is string literal with incompatible type");
 					if (t->incomplete)
 						updatearray(t, expr->string.size);
