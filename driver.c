@@ -10,6 +10,7 @@
 
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -312,16 +313,20 @@ nextarg(char ***argv)
 }
 
 static char *
-compilecommand(void)
+compilecommand(char *arg)
 {
 	char self[PATH_MAX], *cmd;
-	ssize_t n;
+	size_t n;
 
-	n = readlink("/proc/self/exe", self, sizeof(self) - 4);
-	if (n < 0)
-		fatal("readlink /proc/self/exe:");
-	if (n == sizeof(self) - 4)
+	n = readlink("/proc/self/exe", self, sizeof(self) - 5);
+	if (n == -1) {
+		n = strlen(arg);
+		if (n > sizeof(self) - 5)
+			fatal("argv[0] is too large");
+		memcpy(self, arg, n);
+	} else if (n == sizeof(self) - 5) {
 		fatal("target of /proc/self/exe is too large");
+	}
 	strcpy(self + n, "-qbe");
 	if (access(self, X_OK) < 0)
 		return NULL;
@@ -344,7 +349,7 @@ main(int argc, char *argv[])
 	arrayaddbuf(&phases[CODEGEN].cmd, codegencmd, sizeof(codegencmd));
 	arrayaddbuf(&phases[ASSEMBLE].cmd, assemblecmd, sizeof(assemblecmd));
 	arrayaddbuf(&phases[LINK].cmd, linkcmd, sizeof(linkcmd));
-	arg = compilecommand();
+	arg = compilecommand(argv[0]);
 	if (arg)
 		*(char **)phases[COMPILE].cmd.val = arg;
 	for (i = 0; i < LEN(incdirs); ++i) {

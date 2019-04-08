@@ -2,12 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "util.h"
-#include "backend.h"
-#include "decl.h"
-#include "eval.h"
-#include "expr.h"
-#include "token.h"
-#include "type.h"
+#include "cc.h"
 
 static void
 binary(struct expr *expr, enum tokenkind op, struct expr *l, struct expr *r)
@@ -83,7 +78,7 @@ eval(struct expr *expr)
 		expr->constant.i = intconstvalue(expr->ident.decl->value);
 		break;
 	case EXPRCOMPOUND:
-		d = mkdecl(DECLOBJECT, expr->type, LINKNONE);
+		d = mkdecl(DECLOBJECT, expr->type, expr->qual, LINKNONE);
 		d->value = mkglobal(NULL, true);
 		emitdata(d, expr->compound.init);
 		expr->kind = EXPRIDENT;

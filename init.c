@@ -6,12 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "util.h"
-#include "decl.h"
-#include "expr.h"
-#include "init.h"
-#include "pp.h"
-#include "token.h"
-#include "type.h"
+#include "cc.h"
 
 struct object {
 	uint64_t offset;
@@ -83,7 +78,7 @@ subobj(struct initparser *p, struct type *t, uint64_t off)
 	off += p->sub->offset;
 	if (++p->sub == p->obj + LEN(p->obj))
 		fatal("internal error: too many designators");
-	p->sub->type = typeunqual(t, NULL);
+	p->sub->type = t;
 	p->sub->offset = off;
 	p->sub->iscur = false;
 }
@@ -211,7 +206,6 @@ parseinit(struct scope *s, struct type *t)
 	struct expr *expr;
 	struct type *base;
 
-	t = typeunqual(t, NULL);
 	p.cur = NULL;
 	p.sub = p.obj;
 	p.sub->offset = 0;
@@ -241,9 +235,9 @@ parseinit(struct scope *s, struct type *t)
 			t = p.sub->type;
 			switch (t->kind) {
 			case TYPEARRAY:
-				if (expr->flags & EXPRFLAG_DECAYED && expr->unary.base->kind == EXPRSTRING) {
+				if (expr->decayed && expr->unary.base->kind == EXPRSTRING) {
 					expr = expr->unary.base;
-					base = typeunqual(t->base, NULL);
+					base = t->base;
 					/* XXX: wide string literals */
 					if (!(typeprop(base) & PROPCHAR))
 						error(&tok.loc, "array initializer is string literal with incompatible type");

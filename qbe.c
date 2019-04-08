@@ -6,16 +6,9 @@
 #include <string.h>
 #include <inttypes.h>
 #include "util.h"
-#include "backend.h"
-#include "decl.h"
-#include "eval.h"
-#include "expr.h"
+#include "cc.h"
 #include "htab.h"
-#include "init.h"
-#include "scope.h"
-#include "token.h"
 #include "tree.h"
-#include "type.h"
 
 struct name {
 	char *str;
@@ -239,12 +232,10 @@ funcalloc(struct func *f, struct decl *d)
 }
 
 static void
-funcstore(struct func *f, struct type *t, struct value *addr, struct value *v)
+funcstore(struct func *f, struct type *t, enum typequal tq, struct value *addr, struct value *v)
 {
 	enum instkind op;
-	enum typequal tq = QUALNONE;
 
-	t = typeunqual(t, &tq);
 	if (tq & QUALVOLATILE)
 		error(&tok.loc, "volatile store is not yet supported");
 	if (tq & QUALCONST)
@@ -300,9 +291,7 @@ funcload(struct func *f, struct type *t, struct value *addr)
 {
 	struct value *v;
 	enum instkind op;
-	enum typequal tq;
 
-	t = typeunqual(t, &tq);
 	switch (t->kind) {
 	case TYPEBASIC:
 		switch (t->size) {
@@ -373,7 +362,7 @@ mkfunc(char *name, struct type *t, struct scope *s)
 		if (!t->func.isprototype && !typecompatible(p->type, typeargpromote(p->type)))
 			error(&tok.loc, "old-style function definition with parameter type incompatible with promoted type is not yet supported");
 		emittype(p->type);
-		d = mkdecl(DECLOBJECT, p->type, LINKNONE);
+		d = mkdecl(DECLOBJECT, p->type, p->qual, LINKNONE);
 		p->value = xmalloc(sizeof(*p->value));
 		functemp(f, p->value, p->type->repr);
 		if (p->type->repr->abi.id) {
@@ -382,13 +371,13 @@ mkfunc(char *name, struct type *t, struct scope *s)
 			d->value->repr = &iptr;
 		} else {
 			funcinit(f, d, NULL);
-			funcstore(f, typeunqual(p->type, NULL), d->value, p->value);
+			funcstore(f, p->type, QUALNONE, d->value, p->value);
 		}
 		scopeputdecl(s, p->name, d);
 	}
 
-	t = mkarraytype(mkqualifiedtype(&typechar, QUALCONST), strlen(name) + 1);
-	d = mkdecl(DECLOBJECT, t, LINKNONE);
+	t = mkarraytype(&typechar, QUALCONST, strlen(name) + 1);
+	d = mkdecl(DECLOBJECT, t, QUALNONE, LINKNONE);
 	d->value = mkglobal("__func__", true);
 	scopeputdecl(s, "__func__", d);
 	/*
@@ -478,7 +467,7 @@ objectaddr(struct func *f, struct expr *e)
 		d = stringdecl(e);
 		return d->value;
 	case EXPRCOMPOUND:
-		d = mkdecl(DECLOBJECT, e->type, LINKNONE);
+		d = mkdecl(DECLOBJECT, e->type, e->qual, LINKNONE);
 		funcinit(f, d, e->compound.init);
 		return d->value;
 	case EXPRUNARY:
@@ -612,7 +601,7 @@ funcexpr(struct func *f, struct expr *e)
 		else
 			fatal("not a scalar");
 		v = funcinst(f, e->incdec.op == TINC ? IADD : ISUB, e->type->repr, (struct value *[]){l, r});
-		funcstore(f, e->type, addr, v);
+		funcstore(f, e->type, e->qual, addr, v);
 		return e->incdec.post ? l : v;
 	case EXPRCALL:
 		argvals = xreallocarray(NULL, e->call.nargs + 3, sizeof(argvals[0]));
@@ -644,10 +633,10 @@ funcexpr(struct func *f, struct expr *e)
 		l = funcexpr(f, e->cast.e);
 		r = NULL;
 
-		src = typeunqual(e->cast.e->type, NULL);
+		src = e->cast.e->type;
 		if (src->kind == TYPEPOINTER)
 			src = &typeulong;
-		dst = typeunqual(e->type, NULL);
+		dst = e->type;
 		if (dst->kind == TYPEPOINTER)
 			dst = &typeulong;
 		if (dst->kind == TYPEVOID)
@@ -828,7 +817,7 @@ funcexpr(struct func *f, struct expr *e)
 			e->assign.l->temp = r;
 		} else {
 			l = objectaddr(f, e->assign.l);
-			funcstore(f, e->assign.l->type, l, r);
+			funcstore(f, e->assign.l->type, e->assign.l->qual, l, r);
 		}
 		return r;
 	case EXPRCOMMA:
@@ -907,7 +896,7 @@ funcinit(struct func *func, struct decl *d, struct init *init)
 		} else {
 			dst = funcinst(func, IADD, &iptr, (struct value *[]){d->value, mkintconst(&iptr, init->start)});
 			src = funcexpr(func, init->expr);
-			funcstore(func, init->expr->type, dst, src);
+			funcstore(func, init->expr->type, QUALNONE, dst, src);
 			offset = init->end;
 		}
 		if (max < offset)
@@ -1016,7 +1005,7 @@ emittype(struct type *t)
 	for (m = t->structunion.members; m; m = m->next) {
 		for (sub = m->type; sub->kind == TYPEARRAY; sub = sub->base)
 			;
-		emittype(typeunqual(sub, NULL));
+		emittype(sub);
 	}
 	fputs("type :", stdout);
 	emitname(&t->repr->abi);
@@ -1026,7 +1015,7 @@ emittype(struct type *t)
 			fputs("{ ", stdout);
 		for (i = 1, sub = m->type; sub->kind == TYPEARRAY; sub = sub->base)
 			i *= sub->array.length;
-		emitrepr(typeunqual(sub, NULL)->repr, true, true);
+		emitrepr(sub->repr, true, true);
 		if (i > 1)
 			printf(" %" PRIu64, i);
 		if (t->kind == TYPEUNION)

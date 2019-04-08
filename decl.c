@@ -7,18 +7,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include "util.h"
-#include "backend.h"
-#include "decl.h"
-#include "expr.h"
+#include "cc.h"
 #include "htab.h"
-#include "init.h"
-#include "pp.h"
-#include "scope.h"
-#include "stmt.h"
-#include "token.h"
-#include "type.h"
 
 static struct list tentativedefns = {&tentativedefns, &tentativedefns};
+
+struct qualtype {
+	struct type *type;
+	enum typequal qual;
+};
 
 enum storageclass {
 	SCNONE,
@@ -57,8 +54,14 @@ enum funcspec {
 	FUNCNORETURN = 1<<2,
 };
 
+struct structbuilder {
+	struct type *type;
+	struct member **last;
+	int bits;  /* number of bits remaining in the last byte */
+};
+
 struct decl *
-mkdecl(enum declkind k, struct type *t, enum linkage linkage)
+mkdecl(enum declkind k, struct type *t, enum typequal tq, enum linkage linkage)
 {
 	struct decl *d;
 
@@ -66,6 +69,7 @@ mkdecl(enum declkind k, struct type *t, enum linkage linkage)
 	d->kind = k;
 	d->linkage = linkage;
 	d->type = t;
+	d->qual = tq;
 	d->tentative = false;
 	d->defined = false;
 	d->align = 0;
@@ -141,7 +145,7 @@ funcspec(enum funcspec *fs)
 	return 1;
 }
 
-static void structdecl(struct scope *, struct type *, struct member ***);
+static void structdecl(struct scope *, struct structbuilder *);
 
 static struct type *
 tagspec(struct scope *s)
@@ -150,7 +154,7 @@ tagspec(struct scope *s)
 	char *tag;
 	enum typekind kind;
 	struct decl *d;
-	struct member **end;
+	struct structbuilder b;
 	uint64_t i;
 
 	switch (tok.kind) {
@@ -199,8 +203,10 @@ tagspec(struct scope *s)
 	switch (t->kind) {
 	case TYPESTRUCT:
 	case TYPEUNION:
-		end = &t->structunion.members;
-		do structdecl(s, t, &end);
+		b.type = t;
+		b.last = &t->structunion.members;
+		b.bits = 0;
+		do structdecl(s, &b);
 		while (tok.kind != TRBRACE);
 		next();
 		t->size = ALIGNUP(t->size, t->align);
@@ -208,7 +214,7 @@ tagspec(struct scope *s)
 		break;
 	case TYPEBASIC:  /* enum */
 		for (i = 0; tok.kind == TIDENT; ++i) {
-			d = mkdecl(DECLCONST, &typeint, LINKNONE);
+			d = mkdecl(DECLCONST, &typeint, QUALNONE, LINKNONE);
 			scopeputdecl(s, tok.lit, d);
 			next();
 			if (consume(TASSIGN))
@@ -225,11 +231,12 @@ tagspec(struct scope *s)
 }
 
 /* 6.7 Declarations */
-static struct type *
+static struct qualtype
 declspecs(struct scope *s, enum storageclass *sc, enum funcspec *fs, int *align)
 {
-	struct type *t;
+	struct type *t, *other;
 	struct decl *d;
+	struct expr *e;
 	enum typespec ts = SPECNONE;
 	enum typequal tq = QUALNONE;
 	int ntypes = 0;
@@ -328,9 +335,13 @@ declspecs(struct scope *s, enum storageclass *sc, enum funcspec *fs, int *align)
 		case T__TYPEOF__:
 			next();
 			expect(TLPAREN, "after '__typeof__'");
-			t = typename(s);
-			if (!t)
-				t = expr(s)->type;
+			t = typename(s, &tq);
+			if (!t) {
+				e = expr(s);
+				t = e->type;
+				tq |= e->qual;
+				delexpr(e);
+			}
 			++ntypes;
 			expect(TRPAREN, "to close '__typeof__'");
 			break;
@@ -341,9 +352,9 @@ declspecs(struct scope *s, enum storageclass *sc, enum funcspec *fs, int *align)
 				error(&tok.loc, "alignment specifier not allowed in this declaration");
 			next();
 			expect(TLPAREN, "after '_Alignas'");
-			t = typename(s);
-			if (t) {
-				*align = t->align;
+			other = typename(s, NULL);
+			if (other) {
+				*align = other->align;
 			} else {
 				i = intconstexpr(s, false);
 				if (!i || i & (i - 1) || i > 16)
@@ -397,16 +408,11 @@ done:
 	if (!t && (tq || (sc && *sc) || (fs && *fs)))
 		error(&tok.loc, "declaration has no type specifier");
 
-	return mkqualifiedtype(t, tq);
+	return (struct qualtype){t, tq};
 }
 
 /* 6.7.6 Declarators */
 static struct param *parameter(struct scope *);
-
-struct partialtype {
-	struct type *outer;
-	struct type **inner;
-};
 
 static bool
 istypename(struct scope *s, const char *name)
@@ -417,6 +423,12 @@ istypename(struct scope *s, const char *name)
 	return d && d->kind == DECLTYPE;
 }
 
+/*
+When parsing a declarator, qualifiers for derived types are temporarily
+stored in the `qual` field of the type itself (elsewhere this field
+is used for the qualifiers of the base type). This is corrected in
+declarator().
+*/
 static void
 declaratortypes(struct scope *s, struct list *result, char **name, bool allowabstract)
 {
@@ -427,15 +439,11 @@ declaratortypes(struct scope *s, struct list *result, char **name, bool allowabs
 	enum typequal tq;
 
 	while (consume(TMUL)) {
-		t = mkpointertype(NULL);
-		listinsert(result, &t->link);
 		tq = QUALNONE;
 		while (typequal(&tq))
 			;
-		if (tq) {
-			t = mkqualifiedtype(NULL, tq);
-			listinsert(result, &t->link);
-		}
+		t = mkpointertype(NULL, tq);
+		listinsert(result, &t->link);
 	}
 	if (name)
 		*name = NULL;
@@ -464,6 +472,7 @@ declaratortypes(struct scope *s, struct list *result, char **name, bool allowabs
 			next();
 		func:
 			t = mktype(TYPEFUNC);
+			t->qual = QUALNONE;
 			t->func.isprototype = false;
 			t->func.isvararg = false;
 			t->func.isnoreturn = false;
@@ -474,12 +483,10 @@ declaratortypes(struct scope *s, struct list *result, char **name, bool allowabs
 				if (!istypename(s, tok.lit)) {
 					/* identifier-list (K&R declaration) */
 					do {
-						*p = mkparam(tok.lit, NULL);
+						*p = mkparam(tok.lit, NULL, QUALNONE);
 						p = &(*p)->next;
 						next();
-						if (!consume(TCOMMA))
-							break;
-					} while (tok.kind == TIDENT);
+					} while (consume(TCOMMA) && tok.kind == TIDENT);
 					break;
 				}
 				/* fallthrough */
@@ -495,7 +502,7 @@ declaratortypes(struct scope *s, struct list *result, char **name, bool allowabs
 						break;
 					}
 				}
-				if (typeunqual(t->func.params->type, NULL)->kind == TYPEVOID && !t->func.params->next)
+				if (t->func.params->type->kind == TYPEVOID && !t->func.params->next)
 					t->func.params = NULL;
 				break;
 			case TRPAREN:
@@ -508,12 +515,8 @@ declaratortypes(struct scope *s, struct list *result, char **name, bool allowabs
 		case TLBRACK:  /* array declarator */
 			next();
 			tq = QUALNONE;
-			for (;;) {
-				if (tok.kind == TSTATIC)
-					next();  /* ignore */
-				else if (!typequal(&tq))
-					break;
-			}
+			while (consume(TSTATIC) || typequal(&tq))
+				;
 			if (tok.kind == TMUL)
 				error(&tok.loc, "VLAs are not yet supported");
 			if (tok.kind == TRBRACK) {
@@ -523,11 +526,7 @@ declaratortypes(struct scope *s, struct list *result, char **name, bool allowabs
 				i = intconstexpr(s, false);
 				expect(TRBRACK, "after array length");
 			}
-			if (tq) {
-				t = mkqualifiedtype(NULL, tq);
-				listinsert(ptr->prev, &t->link);
-			}
-			t = mkarraytype(NULL, i);
+			t = mkarraytype(NULL, tq, i);
 			listinsert(ptr->prev, &t->link);
 			break;
 		default:
@@ -536,39 +535,38 @@ declaratortypes(struct scope *s, struct list *result, char **name, bool allowabs
 	}
 }
 
-static struct type *
-declarator(struct scope *s, struct type *base, char **name, bool allowabstract)
+static struct qualtype
+declarator(struct scope *s, struct qualtype base, char **name, bool allowabstract)
 {
 	struct type *t;
+	enum typequal tq;
 	struct list result = {&result, &result}, *l, *prev;
 
 	declaratortypes(s, &result, name, allowabstract);
 	for (l = result.prev; l != &result; l = prev) {
 		prev = l->prev;
 		t = listelement(l, struct type, link);
-		t->base = base;
+		tq = t->qual;
+		t->base = base.type;
+		t->qual = base.qual;
 		switch (t->kind) {
 		case TYPEFUNC:
-			if (base->kind == TYPEFUNC)
+			if (base.type->kind == TYPEFUNC)
 				error(&tok.loc, "function declarator specifies function return type");
-			if (base->kind == TYPEARRAY)
+			if (base.type->kind == TYPEARRAY)
 				error(&tok.loc, "function declarator specifies array return type");
 			break;
 		case TYPEARRAY:
-			if (base->incomplete)
+			if (base.type->incomplete)
 				error(&tok.loc, "array element has incomplete type");
-			if (base->kind == TYPEFUNC)
+			if (base.type->kind == TYPEFUNC)
 				error(&tok.loc, "array element has function type");
-			t->align = base->align;
-			t->size = base->size * t->array.length;  // XXX: overflow?
-			break;
-		case TYPEQUALIFIED:
-			t->align = base->align;
-			t->size = base->size;
-			t->repr = base->repr;
+			t->align = base.type->align;
+			t->size = base.type->size * t->array.length;  // XXX: overflow?
 			break;
 		}
-		base = t;
+		base.type = t;
+		base.qual = tq;
 	}
 
 	return base;
@@ -577,15 +575,12 @@ declarator(struct scope *s, struct type *base, char **name, bool allowabstract)
 static struct type *
 adjust(struct type *t)
 {
-	enum typequal tq = QUALNONE;
-
-	t = typeunqual(t, &tq);
 	switch (t->kind) {
 	case TYPEARRAY:
-		t = mkqualifiedtype(mkpointertype(t->base), tq);
+		t = mkpointertype(t->base, t->qual);
 		break;
 	case TYPEFUNC:
-		t = mkpointertype(t);
+		t = mkpointertype(t, QUALNONE);
 		break;
 	}
 
@@ -595,41 +590,38 @@ adjust(struct type *t)
 static struct param *
 parameter(struct scope *s)
 {
-	struct param *p;
-	struct type *t;
+	char *name;
+	struct qualtype t;
 	enum storageclass sc;
 
 	t = declspecs(s, &sc, NULL, NULL);
-	if (!t)
+	if (!t.type)
 		error(&tok.loc, "no type in parameter declaration");
 	if (sc && sc != SCREGISTER)
 		error(&tok.loc, "parameter declaration has invalid storage-class specifier");
-	p = mkparam(NULL, t);
-	p->type = adjust(declarator(s, p->type, &p->name, true));
+	t = declarator(s, t, &name, true);
 
-	return p;
+	return mkparam(name, adjust(t.type), t.qual);
 }
 
 static bool
 paramdecl(struct scope *s, struct param *params)
 {
 	struct param *p;
-	struct type *t, *base;
+	struct qualtype t, base;
 	char *name;
 
 	base = declspecs(s, NULL, NULL, NULL);
-	if (!base)
+	if (!base.type)
 		return false;
 	for (;;) {
-		t = adjust(declarator(s, base, &name, false));
-		for (p = params; p; p = p->next) {
-			if (strcmp(name, p->name) == 0) {
-				p->type = t;
-				break;
-			}
-		}
+		t = declarator(s, base, &name, false);
+		for (p = params; p && strcmp(name, p->name) != 0; p = p->next)
+			;
 		if (!p)
 			error(&tok.loc, "old-style function declarator has no parameter named '%s'", name);
+		p->type = adjust(t.type);
+		p->qual = t.qual;
 		if (tok.kind == TSEMICOLON)
 			break;
 		expect(TCOMMA, "or ';' after parameter declarator");
@@ -639,57 +631,92 @@ paramdecl(struct scope *s, struct param *params)
 }
 
 static void
-addmember(struct type *t, struct member ***end, struct type *mt, char *name, int align)
+addmember(struct structbuilder *b, struct qualtype mt, char *name, int align, uint64_t width)
 {
+	struct type *t = b->type;
 	struct member *m;
+	size_t end;
 
-	m = xmalloc(sizeof(*m));
-	m->type = mt;
-	m->name = name;
-	m->next = NULL;
-	**end = m;
-	*end = &m->next;
-
-	assert(mt->align > 0);
-	if (align < mt->align)
-		align = mt->align;
-	t->size = ALIGNUP(t->size, align);
-	if (t->kind == TYPESTRUCT) {
-		m->offset = t->size;
-		t->size += mt->size;
-	} else {
-		m->offset = 0;
-		if (t->size < mt->size)
-			t->size = mt->size;
+	assert(mt.type->align > 0);
+	if (name || width == -1) {
+		m = xmalloc(sizeof(*m));
+		m->type = mt.type;
+		m->qual = mt.qual;
+		m->name = name;
+		m->next = NULL;
+		*b->last = m;
+		b->last = &m->next;
+	}
+	if (width == -1) {
+		m->bits.before = 0;
+		m->bits.after = 0;
+		if (align < mt.type->align)
+			align = mt.type->align;
+		t->size = ALIGNUP(t->size, align);
+		if (t->kind == TYPESTRUCT) {
+			m->offset = t->size;
+			t->size += mt.type->size;
+		} else {
+			m->offset = 0;
+			if (t->size < mt.type->size)
+				t->size = mt.type->size;
+		}
+	} else {  /* bit-field */
+		if (!(typeprop(mt.type) & PROPINT))
+			error(&tok.loc, "bit-field has invalid type");
+		if (align)
+			error(&tok.loc, "alignment specified for bit-field");
+		if (!width && name)
+			error(&tok.loc, "bit-field with zero width must not have declarator");
+		if (width > mt.type->size * 8)
+			error(&tok.loc, "bit-field exceeds width of underlying type");
+		/* calculate end of the storage-unit for this bit-field */
+		end = ALIGNUP(t->size, mt.type->size);
+		if (!width || width > (end - t->size) * 8 + b->bits) {
+			/* no room, allocate a new storage-unit */
+			t->size = end;
+			b->bits = 0;
+		}
+		if (width) {
+			m->offset = ALIGNDOWN(t->size - !!b->bits, mt.type->size);
+			m->bits.before = (t->size - m->offset) * 8 - b->bits;
+			m->bits.after = mt.type->size * 8 - width - m->bits.before;
+			t->size += (width - b->bits + 7) / 8;
+			b->bits = m->bits.after % 8;
+		}
+		align = mt.type->align;
 	}
 	if (t->align < align)
 		t->align = align;
 }
 
 static void
-structdecl(struct scope *s, struct type *t, struct member ***end)
+structdecl(struct scope *s, struct structbuilder *b)
 {
-	struct type *base, *mt;
+	struct qualtype base, mt;
 	char *name;
+	uint64_t width;
 	int align;
 
 	base = declspecs(s, NULL, NULL, &align);
-	if (!base)
+	if (!base.type)
 		error(&tok.loc, "no type in struct member declaration");
 	if (tok.kind == TSEMICOLON) {
-		if ((base->kind != TYPESTRUCT && base->kind != TYPEUNION) || base->structunion.tag)
+		if ((base.type->kind != TYPESTRUCT && base.type->kind != TYPEUNION) || base.type->structunion.tag)
 			error(&tok.loc, "struct declaration must declare at least one member");
 		next();
-		addmember(t, end, base, NULL, align);
+		addmember(b, base, NULL, align, -1);
 		return;
 	}
 	for (;;) {
-		if (tok.kind != TCOLON) {
+		if (consume(TCOLON)) {
+			width = intconstexpr(s, false);
+			addmember(b, base, NULL, 0, width);
+		} else {
 			mt = declarator(s, base, &name, false);
-			addmember(t, end, mt, name, align);
+			width = consume(TCOLON) ? intconstexpr(s, false) : -1;
+			addmember(b, mt, name, align, width);
 		}
-		if (tok.kind == TCOLON)
-			error(&tok.loc, "bit-fields are not yet supported");
 		if (tok.kind == TSEMICOLON)
 			break;
 		expect(TCOMMA, "or ';' after declarator");
@@ -699,18 +726,25 @@ structdecl(struct scope *s, struct type *t, struct member ***end)
 
 /* 6.7.7 Type names */
 struct type *
-typename(struct scope *s)
+typename(struct scope *s, enum typequal *tq)
 {
-	struct type *t;
+	struct qualtype t;
 
 	t = declspecs(s, NULL, NULL, NULL);
-	return t ? declarator(s, t, NULL, true) : NULL;
+	if (t.type) {
+		t = declarator(s, t, NULL, true);
+		if (tq)
+			*tq |= t.qual;
+	}
+	return t.type;
 }
 
 bool
 decl(struct scope *s, struct func *f)
 {
-	struct type *t, *base;
+	struct qualtype base, qt;
+	struct type *t;
+	enum typequal tq;
 	enum storageclass sc;
 	enum funcspec fs;
 	struct init *init;
@@ -735,7 +769,7 @@ decl(struct scope *s, struct func *f)
 		return true;
 	}
 	base = declspecs(s, &sc, &fs, &align);
-	if (!base)
+	if (!base.type)
 		return false;
 	if (!f) {
 		/* 6.9p2 */
@@ -749,7 +783,9 @@ decl(struct scope *s, struct func *f)
 		return true;
 	}
 	for (;;) {
-		t = declarator(s, base, &name, false);
+		qt = declarator(s, base, &name, false);
+		t = qt.type;
+		tq = qt.qual;
 		kind = sc & SCTYPEDEF ? DECLTYPE : t->kind == TYPEFUNC ? DECLFUNC : DECLOBJECT;
 		d = scopegetdecl(s, name, false);
 		if (d && d->kind != kind)
@@ -759,8 +795,8 @@ decl(struct scope *s, struct func *f)
 			if (align)
 				error(&tok.loc, "typedef '%s' declared with alignment specifier", name);
 			if (!d)
-				scopeputdecl(s, name, mkdecl(DECLTYPE, t, LINKNONE));
-			else if (!typesame(d->type, t))
+				scopeputdecl(s, name, mkdecl(DECLTYPE, t, tq, LINKNONE));
+			else if (!typesame(d->type, t) || d->qual != tq)
 				error(&tok.loc, "typedef '%s' redefined with different type", name);
 			break;
 		case DECLOBJECT:
@@ -772,7 +808,7 @@ decl(struct scope *s, struct func *f)
 					if (d->linkage != linkage)
 						error(&tok.loc, "object '%s' redeclared with different linkage", name);
 				}
-				if (!typecompatible(d->type, t))
+				if (!typecompatible(d->type, t) || d->qual != tq)
 					error(&tok.loc, "object '%s' redeclared with incompatible type", name);
 				d->type = typecomposite(t, d->type);
 			} else {
@@ -784,7 +820,7 @@ decl(struct scope *s, struct func *f)
 					if (d) {
 						if (d->linkage != linkage)
 							error(&tok.loc, "object '%s' redeclared with different linkage", name);
-						if (!typecompatible(d->type, t))
+						if (!typecompatible(d->type, t) || d->qual != tq)
 							error(&tok.loc, "object '%s' redeclared with incompatible type", name);
 						t = typecomposite(t, d->type);
 					}
@@ -792,7 +828,7 @@ decl(struct scope *s, struct func *f)
 					linkage = f ? LINKNONE : sc & SCSTATIC ? LINKINTERN : LINKEXTERN;
 				}
 
-				d = mkdecl(kind, t, linkage);
+				d = mkdecl(kind, t, tq, linkage);
 				scopeputdecl(s, name, d);
 				if (linkage != LINKNONE || sc & SCSTATIC)
 					d->value = mkglobal(name, linkage == LINKNONE);
@@ -845,7 +881,7 @@ decl(struct scope *s, struct func *f)
 				}
 			}
 			if (d) {
-				if (!typecompatible(t, d->type))
+				if (!typecompatible(t, d->type) || tq != d->qual)
 					error(&tok.loc, "function '%s' redeclared with incompatible type", name);
 				d->type = typecomposite(t, d->type);
 			} else {
@@ -853,13 +889,13 @@ decl(struct scope *s, struct func *f)
 					d = scopegetdecl(s->parent, name, 1);
 				if (d && d->linkage != LINKNONE) {
 					linkage = d->linkage;
-					if (!typecompatible(t, d->type))
+					if (!typecompatible(t, d->type) || tq != d->qual)
 						error(&tok.loc, "function '%s' redeclared with incompatible type", name);
 					t = typecomposite(t, d->type);
 				} else {
 					linkage = sc & SCSTATIC ? LINKINTERN : LINKEXTERN;
 				}
-				d = mkdecl(kind, t, linkage);
+				d = mkdecl(kind, t, tq, linkage);
 				d->value = mkglobal(name, false);
 				scopeputdecl(s, name, d);
 			}
@@ -906,7 +942,7 @@ struct decl *stringdecl(struct expr *expr)
 	entry = htabput(strings, &key);
 	d = *entry;
 	if (!d) {
-		d = mkdecl(DECLOBJECT, expr->type, LINKNONE);
+		d = mkdecl(DECLOBJECT, expr->type, QUALNONE, LINKNONE);
 		d->value = mkglobal("string", true);
 		emitdata(d, mkinit(0, expr->type->size, expr));
 		*entry = d;

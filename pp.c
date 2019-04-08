@@ -6,12 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "util.h"
-#include "expr.h"
+#include "cc.h"
 #include "htab.h"
-#include "pp.h"
-#include "scan.h"
-#include "scope.h"
-#include "token.h"
 
 struct context {
 	struct token *tok;
