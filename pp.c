@@ -385,7 +385,7 @@ skipgroup(bool found)
 			continue;
 		if (tok.kind != TIDENT)
 			error(&tok.loc, "expected newline or identifier after '#'");
-		if (strcmp(tok.lit, "if") == 0) {
+		if (strcmp(tok.lit, "if") == 0 || strcmp(tok.lit, "ifdef") == 0 || strcmp(tok.lit, "ifndef") == 0) {
 			++depth;
 		} else if (strcmp(tok.lit, "endif") == 0) {
 			if (depth == 0) {
