@@ -206,7 +206,6 @@ static struct token *
 ctxnext(void)
 {
 	struct context *ctx;
-	struct token *t;
 
 	while (context.len) {
 		ctx = arraylast(&context, sizeof(*ctx));
@@ -409,7 +408,6 @@ skipgroup(bool found)
 static void
 directive(void)
 {
-	static bool newline = true;
 	char *name;
 	bool found = true, skip = false;
 
