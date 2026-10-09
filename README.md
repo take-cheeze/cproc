@@ -8,3 +8,5 @@ Fork of [cproc](https://codeberg.org/mcf/cproc), the C11 compiler front end that
 - `sync` holds only the sync workflow; don't build from it.
 
 Used by [take-cheeze/nfcxx](https://github.com/take-cheeze/nfcxx) through `3rd/cproc`.
+
+The default branch is `sync` so that the workflow is registered by GitHub. `master` stays identical to upstream.
