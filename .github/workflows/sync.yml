@@ -1,0 +1,37 @@
+name: Sync upstream cproc
+
+# Mirrors https://codeberg.org/mcf/cproc (the canonical cproc repository) into this fork:
+# every branch and tag, fast-forward only. A rewritten upstream branch makes this job fail
+# instead of overwriting the fork's history.
+#
+# Lives on the `sync` branch so `master` stays identical to upstream. Schedules only run
+# from the default branch, so the daily run needs this workflow on the default branch;
+# until then run it with "Run workflow".
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Fetch upstream (Codeberg)
+        run: git clone --mirror https://codeberg.org/mcf/cproc "$RUNNER_TEMP/upstream.git"
+
+      - name: Push branches and tags (fast-forward only)
+        working-directory: ${{ runner.temp }}/upstream.git
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git remote add mirror "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push mirror 'refs/heads/*:refs/heads/*'
+          git push mirror 'refs/tags/*:refs/tags/*'
