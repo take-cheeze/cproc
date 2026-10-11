@@ -755,6 +755,74 @@ funcbranch(struct func *f, struct expr *e, struct block *bt, struct block *bf)
 	return v;
 }
 
+/* true if every scalar in t is an integer, pointer or bool, so each eightbyte is SysV class INTEGER */
+static bool
+intclass(struct type *t)
+{
+	struct member *m;
+
+	switch (t->kind) {
+	case TYPEARRAY:
+		return intclass(t->base);
+	case TYPESTRUCT:
+	case TYPEUNION:
+		for (m = t->u.structunion.members; m; m = m->next) {
+			if (!intclass(m->type))
+				return false;
+		}
+		return true;
+	default:
+		return t->prop & PROPSCALAR && !(t->prop & PROPFLOAT);
+	}
+}
+
+/*
+va_arg for a struct/union of at most 16 bytes whose eightbytes are all class INTEGER
+(x86_64 SysV only; QBE's vaarg handles scalars). Such an argument is in the general
+registers when enough remain (gp_offset <= 48 - size), all of it or none, and otherwise in
+the overflow area. The result is the address of the argument, like any aggregate value.
+*/
+static struct value *
+funcvaargagg(struct func *f, struct expr *e)
+{
+	struct value *ap, *gp, *cond, *tmp, *addr[2];
+	struct block *b[3];
+	unsigned long long size;
+
+	if (strcmp(targ->name, "x86_64-sysv") != 0 || !e->type->size || e->type->size > 16
+	    || e->type->align > 8 || !intclass(e->type))
+		error(&tok.loc, "va_arg with non-scalar type is not yet supported (only integer-class aggregates of up to 16 bytes on x86_64)");
+	size = ALIGNUP(e->type->size, 8);
+	ap = funcexpr(f, e->base);
+	b[0] = mkblock("vaarg_reg");
+	b[1] = mkblock("vaarg_stack");
+	b[2] = mkblock("vaarg_join");
+
+	gp = funcinst(f, ILOADW, 'w', ap, NULL);
+	cond = funcinst(f, ICULEW, 'w', gp, mkintconst(48 - size));
+	funcjnz(f, cond, NULL, b[0], b[1]);
+
+	funclabel(f, b[0]);
+	tmp = funcinst(f, ILOADL, 'l', funcinst(f, IADD, 'l', ap, mkintconst(16)), NULL);  /* reg_save_area */
+	addr[0] = funcinst(f, IADD, 'l', tmp, funcinst(f, IEXTUW, 'l', gp, NULL));
+	funcinst(f, ISTOREW, 0, funcinst(f, IADD, 'w', gp, mkintconst(size)), ap);
+	b[2]->phi.val[0] = addr[0];
+	b[2]->phi.blk[0] = f->end;
+	funcjmp(f, b[2]);
+
+	funclabel(f, b[1]);
+	tmp = funcinst(f, IADD, 'l', ap, mkintconst(8));  /* &overflow_arg_area */
+	addr[1] = funcinst(f, ILOADL, 'l', tmp, NULL);
+	funcinst(f, ISTOREL, 0, funcinst(f, IADD, 'l', addr[1], mkintconst(size)), tmp);
+	b[2]->phi.val[1] = addr[1];
+	b[2]->phi.blk[1] = f->end;
+
+	funclabel(f, b[2]);
+	functemp(f, &b[2]->phi.res);
+	b[2]->phi.class = 'l';
+	return &b[2]->phi.res;
+}
+
 struct value *
 funcexpr(struct func *f, struct expr *e)
 {
@@ -999,7 +1067,7 @@ funcexpr(struct func *f, struct expr *e)
 				funcexpr(f, e->toeval);
 			/* https://todo.sr.ht/~mcf/cproc/52 */
 			if (!(e->type->prop & PROPSCALAR))
-				error(&tok.loc, "va_arg with non-scalar type is not yet supported");
+				return funcvaargagg(f, e);
 			l = funcexpr(f, e->base);
 			return funcinst(f, IVAARG, qbetype(e->type).base, l, NULL);
 		case BUILTINALLOCA:
