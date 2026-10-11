@@ -429,6 +429,10 @@ funccopy(struct func *f, struct value *dst, struct value *src, unsigned long lon
 	unsigned long long off;
 
 	assert((align & align - 1) == 0);
+	/* an empty struct or union (size 0, see cproc-empty-struct.patch) has nothing to copy; the loop
+	 * below always runs once and would write one byte past the zero-size destination */
+	if (size == 0)
+		return;
 	class = 'w';
 	switch (align) {
 	case 1: load = ILOADUB, store = ISTOREB; break;
