@@ -392,10 +392,14 @@ funcalloc(struct func *f, struct decl *d)
 	if (d->type->size) {
 		f->end = f->start;
 		v = mkintconst(d->type->size);
-	} else {
+	} else if (d->type->prop & PROPVM) {
 		assert(d->type->kind == TYPEARRAY);
 		assert(d->type->u.array.size);
 		v = d->type->u.array.size;
+	} else {
+		/* zero-size object: an empty struct or union, or an array of them (GNU extension) */
+		f->end = f->start;
+		v = mkintconst(0);
 	}
 	align = d->u.obj.align;
 	switch (align) {

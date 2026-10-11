@@ -224,10 +224,12 @@ tagspec(struct scope *s)
 		b.last = &t->u.structunion.members;
 		b.bits = 0;
 		b.pack = a.kind & ATTRPACKED;
-		do structdecl(s, &b);
-		while (tok.kind != TRBRACE);
+		/* GNU extension, accepted by gcc in C: an empty body is size 0 with alignment 1.
+		 * EDG emits `struct X {}` for empty C++ classes. */
+		while (tok.kind != TRBRACE)
+			structdecl(s, &b);
 		if (!t->u.structunion.members)
-			error(&tok.loc, "struct/union has no members");
+			t->align = 1;
 		next();
 		if (!b.pack)
 			t->size = ALIGNUP(t->size, t->align);
@@ -731,10 +733,10 @@ declarator(struct scope *s, struct qualtype base, char **name, int *align, struc
 			t->size = 0;
 			if (t->u.array.length) {
 				e = eval(t->u.array.length);
-				if (e->kind == EXPRCONST && base.type->size) {
+				if (e->kind == EXPRCONST && !(t->prop & PROPVM)) {
 					if (e->type->u.arith.issigned && e->u.constant.u >> 63)
 						error(&tok.loc, "array length must be non-negative");
-					if (e->u.constant.u > ULLONG_MAX / base.type->size)
+					if (base.type->size && e->u.constant.u > ULLONG_MAX / base.type->size)
 						error(&tok.loc, "array length is too large");
 					t->size = base.type->size * e->u.constant.u;
 				} else {
