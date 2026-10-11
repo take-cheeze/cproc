@@ -691,6 +691,21 @@ declaratortypes(struct scope *s, struct list *result, char **name, int *align, s
 	}
 }
 
+/* 6.7.3p9: a qualified array type is an array of qualified elements. A derived type keeps its base's
+   qualifiers in its own qual field, so for a qualified array (const T typedef'd to an array) the
+   qualifiers must go on the array node itself, or a pointer to it differs from a pointer to the
+   elements-qualified array (`const S *` against `const unsigned char (*)[12]`). */
+static struct type *
+qualarray(struct type *t, enum typequal qual)
+{
+	struct type *n;
+
+	n = xmalloc(sizeof(*n));
+	*n = *t;
+	n->qual |= qual;
+	return n;
+}
+
 static struct qualtype
 declarator(struct scope *s, struct qualtype base, char **name, int *align, struct scope **funcscope, bool allowabstract)
 {
@@ -702,6 +717,10 @@ declarator(struct scope *s, struct qualtype base, char **name, int *align, struc
 	if (funcscope)
 		*funcscope = NULL;
 	declaratortypes(s, &result, name, align, funcscope, allowabstract);
+	if (result.prev != &result && base.type->kind == TYPEARRAY && base.qual) {
+		base.type = qualarray(base.type, base.qual);
+		base.qual = QUALNONE;
+	}
 	for (l = result.prev; l != &result; l = prev) {
 		prev = l->prev;
 		t = listelement(l, struct type, link);

@@ -190,6 +190,31 @@ nullpointer(struct expr *e)
 	return e->u.constant.u == 0;
 }
 
+/* Qualifiers of the object a pointer points to. An array's qualifiers are those of its elements (decl.c qualarray),
+   so for a pointer to an array they are on the array type, not on the pointer. */
+static enum typequal
+pointeequal(struct type *p)
+{
+	if (p->base->kind == TYPEARRAY)
+		return p->qual | p->base->qual;
+	return p->qual;
+}
+
+/* 6.5.16.1 for the pointed-to types: compatible apart from qualifiers, which pointeequal checks. */
+static bool
+pointeecompatible(struct type *t, struct type *et)
+{
+	struct type a, b;
+
+	if (t->kind != TYPEARRAY || et->kind != TYPEARRAY)
+		return typecompatible(t, et);
+	a = *t;
+	b = *et;
+	a.qual = QUALNONE;
+	b.qual = QUALNONE;
+	return typecompatible(&a, &b);
+}
+
 struct expr *
 exprassign(struct expr *e, struct type *t)
 {
@@ -206,9 +231,9 @@ exprassign(struct expr *e, struct type *t)
 			break;
 		if (et->kind != TYPEPOINTER)
 			error(&tok.loc, "assignment to pointer must be from pointer or null pointer constant");
-		if (t->base != &typevoid && et->base != &typevoid && !typecompatible(t->base, et->base))
+		if (t->base != &typevoid && et->base != &typevoid && !pointeecompatible(t->base, et->base))
 			error(&tok.loc, "base types of pointer assignment must be compatible or void");
-		if ((et->qual & t->qual) != et->qual)
+		if (pointeequal(et) & ~pointeequal(t))
 			error(&tok.loc, "assignment to pointer discards qualifiers");
 		break;
 	case TYPENULLPTR:
