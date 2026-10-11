@@ -272,6 +272,93 @@ issoft(struct type *t)
 	return t->prop & PROPSOFT;
 }
 
+/*
+The IEEE binary16 image of _Float16 (2 bytes). halfbits rounds a double to the nearest binary16 value, ties to even,
+from its exact value, so the result is that of a single rounding; halfvalue is the double of an image. Both work on
+the bits, so the code does not depend on the host having a _Float16 type.
+*/
+static unsigned
+halfmag(unsigned long long m, int e2)
+{
+	unsigned long long q, rem, half;
+	unsigned code;
+	int p, E, Q, s;
+
+	/* m > 0; the value is m * 2^e2 */
+	for (p = 0; m >> p > 1; ++p)
+		;
+	E = p + e2;  /* the value is in [2^E, 2^(E+1)) */
+	if (E > 15)
+		return 0x7c00;
+	Q = E >= -14 ? E - 10 : -24;  /* exponent of the last bit kept */
+	s = Q - e2;  /* bits of m that are dropped */
+	if (s <= 0) {
+		q = m << -s;
+	} else if (s > 60) {
+		q = 0;
+	} else {
+		q = m >> s;
+		rem = m & (1ull << s) - 1;
+		half = 1ull << s - 1;
+		if (rem > half || (rem == half && (q & 1)))
+			++q;
+	}
+	/* a normal number has q in [1024, 2048]; a carry to 2048 raises the exponent */
+	if (E >= -14)
+		code = (unsigned)(((E + 15) << 10) + (q - 1024));
+	else
+		code = (unsigned)q;
+	return code >= 0x7c00 ? 0x7c00 : code;
+}
+
+unsigned
+halfbits(double x)
+{
+	unsigned long long u, m;
+	unsigned sign;
+	int exp, e2;
+
+	memcpy(&u, &x, sizeof u);
+	sign = (unsigned)(u >> 63) << 15;
+	exp = u >> 52 & 0x7ff;
+	m = u & (1ull << 52) - 1;
+	if (exp == 0x7ff)
+		return sign | (m ? 0x7e00 : 0x7c00);
+	if (exp == 0) {
+		if (m == 0)
+			return sign;
+		e2 = -1074;
+	} else {
+		m |= 1ull << 52;
+		e2 = exp - 1075;
+	}
+	return sign | halfmag(m, e2);
+}
+
+double
+halfvalue(unsigned bits)
+{
+	unsigned long long u;
+	unsigned exp, man;
+	double x;
+
+	exp = bits >> 10 & 31;
+	man = bits & 1023;
+	if (exp == 0) {
+		/* a subnormal, man * 2^-24: exact as a double */
+		x = (double)man / 16777216.0;
+	} else {
+		if (exp == 31)
+			u = 0x7ffull << 52 | (man ? 1ull << 51 : 0);
+		else
+			u = (unsigned long long)(exp + 1008) << 52 | (unsigned long long)man << 42;
+		memcpy(&x, &u, sizeof x);
+	}
+	if (bits >> 15)
+		x = -x;
+	return x;
+}
+
 static void
 cast(struct expr *expr)
 {
@@ -282,6 +369,8 @@ cast(struct expr *expr)
 	if (t->prop & PROPFLOAT) {
 		if (t->size == 4)
 			expr->u.constant.f = (float)expr->u.constant.f;
+		else if (t->size == 2)
+			expr->u.constant.f = halfvalue(halfbits(expr->u.constant.f));
 	} else if (t->prop & PROPINT) {
 		m = 1ull << t->u.arith.width - 1;
 		expr->u.constant.u &= m | m - 1;

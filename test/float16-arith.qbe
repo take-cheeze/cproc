@@ -1,0 +1,75 @@
+export
+function w $f(w %.1, w %.3) {
+@start.1
+	%.2 =l alloc4 2
+	storeh %.1, %.2
+	%.4 =l alloc4 4
+	storew %.3, %.4
+@body.2
+	%.5 =w loaduh %.2
+	%.6 =w loadw %.4
+	%.7 =l extsw %.6
+	%.8 =w call $__nfcxx_f16_from_s64(l %.7)
+	%.9 =w call $__nfcxx_f16_add(w %.5, w %.8)
+	storeh %.9, %.2
+	%.10 =w loaduh %.2
+	%.11 =w xor %.10, 32768
+	ret %.11
+}
+export
+function w $g(w %.1) {
+@start.3
+	%.2 =l alloc4 2
+	storeh %.1, %.2
+@body.4
+	%.3 =w loaduh %.2
+	%.4 =d call $__nfcxx_f16_to_f64(w %.3)
+	%.5 =w cltd %.4, d_1
+	ret %.5
+}
+export
+function w $inc(w %.1) {
+@start.5
+	%.2 =l alloc4 2
+	storeh %.1, %.2
+@body.6
+	%.3 =w loaduh %.2
+	%.4 =w call $__nfcxx_f16_add(w %.3, w 15360)
+	storeh %.4, %.2
+	%.5 =w loaduh %.2
+	ret %.5
+}
+export
+function d $d(w %.1) {
+@start.7
+	%.2 =l alloc4 2
+	storeh %.1, %.2
+@body.8
+	%.3 =w loaduh %.2
+	%.4 =d call $__nfcxx_f16_to_f64(w %.3)
+	%.5 =s truncd %.4
+	%.6 =s mul %.5, s_2
+	%.7 =d exts %.6
+	ret %.7
+}
+export
+function w $c(d %.1) {
+@start.9
+	%.2 =l alloc8 8
+	stored %.1, %.2
+@body.10
+	%.3 =d loadd %.2
+	%.4 =w call $__nfcxx_f16_from_f64(d %.3)
+	ret %.4
+}
+export
+function l $l(w %.1) {
+@start.11
+	%.2 =l alloc4 2
+	storeh %.1, %.2
+@body.12
+	%.3 =w loaduh %.2
+	%.4 =d call $__nfcxx_f16_to_f64(w %.3)
+	%.5 =l dtosi %.4
+	ret %.5
+}

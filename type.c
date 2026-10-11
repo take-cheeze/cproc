@@ -46,6 +46,9 @@ struct type typefloat128 = {
 	.kind = TYPEFLOAT128, .size = 16, .align = 16,
 	.prop = PROPSCALAR|PROPARITH|PROPREAL|PROPSOFT,
 };
+/* _Float16 is an IEEE binary16 value in 2 bytes; it is an ordinary (non-soft) float whose QBE value is the 16-bit
+ * pattern in a word (qbe.c, f16binary) */
+struct type typefloat16 = FLTTYPE(TYPEFLOAT16, 2);
 
 struct type typenullptr = {.kind = TYPENULLPTR, .size = 8, .align = 8, .prop = PROPSCALAR};
 
@@ -235,6 +238,8 @@ typecommonreal(struct type *t1, unsigned w1, struct type *t2, unsigned w2)
 		return &typedouble;
 	if (t1 == &typefloat || t2 == &typefloat)
 		return &typefloat;
+	if (t1 == &typefloat16 || t2 == &typefloat16)
+		return &typefloat16;
 	t1 = typepromote(t1, w1);
 	t2 = typepromote(t2, w2);
 	if (t1 == t2)

@@ -50,6 +50,7 @@ enum typekind {
 	TYPEDOUBLE,
 	TYPELDOUBLE,
 	TYPEFLOAT128,
+	TYPEFLOAT16,
 	TYPEPOINTER,
 	TYPEARRAY,
 	TYPEFUNC,
@@ -348,6 +349,8 @@ bool typehasint(struct type *, unsigned long long, bool);
 
 /* 16-byte floating types (eval.c): the image of a constant of type t, and the sign flip of such an image */
 void softimage(unsigned long long img[2], struct type *t, long double x);
+unsigned halfbits(double x);
+double halfvalue(unsigned bits);
 void softliteral(unsigned long long img[2], const char *lit);
 unsigned long long softsignbit(struct type *t);
 
@@ -358,7 +361,7 @@ extern struct type typeshort, typeushort;
 extern struct type typeint, typeuint;
 extern struct type typelong, typeulong;
 extern struct type typellong, typeullong;
-extern struct type typefloat, typedouble, typeldouble, typefloat128;
+extern struct type typefloat, typedouble, typeldouble, typefloat128, typefloat16;
 extern struct type typenullptr;
 extern struct type *typeadjvalist;
 

@@ -1,0 +1,15 @@
+export data $a = align 2 { h 11878, }
+export data $b = align 2 { h 31744, }
+export data $c = align 2 { h 26624, }
+export data $d = align 2 { h 64511, }
+export data $e = align 2 { h 1, }
+export data $f = align 2 { h 15360, h 16384, h 16896, }
+export
+function w $g() {
+@start.1
+@body.2
+	%.1 =w call $__nfcxx_f16_from_f64(d d_0.10000000000000001)
+	%.2 =w loaduh extern $a
+	%.3 =w call $__nfcxx_f16_eq(w %.1, w %.2)
+	ret %.3
+}

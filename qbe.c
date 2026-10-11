@@ -297,7 +297,7 @@ static struct value *convert(struct func *f, struct type *dst, struct type *src,
 static struct value *
 softname(struct type *t, const char *op)
 {
-	const char *prefix = t->kind == TYPEFLOAT128 ? "__nfcxx_f128_" : "__nfcxx_ld_";
+	const char *prefix = t->kind == TYPEFLOAT128 ? "__nfcxx_f128_" : t->kind == TYPEFLOAT16 ? "__nfcxx_f16_" : "__nfcxx_ld_";
 	struct value *v;
 	char *name;
 
@@ -434,6 +434,71 @@ convertsoft(struct func *f, struct type *dst, struct type *src, struct value *l)
 	return softcall(f, dst->size == 4 ? 's' : 'd', softname(src, name), 1, a);
 }
 
+/*
+_Float16 (TYPEFLOAT16) is a scalar whose QBE value is its 16-bit pattern in a word. Each operation is a call of a
+helper of the runtime (be/nfcxx_ldrt.c, __nfcxx_f16_<op>) on patterns, which returns a pattern or, for a comparison, an
+int. The helpers round a result once, to nearest with ties to even. A conversion to a wider type goes through double,
+which holds every binary16 value exactly.
+*/
+static struct value *
+f16binary(struct func *f, enum tokenkind op, struct type *t, struct value *l, struct value *r)
+{
+	struct softarg a[2];
+	const char *name;
+
+	switch (op) {
+	case TADD:     name = "add"; break;
+	case TSUB:     name = "sub"; break;
+	case TMUL:     name = "mul"; break;
+	case TDIV:     name = "div"; break;
+	case TEQL:     name = "eq"; break;
+	case TNEQ:     name = "ne"; break;
+	case TLESS:    name = "lt"; break;
+	case TLEQ:     name = "le"; break;
+	case TGREATER: name = "gt"; break;
+	case TGEQ:     name = "ge"; break;
+	default:
+		fatal("internal error; unsupported operation on _Float16");
+	}
+	a[0] = (struct softarg){'w', l};
+	a[1] = (struct softarg){'w', r};
+	return softcall(f, 'w', softname(t, name), 2, a);
+}
+
+/* a conversion where dst or src is _Float16 (src and dst differ) */
+static struct value *
+convertf16(struct func *f, struct type *dst, struct type *src, struct value *l)
+{
+	struct softarg a[1];
+	struct value *d;
+
+	if (dst->kind == TYPEFLOAT16) {
+		if (src->prop & PROPINT) {
+			if (src->size < 8)
+				l = convert(f, src->u.arith.issigned ? &typelong : &typeulong, src, l);
+			a[0] = (struct softarg){'l', l};
+			return softcall(f, 'w', softname(dst, src->u.arith.issigned ? "from_s64" : "from_u64"), 1, a);
+		}
+		/* the 16-byte types are rounded to binary16 directly (rounding them to double first could double round) */
+		if (src->kind == TYPELDOUBLE || src->kind == TYPEFLOAT128) {
+			a[0] = (struct softarg){'l', l};
+			return softcall(f, 'w', softname(dst, src->kind == TYPELDOUBLE ? "from_ld" : "from_f128"), 1, a);
+		}
+		/* a float or double is exact as a double */
+		d = convert(f, &typedouble, src, l);
+		a[0] = (struct softarg){'d', d};
+		return softcall(f, 'w', softname(dst, "from_f64"), 1, a);
+	}
+	if (dst->kind == TYPEBOOL) {
+		/* a value is true unless it is +0 or -0 (a NaN is true) */
+		l = funcinst(f, IAND, 'w', l, mkintconst(0x7fff));
+		return funcinst(f, ICNEW, 'w', l, mkintconst(0));
+	}
+	a[0] = (struct softarg){'w', l};
+	d = softcall(f, 'd', softname(src, "to_f64"), 1, a);
+	return convert(f, dst, &typedouble, d);
+}
+
 static struct value *
 convert(struct func *f, struct type *dst, struct type *src, struct value *l)
 {
@@ -449,6 +514,8 @@ convert(struct func *f, struct type *dst, struct type *src, struct value *l)
 		dst = &typeulong;
 	if (dst->kind == TYPEVOID)
 		return NULL;
+	if (src->kind == TYPEFLOAT16 || dst->kind == TYPEFLOAT16)
+		return convertf16(f, dst, src, l);
 	if ((src->prop | dst->prop) & PROPSOFT)
 		return convertsoft(f, dst, src, l);
 	if (!(src->prop & PROPREAL) || !(dst->prop & PROPREAL))
@@ -1026,6 +1093,8 @@ funcexpr(struct func *f, struct expr *e)
 		if (t->prop & PROPINT || t->kind == TYPEPOINTER)
 			return mkintconst(e->u.constant.u);
 		assert(t->prop & PROPFLOAT);
+		if (t->kind == TYPEFLOAT16)
+			return mkintconst(halfbits(e->u.constant.f));
 		return mkfltconst(t->size == 4 ? VALUE_FLTCONST : VALUE_DBLCONST, e->u.constant.f);
 	case EXPRBITFIELD:
 	case EXPRCOMPOUND:
@@ -1044,6 +1113,12 @@ funcexpr(struct func *f, struct expr *e)
 			}
 			r = convert(f, t, &typeint, mkintconst(1));
 			v = softbinary(f, e->op == TINC ? TADD : TSUB, t, funcload(f, t, lval), r);
+			v = funcstore(f, e->type, e->qual, lval, v);
+			return e->u.incdec.post ? l : v;
+		}
+		if (t->kind == TYPEFLOAT16) {
+			/* 1.0 is 0x3c00 */
+			v = f16binary(f, e->op == TINC ? TADD : TSUB, t, l, mkintconst(0x3c00));
 			v = funcstore(f, e->type, e->qual, lval, v);
 			return e->u.incdec.post ? l : v;
 		}
@@ -1098,6 +1173,8 @@ funcexpr(struct func *f, struct expr *e)
 			r = funcexpr(f, e->base);
 			if (e->type->prop & PROPSOFT)
 				return softunary(f, e->type, "neg", r);
+			if (e->type->kind == TYPEFLOAT16)
+				return funcinst(f, IXOR, 'w', r, mkintconst(0x8000));
 			return funcinst(f, INEG, qbetype(e->type).base, r, NULL);
 		}
 		fatal("internal error; unknown unary expression");
@@ -1135,6 +1212,8 @@ funcexpr(struct func *f, struct expr *e)
 			t = &typeulong;
 		if (t->prop & PROPSOFT)
 			return softbinary(f, e->op, t, l, r);
+		if (t->kind == TYPEFLOAT16)
+			return f16binary(f, e->op, t, l, r);
 		switch (e->op) {
 		case TMUL:
 			op = IMUL;
@@ -1720,7 +1799,9 @@ dataitem(struct expr *expr, unsigned long long size)
 		dataitem(expr->u.binary.r, 0);
 		break;
 	case EXPRCONST:
-		if (expr->type->prop & PROPFLOAT)
+		if (expr->type->kind == TYPEFLOAT16)
+			printf("%u", halfbits(expr->u.constant.f));
+		else if (expr->type->prop & PROPFLOAT)
 			printf("%c_%.17g", expr->type->size == 4 ? 's' : 'd', expr->u.constant.f);
 		else
 			printf("%llu", expr->u.constant.u);
