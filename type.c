@@ -37,7 +37,15 @@ struct type typeullong  = INTTYPE(TYPELLONG, 8, false, 0);
 
 struct type typefloat   = FLTTYPE(TYPEFLOAT, 4);
 struct type typedouble  = FLTTYPE(TYPEDOUBLE, 8);
-struct type typeldouble = FLTTYPE(TYPELDOUBLE, 16);
+/* long double and __float128 are 16-byte objects with no QBE scalar class (see qbe.c, PROPSOFT) */
+struct type typeldouble = {
+	.kind = TYPELDOUBLE, .size = 16, .align = 16,
+	.prop = PROPSCALAR|PROPARITH|PROPREAL|PROPSOFT,
+};
+struct type typefloat128 = {
+	.kind = TYPEFLOAT128, .size = 16, .align = 16,
+	.prop = PROPSCALAR|PROPARITH|PROPREAL|PROPSOFT,
+};
 
 struct type typenullptr = {.kind = TYPENULLPTR, .size = 8, .align = 8, .prop = PROPSCALAR};
 
@@ -219,6 +227,8 @@ typecommonreal(struct type *t1, unsigned w1, struct type *t2, unsigned w2)
 	struct type *tmp;
 
 	assert(t1->prop & PROPREAL && t2->prop & PROPREAL);
+	if (t1 == &typefloat128 || t2 == &typefloat128)
+		return &typefloat128;
 	if (t1 == &typeldouble || t2 == &typeldouble)
 		return &typeldouble;
 	if (t1 == &typedouble || t2 == &typedouble)

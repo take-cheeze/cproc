@@ -13,6 +13,7 @@ scopeinit(void)
 		{.name = "__builtin_alloca",      .kind = DECLBUILTIN, .u.builtin = BUILTINALLOCA},
 		{.name = "__builtin_constant_p",  .kind = DECLBUILTIN, .u.builtin = BUILTINCONSTANTP},
 		{.name = "__builtin_expect",      .kind = DECLBUILTIN, .u.builtin = BUILTINEXPECT},
+		{.name = "__builtin_fabsf",      .kind = DECLBUILTIN, .u.builtin = BUILTINFABSF},
 		{.name = "__builtin_inff",        .kind = DECLBUILTIN, .u.builtin = BUILTININFF},
 		{.name = "__builtin_nanf",        .kind = DECLBUILTIN, .u.builtin = BUILTINNANF},
 		{.name = "__builtin_offsetof",    .kind = DECLBUILTIN, .u.builtin = BUILTINOFFSETOF},

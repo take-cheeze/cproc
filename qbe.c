@@ -196,14 +196,13 @@ qbetype(struct type *t)
 
 	if (t == &typevoid)
 		return v;
-	if (!(t->prop & PROPSCALAR))
+	if (!(t->prop & PROPSCALAR) || t->prop & PROPSOFT)
 		return l;
 	switch (t->size) {
 	case 1: return t->u.arith.issigned ? sb : ub;
 	case 2: return t->u.arith.issigned ? sh : uh;
 	case 4: return t->prop & PROPFLOAT ? s : w;
 	case 8: return t->prop & PROPFLOAT ? d : l;
-	case 16: fatal("long double is not yet supported");
 	}
 	assert(0);
 }
@@ -279,6 +278,162 @@ funcbits(struct func *f, struct type *t, struct value *v, struct bitfield b)
 	return v;
 }
 
+/*
+Soft floating types: long double and __float128 (PROPSOFT in cc.h). Such a value is not a QBE scalar. Like a struct, its
+value is the address of a 16-byte, 16-aligned object, and passing or returning one by value uses the QBE aggregate
+:__nfcxx_soft16 (two integer eightbytes), which the struct code of the calls, parameters and returns already handles.
+Every arithmetic operation, comparison and conversion is a call of a helper of the runtime (be/nfcxx_ldrt.c, names
+__nfcxx_ld_<op> for long double and __nfcxx_f128_<op> for __float128). A helper takes its operands by address and writes
+a result through the first address, so no 16-byte value crosses the call in a register. A predicate or integer result is
+returned in an integer register.
+*/
+struct softarg {
+	int class;
+	struct value *v;
+};
+
+static struct value *convert(struct func *f, struct type *dst, struct type *src, struct value *l);
+
+static struct value *
+softname(struct type *t, const char *op)
+{
+	const char *prefix = t->kind == TYPEFLOAT128 ? "__nfcxx_f128_" : "__nfcxx_ld_";
+	struct value *v;
+	char *name;
+
+	name = xmalloc(strlen(prefix) + strlen(op) + 1);
+	strcpy(name, prefix);
+	strcat(name, op);
+	v = xmalloc(sizeof(*v));
+	v->kind = VALUE_GLOBAL;
+	v->u.name = name;
+	v->id = 0;
+	return v;
+}
+
+/* a 16-byte temporary, allocated in the entry block as funcalloc does, so that a loop does not grow the stack */
+static struct value *
+softtemp(struct func *f)
+{
+	struct block *end = f->end;
+	struct value *v;
+
+	f->end = f->start;
+	v = funcinst(f, IALLOC16, ptrclass, mkintconst(16), NULL);
+	f->end = end;
+	return v;
+}
+
+/* a call of fn (class is the class of its result, 0 for none) with n arguments */
+static struct value *
+softcall(struct func *f, int class, struct value *fn, unsigned n, struct softarg *arg)
+{
+	struct value *r;
+	unsigned i;
+
+	r = funcinst(f, ICALL, class, fn, NULL);
+	for (i = 0; i < n; ++i)
+		funcinst(f, IARG, arg[i].class, arg[i].v, NULL);
+	return r;
+}
+
+/* the operation op (an operator token) on two soft operands of type t: a new temporary, or an int for a comparison */
+static struct value *
+softbinary(struct func *f, enum tokenkind op, struct type *t, struct value *l, struct value *r)
+{
+	struct softarg a[3];
+	struct value *d;
+	const char *name;
+	bool cmp = false;
+
+	switch (op) {
+	case TADD:    name = "add"; break;
+	case TSUB:    name = "sub"; break;
+	case TMUL:    name = "mul"; break;
+	case TDIV:    name = "div"; break;
+	case TEQL:    name = "eq"; cmp = true; break;
+	case TNEQ:    name = "ne"; cmp = true; break;
+	case TLESS:   name = "lt"; cmp = true; break;
+	case TLEQ:    name = "le"; cmp = true; break;
+	case TGREATER: name = "gt"; cmp = true; break;
+	case TGEQ:    name = "ge"; cmp = true; break;
+	default:
+		fatal("internal error; unsupported operation on a 16-byte floating type");
+	}
+	a[0] = (struct softarg){'l', l};
+	a[1] = (struct softarg){'l', r};
+	if (cmp)
+		return softcall(f, 'w', softname(t, name), 2, a);
+	d = softtemp(f);
+	a[0] = (struct softarg){'l', d};
+	a[1] = (struct softarg){'l', l};
+	a[2] = (struct softarg){'l', r};
+	softcall(f, 0, softname(t, name), 3, a);
+	return d;
+}
+
+/* a unary helper on a soft value: neg */
+static struct value *
+softunary(struct func *f, struct type *t, const char *name, struct value *l)
+{
+	struct softarg a[2];
+	struct value *d;
+
+	d = softtemp(f);
+	a[0] = (struct softarg){'l', d};
+	a[1] = (struct softarg){'l', l};
+	softcall(f, 0, softname(t, name), 2, a);
+	return d;
+}
+
+/* a conversion where dst or src is a soft type (src and dst differ, and neither is a pointer or void) */
+static struct value *
+convertsoft(struct func *f, struct type *dst, struct type *src, struct value *l)
+{
+	struct softarg a[2];
+	struct value *d;
+	const char *name;
+	int bits;
+
+	if (dst->prop & PROPSOFT && src->prop & PROPSOFT) {
+		d = softtemp(f);
+		a[0] = (struct softarg){'l', d};
+		a[1] = (struct softarg){'l', l};
+		softcall(f, 0, softname(dst, src->kind == TYPELDOUBLE ? "from_ld" : "from_f128"), 2, a);
+		return d;
+	}
+	if (dst->prop & PROPSOFT) {
+		d = softtemp(f);
+		a[0] = (struct softarg){'l', d};
+		if (src->prop & PROPINT) {
+			if (src->size < 8)
+				l = convert(f, src->u.arith.issigned ? &typelong : &typeulong, src, l);
+			name = src->u.arith.issigned ? "from_s64" : "from_u64";
+			a[1] = (struct softarg){'l', l};
+		} else if (src->size == 4) {
+			name = "from_f32";
+			a[1] = (struct softarg){'s', l};
+		} else {
+			name = "from_f64";
+			a[1] = (struct softarg){'d', l};
+		}
+		softcall(f, 0, softname(dst, name), 2, a);
+		return d;
+	}
+	/* from a soft type to a scalar */
+	a[0] = (struct softarg){'l', l};
+	if (dst->kind == TYPEBOOL) {
+		return softcall(f, 'w', softname(src, "nz"), 1, a);
+	} else if (dst->prop & PROPINT) {
+		bits = dst->size * 8;
+		a[1] = (struct softarg){'w', mkintconst(bits)};
+		name = dst->u.arith.issigned ? "to_s" : "to_u";
+		return softcall(f, dst->size == 8 ? 'l' : 'w', softname(src, name), 2, a);
+	}
+	name = dst->size == 4 ? "to_f32" : "to_f64";
+	return softcall(f, dst->size == 4 ? 's' : 'd', softname(src, name), 1, a);
+}
+
 static struct value *
 convert(struct func *f, struct type *dst, struct type *src, struct value *l)
 {
@@ -294,6 +449,8 @@ convert(struct func *f, struct type *dst, struct type *src, struct value *l)
 		dst = &typeulong;
 	if (dst->kind == TYPEVOID)
 		return NULL;
+	if ((src->prop | dst->prop) & PROPSOFT)
+		return convertsoft(f, dst, src, l);
 	if (!(src->prop & PROPREAL) || !(dst->prop & PROPREAL))
 		fatal("internal error; unsupported conversion");
 	if (dst->kind == TYPEBOOL) {
@@ -469,6 +626,10 @@ funcstore(struct func *f, struct type *t, enum typequal tq, struct lvalue lval, 
 	tp = t->prop;
 	assert(!lval.bits.before && !lval.bits.after || tp & PROPINT);
 	r = v;
+	if (tp & PROPSOFT) {
+		funccopy(f, lval.addr, v, t->size, t->align);
+		return r;
+	}
 	switch (t->kind) {
 	case TYPESTRUCT:
 	case TYPEUNION:
@@ -506,6 +667,8 @@ funcload(struct func *f, struct type *t, struct lvalue lval)
 	struct value *v;
 	struct qbetype qt;
 
+	if (t->prop & PROPSOFT)
+		return lval.addr;
 	switch (t->kind) {
 	case TYPESTRUCT:
 	case TYPEUNION:
@@ -852,6 +1015,14 @@ funcexpr(struct func *f, struct expr *e)
 		break;
 	case EXPRCONST:
 		t = e->type;
+		if (t->prop & PROPSOFT) {
+			/* the image of the constant, stored into a temporary */
+			v = softtemp(f);
+			funcinst(f, ISTOREL, 0, mkintconst(e->u.constant.soft[0]), v);
+			r = funcinst(f, IADD, ptrclass, v, mkintconst(8));
+			funcinst(f, ISTOREL, 0, mkintconst(e->u.constant.soft[1]), r);
+			return v;
+		}
 		if (t->prop & PROPINT || t->kind == TYPEPOINTER)
 			return mkintconst(e->u.constant.u);
 		assert(t->prop & PROPFLOAT);
@@ -864,6 +1035,18 @@ funcexpr(struct func *f, struct expr *e)
 		lval = funclval(f, e->base);
 		l = funcload(f, e->base->type, lval);
 		t = e->type;
+		if (t->prop & PROPSOFT) {
+			/* the old value is copied out first: the store overwrites the object that l addresses */
+			if (e->u.incdec.post) {
+				r = softtemp(f);
+				funccopy(f, r, l, t->size, t->align);
+				l = r;
+			}
+			r = convert(f, t, &typeint, mkintconst(1));
+			v = softbinary(f, e->op == TINC ? TADD : TSUB, t, funcload(f, t, lval), r);
+			v = funcstore(f, e->type, e->qual, lval, v);
+			return e->u.incdec.post ? l : v;
+		}
 		if (t->kind == TYPEPOINTER) {
 			if (t->base->kind == TYPEARRAY && t->base->size == 0) {
 				r = t->base->u.array.size;
@@ -913,6 +1096,8 @@ funcexpr(struct func *f, struct expr *e)
 			return funcload(f, e->type, (struct lvalue){r});
 		case TSUB:
 			r = funcexpr(f, e->base);
+			if (e->type->prop & PROPSOFT)
+				return softunary(f, e->type, "neg", r);
 			return funcinst(f, INEG, qbetype(e->type).base, r, NULL);
 		}
 		fatal("internal error; unknown unary expression");
@@ -948,6 +1133,8 @@ funcexpr(struct func *f, struct expr *e)
 		t = e->u.binary.l->type;
 		if (t->kind == TYPEPOINTER)
 			t = &typeulong;
+		if (t->prop & PROPSOFT)
+			return softbinary(f, e->op, t, l, r);
 		switch (e->op) {
 		case TMUL:
 			op = IMUL;
@@ -1070,7 +1257,7 @@ funcexpr(struct func *f, struct expr *e)
 			if (e->toeval)
 				funcexpr(f, e->toeval);
 			/* https://todo.sr.ht/~mcf/cproc/52 */
-			if (!(e->type->prop & PROPSCALAR))
+			if (!(e->type->prop & PROPSCALAR) || e->type->prop & PROPSOFT)
 				return funcvaargagg(f, e);
 			l = funcexpr(f, e->base);
 			return funcinst(f, IVAARG, qbetype(e->type).base, l, NULL);
@@ -1080,6 +1267,20 @@ funcexpr(struct func *f, struct expr *e)
 		case BUILTINUNREACHABLE:
 			funchlt(f);
 			return NULL;
+		case BUILTINFABSF:
+			/* clear the sign bit of the float in a 4-byte temporary (entry block, as softtemp) */
+			l = funcexpr(f, e->base);
+			{
+				struct block *end = f->end;
+				f->end = f->start;
+				v = funcinst(f, IALLOC4, ptrclass, mkintconst(4), NULL);
+				f->end = end;
+			}
+			funcinst(f, ISTORES, 0, l, v);
+			l = funcinst(f, ILOADW, 'w', v, NULL);
+			l = funcinst(f, IAND, 'w', l, mkintconst(0x7fffffff));
+			funcinst(f, ISTOREW, 0, l, v);
+			return funcinst(f, ILOADS, 's', v, NULL);
 		default:
 			fatal("internal error: unimplemented builtin");
 		}
@@ -1113,6 +1314,10 @@ zero(struct func *func, struct value *addr, int align, unsigned long long offset
 	struct value *tmp;
 	int a = 1;
 
+	/* the stores are at most 8 bytes (store[] has no entry for more); an object aligned to 16 is aligned to 8 at each
+	 * offset that matters here, so clamping the alignment is enough (long double arrays and structs reach this) */
+	if (align > 8)
+		align = 8;
 	while (offset < end) {
 		if ((align - (offset & align - 1)) & a) {
 			tmp = offset ? funcinst(func, IADD, ptrclass, addr, mkintconst(offset)) : addr;
@@ -1277,10 +1482,21 @@ static void
 emittype(struct type *t)
 {
 	static unsigned id;
+	static struct value soft = {.kind = VALUE_TYPE, .u.name = "__nfcxx_soft16"};
+	static bool softemitted;
 	struct member *m, *other;
 	struct type *sub;
 	unsigned long long off;
 
+	if (t->prop & PROPSOFT) {
+		/* the aggregate of a 16-byte floating value: two integer eightbytes, 16-aligned */
+		if (!softemitted) {
+			softemitted = true;
+			puts("type :__nfcxx_soft16 = align 16 { l, l }");
+		}
+		t->value = &soft;
+		return;
+	}
 	if (t->value || t->kind != TYPESTRUCT && t->kind != TYPEUNION)
 		return;
 	t->value = xmalloc(sizeof(*t->value));
@@ -1601,6 +1817,13 @@ emitdata(struct decl *d, struct init *init)
 			t = cur->expr->type;
 			if (t->kind == TYPEARRAY)
 				t = t->base;
+			if (t->prop & PROPSOFT) {
+				if (cur->expr->kind != EXPRCONST)
+					error(&tok.loc, "initializer is not a constant expression");
+				printf("l %llu, l %llu, ", cur->expr->u.constant.soft[0], cur->expr->u.constant.soft[1]);
+				offset = end;
+				continue;
+			}
 			printf("%c ", qbetype(t).data);
 			dataitem(cur->expr, cur->end - cur->start);
 			fputs(", ", stdout);

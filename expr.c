@@ -790,8 +790,14 @@ primaryexpr(struct scope *s)
 				e->type = &typefloat;
 			else if ((end[0] == 'l' || end[0] == 'L') && !end[1])
 				e->type = &typeldouble;
+			else if ((end[0] == 'q' || end[0] == 'Q') && !end[1])
+				e->type = &typefloat128;
 			else
 				error(&tok.loc, "invalid floating constant suffix '%s'", end);
+			if (e->type == &typefloat128)
+				softliteral(e->u.constant.soft, tok.lit);
+			else if (e->type == &typeldouble)
+				softimage(e->u.constant.soft, e->type, strtold(tok.lit, NULL));
 		} else {
 			src = tok.lit;
 			if (base == 2)
@@ -892,6 +898,11 @@ builtinfunc(struct scope *s, enum builtinkind kind)
 		e = exprassign(assignexpr(s), &typeulong);
 		e = mkexpr(EXPRBUILTIN, mkpointertype(&typevoid, QUALNONE), e);
 		e->u.builtin.kind = BUILTINALLOCA;
+		break;
+	case BUILTINFABSF:
+		e = exprconvert(assignexpr(s), &typefloat);
+		e = mkexpr(EXPRBUILTIN, &typefloat, e);
+		e->u.builtin.kind = BUILTINFABSF;
 		break;
 	case BUILTINCONSTANTP:
 		e = mkconstexpr(&typeint, eval(condexpr(s))->kind == EXPRCONST);

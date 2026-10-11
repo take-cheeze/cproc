@@ -49,6 +49,7 @@ enum typekind {
 	TYPEFLOAT,
 	TYPEDOUBLE,
 	TYPELDOUBLE,
+	TYPEFLOAT128,
 	TYPEPOINTER,
 	TYPEARRAY,
 	TYPEFUNC,
@@ -69,6 +70,9 @@ enum typeprop {
 	PROPFLOAT   = 1<<5,
 	PROPVM      = 1<<6, /* variably-modified type */
 	PROPFLEX    = 1<<7, /* struct with flexible array member */
+	/* 16-byte floating type (long double, __float128): a value is the address of a 16-byte object, and each
+	 * operation is a call of a runtime helper (qbe.c: softname, softbinary, convertsoft) */
+	PROPSOFT    = 1<<8,
 };
 
 struct bitfield {
@@ -142,6 +146,7 @@ enum builtinkind {
 	BUILTINALLOCA,
 	BUILTINCONSTANTP,
 	BUILTINEXPECT,
+	BUILTINFABSF,
 	BUILTININFF,
 	BUILTINNANF,
 	BUILTINOFFSETOF,
@@ -244,6 +249,8 @@ struct expr {
 			unsigned long long u;
 			long long i;
 			double f;
+			/* a 16-byte floating constant (PROPSOFT type): the object image, low and high eightbyte */
+			unsigned long long soft[2];
 		} constant;
 		struct stringlit string;
 		struct {
@@ -339,6 +346,11 @@ enum typeprop typeprop(struct type *);
 struct member *typemember(struct type *, const char *, unsigned long long *);
 bool typehasint(struct type *, unsigned long long, bool);
 
+/* 16-byte floating types (eval.c): the image of a constant of type t, and the sign flip of such an image */
+void softimage(unsigned long long img[2], struct type *t, long double x);
+void softliteral(unsigned long long img[2], const char *lit);
+unsigned long long softsignbit(struct type *t);
+
 extern struct type typevoid;
 extern struct type typebool;
 extern struct type typechar, typeschar, typeuchar;
@@ -346,7 +358,7 @@ extern struct type typeshort, typeushort;
 extern struct type typeint, typeuint;
 extern struct type typelong, typeulong;
 extern struct type typellong, typeullong;
-extern struct type typefloat, typedouble, typeldouble;
+extern struct type typefloat, typedouble, typeldouble, typefloat128;
 extern struct type typenullptr;
 extern struct type *typeadjvalist;
 
