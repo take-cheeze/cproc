@@ -486,6 +486,9 @@ inttype(unsigned long long val, bool decimal, char *suffix)
 		if (typehasint(t, val, false))
 			return t;
 	}
+	/* gcc: a decimal constant too large for every signed type is unsigned (gcc also warns: "so large that it is unsigned") */
+	if (sign && decimal)
+		return &typeullong;
 notype:
 	error(&tok.loc, "no suitable type for constant '%s'", tok.lit);
 }
