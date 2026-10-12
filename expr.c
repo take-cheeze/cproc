@@ -81,6 +81,11 @@ mkconstexpr(struct type *t, unsigned long long n)
 
 	e = mkexpr(EXPRCONST, t, NULL);
 	e->u.constant.u = n;
+	if (t->kind == TYPEINT128) {
+		/* the 128-bit image: n sign-extended (the constants are ints, and ~x is x ^ -1) */
+		e->u.constant.soft[0] = n;
+		e->u.constant.soft[1] = (long long)n < 0 ? ~0ull : 0;
+	}
 
 	return e;
 }

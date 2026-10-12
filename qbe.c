@@ -325,7 +325,8 @@ static struct value *convert(struct func *f, struct type *dst, struct type *src,
 static struct value *
 softname(struct type *t, const char *op)
 {
-	const char *prefix = t->kind == TYPEFLOAT128 ? "__nfcxx_f128_" : t->kind == TYPEFLOAT16 ? "__nfcxx_f16_" : "__nfcxx_ld_";
+	const char *prefix = t->kind == TYPEINT128 ? "__nfcxx_i128_" : t->kind == TYPEFLOAT128 ? "__nfcxx_f128_" :
+	                     t->kind == TYPEFLOAT16 ? "__nfcxx_f16_" : "__nfcxx_ld_";
 	struct value *v;
 	char *name;
 
@@ -365,6 +366,59 @@ softcall(struct func *f, int class, struct value *fn, unsigned n, struct softarg
 	return r;
 }
 
+/*
+__int128 and unsigned __int128 (TYPEINT128, PROPSOFT): the same scheme as the floating soft types, with the helpers
+__nfcxx_i128_<op> of be/nfcxx_ldrt.c. A shift takes its count as a long (the caller converts it). The comparisons > and >=
+are the < and <= helpers with the operands swapped.
+*/
+static struct value *
+int128binary(struct func *f, enum tokenkind op, struct type *t, struct value *l, struct value *r)
+{
+	struct softarg a[3];
+	struct value *d;
+	struct value *tmp;
+	const char *name;
+	bool s = t->u.arith.issigned;
+	bool cmp = false, swap = false;
+
+	switch (op) {
+	case TADD:     name = "add"; break;
+	case TSUB:     name = "sub"; break;
+	case TMUL:     name = "mul"; break;
+	case TDIV:     name = s ? "div_s" : "div_u"; break;
+	case TMOD:     name = s ? "rem_s" : "rem_u"; break;
+	case TBAND:    name = "and"; break;
+	case TBOR:     name = "or"; break;
+	case TXOR:     name = "xor"; break;
+	case TSHL:     name = "shl"; break;
+	case TSHR:     name = s ? "shr_s" : "shr_u"; break;
+	case TEQL:     name = "eq"; cmp = true; break;
+	case TNEQ:     name = "ne"; cmp = true; break;
+	case TLESS:    name = s ? "lt_s" : "lt_u"; cmp = true; break;
+	case TLEQ:     name = s ? "le_s" : "le_u"; cmp = true; break;
+	case TGREATER: name = s ? "lt_s" : "lt_u"; cmp = true; swap = true; break;
+	case TGEQ:     name = s ? "le_s" : "le_u"; cmp = true; swap = true; break;
+	default:
+		fatal("internal error; unsupported operation on __int128");
+	}
+	if (swap) {
+		tmp = l;
+		l = r;
+		r = tmp;
+	}
+	if (cmp) {
+		a[0] = (struct softarg){'l', l};
+		a[1] = (struct softarg){'l', r};
+		return softcall(f, 'w', softname(t, name), 2, a);
+	}
+	d = softtemp(f);
+	a[0] = (struct softarg){'l', d};
+	a[1] = (struct softarg){'l', l};
+	a[2] = (struct softarg){'l', r};
+	softcall(f, 0, softname(t, name), 3, a);
+	return d;
+}
+
 /* the operation op (an operator token) on two soft operands of type t: a new temporary, or an int for a comparison */
 static struct value *
 softbinary(struct func *f, enum tokenkind op, struct type *t, struct value *l, struct value *r)
@@ -374,6 +428,8 @@ softbinary(struct func *f, enum tokenkind op, struct type *t, struct value *l, s
 	const char *name;
 	bool cmp = false;
 
+	if (t->kind == TYPEINT128)
+		return int128binary(f, op, t, l, r);
 	switch (op) {
 	case TADD:    name = "add"; break;
 	case TSUB:    name = "sub"; break;
@@ -414,6 +470,71 @@ softunary(struct func *f, struct type *t, const char *name, struct value *l)
 	return d;
 }
 
+/*
+A conversion where dst or src is __int128 (src and dst differ). The unsigned and signed forms differ only in the helper
+suffix _s or _u, chosen by the signedness of the integer side: from an integer or a float, the destination's; to one, the
+source's. The same bit pattern is copied for a change of signedness only.
+*/
+static struct value *
+convertint128(struct func *f, struct type *dst, struct type *src, struct value *l)
+{
+	struct softarg a[2];
+	struct value *d;
+	const char *name;
+	bool s;
+
+	if (dst->kind == TYPEBOOL) {
+		a[0] = (struct softarg){'l', l};
+		return softcall(f, 'w', softname(src, "nz"), 1, a);
+	}
+	if (dst->kind == TYPEINT128) {
+		d = softtemp(f);
+		a[0] = (struct softarg){'l', d};
+		s = dst->u.arith.issigned;
+		if (src->kind == TYPEINT128) {
+			a[1] = (struct softarg){'l', l};
+			softcall(f, 0, softname(dst, "copy"), 2, a);
+			return d;
+		}
+		if (src->prop & PROPINT) {
+			if (src->size < 8)
+				l = convert(f, src->u.arith.issigned ? &typelong : &typeulong, src, l);
+			name = src->u.arith.issigned ? "from_s64" : "from_u64";
+			a[1] = (struct softarg){'l', l};
+		} else if (src->kind == TYPELDOUBLE || src->kind == TYPEFLOAT128) {
+			name = src->kind == TYPELDOUBLE ? (s ? "from_ld_s" : "from_ld_u") : (s ? "from_f128_s" : "from_f128_u");
+			a[1] = (struct softarg){'l', l};
+		} else if (src->size == 4) {
+			name = s ? "from_f32_s" : "from_f32_u";
+			a[1] = (struct softarg){'s', l};
+		} else {
+			name = s ? "from_f64_s" : "from_f64_u";
+			a[1] = (struct softarg){'d', l};
+		}
+		softcall(f, 0, softname(dst, name), 2, a);
+		return d;
+	}
+	/* from __int128 to a scalar integer, or to a float type */
+	a[0] = (struct softarg){'l', l};
+	if (dst->prop & PROPINT) {
+		l = softcall(f, 'l', softname(src, "lo64"), 1, a);
+		return convert(f, dst, &typeulong, l);
+	}
+	s = src->u.arith.issigned;
+	if (dst->prop & PROPSOFT) {
+		/* a long double or __float128 result */
+		d = softtemp(f);
+		a[0] = (struct softarg){'l', d};
+		a[1] = (struct softarg){'l', l};
+		name = dst->kind == TYPELDOUBLE ? (s ? "to_ld_s" : "to_ld_u") : (s ? "to_f128_s" : "to_f128_u");
+		softcall(f, 0, softname(src, name), 2, a);
+		return d;
+	}
+	if (dst->size == 4)
+		return softcall(f, 's', softname(src, s ? "to_f32_s" : "to_f32_u"), 1, a);
+	return softcall(f, 'd', softname(src, s ? "to_f64_s" : "to_f64_u"), 1, a);
+}
+
 /* a conversion where dst or src is a soft type (src and dst differ, and neither is a pointer or void) */
 static struct value *
 convertsoft(struct func *f, struct type *dst, struct type *src, struct value *l)
@@ -423,6 +544,8 @@ convertsoft(struct func *f, struct type *dst, struct type *src, struct value *l)
 	const char *name;
 	int bits;
 
+	if (dst->kind == TYPEINT128 || src->kind == TYPEINT128)
+		return convertint128(f, dst, src, l);
 	if (dst->prop & PROPSOFT && src->prop & PROPSOFT) {
 		d = softtemp(f);
 		a[0] = (struct softarg){'l', d};
@@ -1247,6 +1370,8 @@ funcexpr(struct func *f, struct expr *e)
 		t = e->u.binary.l->type;
 		if (t->kind == TYPEPOINTER)
 			t = &typeulong;
+		if (t->kind == TYPEINT128 && (e->op == TSHL || e->op == TSHR))
+			r = convert(f, &typelong, e->u.binary.r->type, r);
 		if (t->prop & PROPSOFT)
 			return softbinary(f, e->op, t, l, r);
 		if (t->kind == TYPEFLOAT16)

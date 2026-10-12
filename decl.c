@@ -45,6 +45,7 @@ enum typespec {
 	SPECBITINT   = 1<<13,
 	SPECFLOAT128 = 1<<14,
 	SPECFLOAT16  = 1<<15,
+	SPECINT128   = 1<<16,
 
 	SPECLONGLONG = SPECLONG|SPECLONG2,
 };
@@ -393,6 +394,11 @@ declspecs(struct scope *s, enum storageclass *sc, enum funcspec *fs, int *align)
 			++ntypes;
 			next();
 			break;
+		case T__INT128:
+			ts |= SPECINT128;
+			++ntypes;
+			next();
+			break;
 		case T__FLOAT16:
 			ts |= SPECFLOAT16;
 			++ntypes;
@@ -525,6 +531,9 @@ done:
 	case SPECLONG|SPECDOUBLE:               t = &typeldouble; break;
 	case SPECFLOAT128:                      t = &typefloat128; break;
 	case SPECFLOAT16:                       t = &typefloat16; break;
+	case SPECINT128:
+	case SPECINT128|SPECSIGNED:             t = &typeint128;  break;
+	case SPECINT128|SPECUNSIGNED:           t = &typeuint128; break;
 	default:
 		error(&tok.loc, "invalid combination of type specifiers");
 	}

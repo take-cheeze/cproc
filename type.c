@@ -50,6 +50,18 @@ struct type typefloat128 = {
  * pattern in a word (qbe.c, f16binary) */
 struct type typefloat16 = FLTTYPE(TYPEFLOAT16, 2);
 
+/* __int128 and unsigned __int128: 16-byte integers with no QBE scalar class (PROPSOFT), like long double (qbe.c) */
+struct type typeint128  = {
+	.kind = TYPEINT128, .size = 16, .align = 16,
+	.u.arith = {.issigned = true, .width = 128},
+	.prop = PROPSCALAR|PROPARITH|PROPREAL|PROPINT|PROPSOFT,
+};
+struct type typeuint128 = {
+	.kind = TYPEINT128, .size = 16, .align = 16,
+	.u.arith = {.issigned = false, .width = 128},
+	.prop = PROPSCALAR|PROPARITH|PROPREAL|PROPINT|PROPSOFT,
+};
+
 struct type typenullptr = {.kind = TYPENULLPTR, .size = 8, .align = 8, .prop = PROPSCALAR};
 
 struct type *typeadjvalist;
@@ -143,6 +155,7 @@ typerank(struct type *t)
 	case TYPELONG:   return t->size << 3 + 4 | 0x1;
 	case TYPELLONG:  return 0x402;
 	case TYPEBITINT: return t->u.arith.width << 4;
+	case TYPEINT128: return 0x1000;
 	}
 	fatal("internal error; unhandled integer type");
 	return -1;

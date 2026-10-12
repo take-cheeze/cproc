@@ -366,6 +366,8 @@ cast(struct expr *expr)
 	unsigned long long m;
 
 	t = expr->type;
+	if (t->kind == TYPEINT128)
+		return;  /* a 128-bit image (eval.c, EXPRCAST) */
 	if (t->prop & PROPFLOAT) {
 		if (t->size == 4)
 			expr->u.constant.f = (float)expr->u.constant.f;
@@ -382,6 +384,8 @@ cast(struct expr *expr)
 static void
 unary(struct expr *expr, enum tokenkind op, struct expr *l)
 {
+	if (l->type->kind == TYPEINT128)
+		return;  /* not folded: negation of a 128-bit integer is not a sign flip */
 	if (issoft(l->type)) {
 		if (op != TSUB)
 			return;
@@ -512,8 +516,20 @@ eval(struct expr *expr)
 	case EXPRCAST:
 		l = eval(expr->base);
 		if (l->kind == EXPRCONST && (issoft(t) || issoft(l->type))) {
-			/* only an integer or floating constant converted to a 16-byte floating type is folded */
-			if (issoft(t) && !issoft(l->type)) {
+			/* only an integer constant converted to __int128, or an integer or floating constant converted to a
+			 * 16-byte floating type, is folded */
+			if (t->kind == TYPEINT128) {
+				if (l->type->kind == TYPEINT128) {
+					expr->kind = EXPRCONST;
+					expr->u.constant.soft[0] = l->u.constant.soft[0];
+					expr->u.constant.soft[1] = l->u.constant.soft[1];
+				} else if (l->type->prop & PROPINT) {
+					unsigned long long v = l->type->u.arith.issigned ? (unsigned long long)l->u.constant.i : l->u.constant.u;
+					expr->kind = EXPRCONST;
+					expr->u.constant.soft[0] = v;
+					expr->u.constant.soft[1] = l->type->u.arith.issigned && (long long)v < 0 ? ~0ull : 0;
+				}
+			} else if (issoft(t) && !issoft(l->type)) {
 				expr->kind = EXPRCONST;
 				if (l->type->prop & PROPINT)
 					softimage(expr->u.constant.soft, t, l->type->u.arith.issigned ? (long double)l->u.constant.i : (long double)l->u.constant.u);

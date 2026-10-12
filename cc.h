@@ -58,6 +58,7 @@ enum typekind {
 	TYPEUNION,
 	TYPENULLPTR,
 	TYPEBITINT,
+	TYPEINT128,
 };
 
 enum typeprop {
@@ -362,6 +363,7 @@ extern struct type typeint, typeuint;
 extern struct type typelong, typeulong;
 extern struct type typellong, typeullong;
 extern struct type typefloat, typedouble, typeldouble, typefloat128, typefloat16;
+extern struct type typeint128, typeuint128;
 extern struct type typenullptr;
 extern struct type *typeadjvalist;
 
