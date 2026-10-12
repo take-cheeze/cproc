@@ -184,6 +184,8 @@ struct decl {
 	bool defined;
 	bool tentative;
 	struct decl *next;
+	/* where the declarator's name is (the current token when the declaration is made; -fsanitize=address's frame description) */
+	struct location loc;
 
 	union {
 		struct {
