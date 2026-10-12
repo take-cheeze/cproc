@@ -1227,9 +1227,60 @@ funcvaargagg(struct func *f, struct expr *e)
 	return &b[2]->phi.res;
 }
 
+/*
+A call of a function with a __float128 argument or result (passed by value) is checked when the translation unit is complete
+(checkf128calls): a function defined later in the unit is fine, and so is one with internal linkage.
+*/
+struct f128call {
+	struct decl *decl;
+	struct location loc;
+};
+static struct f128call *f128calls;
+static size_t nf128calls, cap128calls;
+
+static void
+addf128call(struct decl *d)
+{
+	if (nf128calls == cap128calls) {
+		cap128calls = cap128calls ? 2 * cap128calls : 16;
+		f128calls = xreallocarray(f128calls, cap128calls, sizeof(f128calls[0]));
+	}
+	f128calls[nf128calls].decl = d;
+	f128calls[nf128calls].loc = tok.loc;
+	++nf128calls;
+}
+
+void
+checkf128calls(void)
+{
+	size_t i;
+
+	for (i = 0; i < nf128calls; ++i) {
+		struct decl *d = f128calls[i].decl;
+
+		if (!d->defined && d->linkage != LINKINTERN) {
+			error(&f128calls[i].loc, "__float128 passed or returned by value to '%s' (not defined in this unit) is not supported by the qbe backend",
+			      d->name);
+		}
+	}
+}
+
+/* whether a call has a __float128 argument (passed by value) */
+static bool
+anyf128arg(struct expr *e)
+{
+	struct expr *arg;
+
+	for (arg = e->u.call.args; arg; arg = arg->next)
+		if (arg->type->kind == TYPEFLOAT128)
+			return true;
+	return false;
+}
+
 struct value *
 funcexpr(struct func *f, struct expr *e)
 {
+	struct expr *callee;
 	enum instkind op = INONE;
 	struct decl *d;
 	struct value *l, *r, *v, **argvals;
@@ -1309,6 +1360,14 @@ funcexpr(struct func *f, struct expr *e)
 		v = funcstore(f, e->type, e->qual, lval, v);
 		return e->u.incdec.post ? l : v;
 	case EXPRCALL:
+		/* __float128 is passed in one SSE register (class SSE, SSEUP) in the SysV ABI, which this backend does not do: a
+		 * call of a function that is not defined in this unit (its code may be gcc's) with a __float128 argument or result
+		 * is an error, not a silently different convention. Calls within the unit use the same convention on both sides. */
+		callee = e->base;
+		if (callee->kind == EXPRUNARY && callee->op == TBAND)
+			callee = callee->base;  /* a function designator, decayed to a pointer */
+		if (callee->kind == EXPRIDENT && callee->u.ident.decl->kind == DECLFUNC && (e->type->kind == TYPEFLOAT128 || anyf128arg(e)))
+			addf128call(callee->u.ident.decl);
 		argvals = xreallocarray(NULL, e->u.call.nargs, sizeof(argvals[0]));
 		for (arg = e->u.call.args, i = 0; arg; arg = arg->next, ++i) {
 			emittype(arg->type);

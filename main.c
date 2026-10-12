@@ -64,6 +64,7 @@ main(int argc, char *argv[])
 			}
 		}
 		emittentativedefns();
+		checkf128calls();
 	}
 
 	fflush(stdout);

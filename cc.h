@@ -423,6 +423,7 @@ struct type *typename(struct scope *, enum typequal *, struct expr **);
 struct decl *stringdecl(struct expr *);
 
 void emittentativedefns(void);
+void checkf128calls(void);
 
 /* scope */
 
