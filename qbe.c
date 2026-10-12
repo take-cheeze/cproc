@@ -259,6 +259,34 @@ funcinst(struct func *f, int op, int class, struct value *arg0, struct value *ar
 	return &inst->res;
 }
 
+/*
+SysV passes a _Float16 argument or return value in an SSE register (the low 16 bits of an xmm), not in an integer
+register, so QBE's class for it at the function boundary is 's'. The register holds the float's bits, and the binary16
+pattern is its low 16 bits. Inside a function a _Float16 stays a 'w' pattern. Only the boundary converts: a value
+passed out (an argument, a return value) is cast to 's', and a value passed in is cast back and masked, because the
+upper 16 bits of the register are undefined.
+*/
+static int
+abiclass(struct type *t)
+{
+	return t->kind == TYPEFLOAT16 ? 's' : qbetype(t).base;
+}
+
+/* the register form (s) of a _Float16 pattern (w) */
+static struct value *
+f16tosse(struct func *f, struct value *v)
+{
+	return funcinst(f, ICAST, 's', v, NULL);
+}
+
+/* the pattern (w) of a _Float16 in a register (s): its low 16 bits */
+static struct value *
+f16fromsse(struct func *f, struct value *v)
+{
+	v = funcinst(f, ICAST, 'w', v, NULL);
+	return funcinst(f, IAND, 'w', v, mkintconst(0xffff));
+}
+
 static struct value *
 funcbits(struct func *f, struct type *t, struct value *v, struct bitfield b)
 {
@@ -752,7 +780,7 @@ mkfunc(struct decl *decl, char *name, struct type *t, struct scope *s)
 {
 	struct func *f;
 	struct decl *d;
-	struct value *v;
+	struct value *v, *r;
 
 	f = xmalloc(sizeof(*f));
 	f->decl = decl;
@@ -774,7 +802,10 @@ mkfunc(struct decl *decl, char *name, struct type *t, struct scope *s)
 			d->value = v;
 		} else {
 			funcalloc(f, d);
-			funcstore(f, d->type, QUALNONE, (struct lvalue){d->value}, v);
+			r = v;
+			if (d->type->kind == TYPEFLOAT16)
+				r = f16fromsse(f, v);
+			funcstore(f, d->type, QUALNONE, (struct lvalue){d->value}, r);
 		}
 	}
 
@@ -862,6 +893,8 @@ funcret(struct func *f, struct value *v)
 	struct block *b = f->end;
 
 	if (!b->jump.kind) {
+		if (v && f->type->base->kind == TYPEFLOAT16)
+			v = f16tosse(f, v);
 		b->jump.kind = JUMP_RET;
 		b->jump.arg = v;
 	}
@@ -1143,17 +1176,21 @@ funcexpr(struct func *f, struct expr *e)
 		for (arg = e->u.call.args, i = 0; arg; arg = arg->next, ++i) {
 			emittype(arg->type);
 			argvals[i] = funcexpr(f, arg);
+			if (arg->type->kind == TYPEFLOAT16)
+				argvals[i] = f16tosse(f, argvals[i]);
 		}
 		t = e->type;
 		emittype(t);
-		v = funcinst(f, ICALL, qbetype(t).base, funcexpr(f, e->base), t->value);
+		v = funcinst(f, ICALL, abiclass(t), funcexpr(f, e->base), t->value);
 		functype = e->base->type->base;
 		for (arg = e->u.call.args, i = 0; arg; arg = arg->next, ++i) {
 			if (functype->u.func.isvararg && i == functype->u.func.nparam)
 				funcinst(f, IVARARG, 0, NULL, NULL);
 			t = arg->type;
-			funcinst(f, IARG, qbetype(t).base, argvals[i], t->value);
+			funcinst(f, IARG, abiclass(t), argvals[i], t->value);
 		}
+		if (e->type->kind == TYPEFLOAT16)
+			v = f16fromsse(f, v);
 		e = e->base;
 		if (e->kind == EXPRUNARY && e->op == TBAND) {
 			e = e->base;
@@ -1730,7 +1767,7 @@ emitfunc(struct func *f, bool global)
 		puts("export");
 	fputs("function ", stdout);
 	if (f->type->base != &typevoid) {
-		emitclass(qbetype(f->type->base).base, f->type->base->value);
+		emitclass(abiclass(f->type->base), f->type->base->value);
 		putchar(' ');
 	}
 	emitname(f->decl->value);
@@ -1738,7 +1775,7 @@ emitfunc(struct func *f, bool global)
 	for (p = f->type->u.func.params, v = f->paramtemps; p; p = p->next, ++v) {
 		if (p != f->type->u.func.params)
 			fputs(", ", stdout);
-		emitclass(qbetype(p->type).base, p->type->value);
+		emitclass(abiclass(p->type), p->type->value);
 		putchar(' ');
 		emitname(v);
 	}
