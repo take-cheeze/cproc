@@ -1016,6 +1016,12 @@ funcret(struct func *f, struct value *v)
 	struct block *b = f->end;
 
 	if (!b->jump.kind) {
+		if (v && f->type->base->kind == TYPELDOUBLE) {
+			struct softarg pa[1] = {{'l', v}};
+
+			softcall(f, 0, softname(f->type->base, "push"), 1, pa);
+			v = NULL;
+		}
 		if (v && f->type->base->kind == TYPEFLOAT16)
 			v = f16tosse(f, v);
 		b->jump.kind = JUMP_RET;
@@ -1179,6 +1185,14 @@ funcvaargagg(struct func *f, struct expr *e)
 	struct block *b[3];
 	unsigned long long size;
 
+	if (e->type->kind == TYPELDOUBLE) {
+		/* a long double is class X87 (memory): the next 16-byte aligned slot of the overflow area */
+		ap = funcexpr(f, e->base);
+		tmp = funcinst(f, IADD, 'l', ap, mkintconst(8));  /* &overflow_arg_area */
+		addr[0] = funcinst(f, IAND, 'l', funcinst(f, IADD, 'l', funcinst(f, ILOADL, 'l', tmp, NULL), mkintconst(15)), mkintconst(-16ull));
+		funcinst(f, ISTOREL, 0, funcinst(f, IADD, 'l', addr[0], mkintconst(16)), tmp);
+		return addr[0];
+	}
 	if (strcmp(targ->name, "x86_64-sysv") != 0 || !e->type->size || e->type->size > 16
 	    || e->type->align > 8 || !intclass(e->type))
 		error(&tok.loc, "va_arg with non-scalar type is not yet supported (only integer-class aggregates of up to 16 bytes on x86_64)");
@@ -1304,13 +1318,24 @@ funcexpr(struct func *f, struct expr *e)
 		}
 		t = e->type;
 		emittype(t);
-		v = funcinst(f, ICALL, abiclass(t), funcexpr(f, e->base), t->value);
+		/* a long double is returned in st(0): the call has no QBE result, and the value is popped into a temporary */
+		if (t->kind == TYPELDOUBLE) {
+			v = softtemp(f);
+			funcinst(f, ICALL, 0, funcexpr(f, e->base), NULL);
+		} else {
+			v = funcinst(f, ICALL, abiclass(t), funcexpr(f, e->base), t->value);
+		}
 		functype = e->base->type->base;
 		for (arg = e->u.call.args, i = 0; arg; arg = arg->next, ++i) {
 			if (functype->u.func.isvararg && i == functype->u.func.nparam)
 				funcinst(f, IVARARG, 0, NULL, NULL);
 			t = arg->type;
 			funcinst(f, IARG, abiclass(t), argvals[i], t->value);
+		}
+		if (e->type->kind == TYPELDOUBLE) {
+			struct softarg pa[1] = {{'l', v}};
+
+			softcall(f, 0, softname(e->type, "pop"), 1, pa);
 		}
 		if (e->type->kind == TYPEFLOAT16)
 			v = f16fromsse(f, v);
@@ -1747,11 +1772,22 @@ emittype(struct type *t)
 {
 	static unsigned id;
 	static struct value soft = {.kind = VALUE_TYPE, .u.name = "__nfcxx_soft16"};
-	static bool softemitted;
+	static struct value ldmem = {.kind = VALUE_TYPE, .u.name = "__nfcxx_ldmem"};
+	static bool softemitted, ldemitted;
 	struct member *m, *other;
 	struct type *sub;
 	unsigned long long off;
 
+	if (t->kind == TYPELDOUBLE) {
+		/* long double: class X87 in the SysV ABI, so an argument is in memory (a dark type of 16 bytes), and a result is
+		 * in st(0), which a call pops into a temporary (funccall, funcret) */
+		if (!ldemitted) {
+			ldemitted = true;
+			puts("type :__nfcxx_ldmem = align 16 { 16 }");
+		}
+		t->value = &ldmem;
+		return;
+	}
 	if (t->prop & PROPSOFT) {
 		/* the aggregate of a 16-byte floating value: two integer eightbytes, 16-aligned */
 		if (!softemitted) {
@@ -1914,7 +1950,7 @@ emitfunc(struct func *f, bool global)
 	if (global)
 		puts("export");
 	fputs("function ", stdout);
-	if (f->type->base != &typevoid) {
+	if (f->type->base != &typevoid && f->type->base->kind != TYPELDOUBLE) {
 		emitclass(abiclass(f->type->base), f->type->base->value);
 		putchar(' ');
 	}
