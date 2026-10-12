@@ -91,6 +91,7 @@ mkconstexpr(struct type *t, unsigned long long n)
 }
 
 static struct expr *mkunaryexpr(enum tokenkind, struct expr *);
+static struct expr *mkassignexpr(struct expr *, struct expr *);
 
 /* 6.3.2.1 Conversion of arrays and function designators */
 static struct expr *
@@ -889,6 +890,160 @@ designator(struct scope *s, struct type *t, unsigned long long *offset)
 	}
 }
 
+/*
+The classification built-ins (C99 7.12) on a real operand x, lowered to comparisons. x is evaluated once into a temporary
+(fpvalue, the definition); every reference to the temporary is a new EXPRTEMP node whose base is the definition (fpuse),
+so that no node has two parents (delexpr frees each node once) and codegen reads the value the definition holds. A NaN
+compares unequal to itself, x - x is NaN for an infinity and 0 for a finite value, and the minimum normal value of each
+type is a constant image (fpminnormal).
+*/
+struct fpbuild {
+	struct expr *head;
+	struct expr **end;
+};
+
+static void
+fpadd(struct fpbuild *b, struct expr *e)
+{
+	*b->end = e;
+	b->end = &e->next;
+}
+
+static struct expr *
+fpvalue(struct fpbuild *b, struct expr *x)
+{
+	struct expr *def;
+
+	/* long double and __float128 are PROPREAL without PROPFLOAT (type.c): they are operands as they are */
+	if (!(x->type->prop & PROPREAL))
+		x = exprconvert(x, &typedouble);
+	def = mkexpr(EXPRTEMP, x->type, NULL);
+	def->lvalue = true;
+	def->u.temp = NULL;
+	fpadd(b, mkassignexpr(def, x));
+	return def;
+}
+
+static struct expr *
+fpuse(struct expr *def)
+{
+	return mkexpr(EXPRTEMP, def->type, def);
+}
+
+static struct expr *
+fpminnormal(struct type *t)
+{
+	struct expr *e = mkexpr(EXPRCONST, t, NULL);
+
+	switch (t->kind) {
+	case TYPEFLOAT:    e->u.constant.f = 0x1p-126; break;
+	case TYPEDOUBLE:   e->u.constant.f = 0x1p-1022; break;
+	/* 2^-16382: the biased exponent 1, the explicit integer bit 1 (extended) or the implicit bit (binary128) */
+	case TYPELDOUBLE:  e->u.constant.soft[0] = 1ull << 63; e->u.constant.soft[1] = 1; break;
+	case TYPEFLOAT128: e->u.constant.soft[0] = 0; e->u.constant.soft[1] = 1ull << 48; break;
+	default:
+		fatal("internal error; no minimum normal value for this type");
+	}
+	return e;
+}
+
+static struct expr *
+fpneg(struct expr *e)
+{
+	struct expr *neg = mkexpr(EXPRUNARY, e->type, e);
+
+	neg->op = TSUB;
+	return neg;
+}
+
+static struct expr *
+fpcond(struct expr *c, struct expr *t, struct expr *f)
+{
+	struct expr *e = mkexpr(EXPRCOND, &typeint, c);
+
+	e->u.cond.t = t;
+	e->u.cond.f = f;
+	return e;
+}
+
+static struct expr *
+fpisfinite(struct expr *def)
+{
+	struct expr *d = mkbinaryexpr(&tok.loc, TSUB, fpuse(def), fpuse(def));
+
+	return mkbinaryexpr(&tok.loc, TEQL, d, mkconstexpr(&typeint, 0));
+}
+
+static struct expr *
+fpisinf(struct expr *def)
+{
+	struct expr *d1 = mkbinaryexpr(&tok.loc, TSUB, fpuse(def), fpuse(def));
+	struct expr *d2 = mkbinaryexpr(&tok.loc, TSUB, fpuse(def), fpuse(def));
+	struct expr *inf = mkbinaryexpr(&tok.loc, TLAND,
+		mkbinaryexpr(&tok.loc, TEQL, fpuse(def), fpuse(def)),
+		mkbinaryexpr(&tok.loc, TNEQ, d1, d2));
+
+	/* gcc: nonzero for either infinity (1 for both signs in __builtin_isinf) */
+	return fpcond(inf, mkconstexpr(&typeint, 1), mkconstexpr(&typeint, 0));
+}
+
+static struct expr *
+fpisnormal(struct expr *def)
+{
+	struct type *t = def->type;
+	struct expr *ge = mkbinaryexpr(&tok.loc, TGEQ, fpuse(def), fpminnormal(t));
+	struct expr *le = mkbinaryexpr(&tok.loc, TLEQ, fpuse(def), fpneg(fpminnormal(t)));
+
+	return mkbinaryexpr(&tok.loc, TLAND, mkbinaryexpr(&tok.loc, TLOR, ge, le), fpisfinite(def));
+}
+
+/* the classification built-in kind on the arguments args (one, two or six of them) */
+static struct expr *
+fpbuiltin(struct scope *s, enum builtinkind kind)
+{
+	struct fpbuild b;
+	struct expr *ta, *tb, *r, *args[6];
+	int i, n = kind == BUILTINFPCLASSIFY ? 6 : kind == BUILTINISUNORDERED || kind == BUILTINISGREATER || kind == BUILTINISLESS
+		|| kind == BUILTINISLESSEQUAL || kind == BUILTINISGREATEREQUAL || kind == BUILTINISLESSGREATER ? 2 : 1;
+
+	for (i = 0; i < n; ++i) {
+		args[i] = assignexpr(s);
+		if (i + 1 < n)
+			expect(TCOMMA, "between the arguments of a built-in");
+	}
+	b.head = NULL;
+	b.end = &b.head;
+	if (kind == BUILTINFPCLASSIFY) {
+		/* fpclassify(nan, inf, normal, subnormal, zero, x) */
+		ta = fpvalue(&b, args[5]);
+		r = fpcond(mkbinaryexpr(&tok.loc, TNEQ, fpuse(ta), fpuse(ta)), args[0],
+		           fpcond(fpisinf(ta), args[1],
+		           fpcond(fpisnormal(ta), args[2],
+		           fpcond(mkbinaryexpr(&tok.loc, TEQL, fpuse(ta), mkconstexpr(&typeint, 0)), args[4], args[3]))));
+	} else if (n == 2) {
+		ta = fpvalue(&b, args[0]);
+		tb = fpvalue(&b, args[1]);
+		switch (kind) {
+		case BUILTINISUNORDERED:    r = mkbinaryexpr(&tok.loc, TLOR, mkbinaryexpr(&tok.loc, TNEQ, fpuse(ta), fpuse(ta)), mkbinaryexpr(&tok.loc, TNEQ, fpuse(tb), fpuse(tb))); break;
+		case BUILTINISGREATER:      r = mkbinaryexpr(&tok.loc, TGREATER, fpuse(ta), fpuse(tb)); break;
+		case BUILTINISGREATEREQUAL: r = mkbinaryexpr(&tok.loc, TGEQ, fpuse(ta), fpuse(tb)); break;
+		case BUILTINISLESS:         r = mkbinaryexpr(&tok.loc, TLESS, fpuse(ta), fpuse(tb)); break;
+		case BUILTINISLESSEQUAL:    r = mkbinaryexpr(&tok.loc, TLEQ, fpuse(ta), fpuse(tb)); break;
+		default:                    r = mkbinaryexpr(&tok.loc, TLOR, mkbinaryexpr(&tok.loc, TLESS, fpuse(ta), fpuse(tb)), mkbinaryexpr(&tok.loc, TGREATER, fpuse(ta), fpuse(tb))); break;
+		}
+	} else {
+		ta = fpvalue(&b, args[0]);
+		switch (kind) {
+		case BUILTINISNAN:    r = mkbinaryexpr(&tok.loc, TNEQ, fpuse(ta), fpuse(ta)); break;
+		case BUILTINISINF:    r = fpisinf(ta); break;
+		case BUILTINISFINITE: r = fpisfinite(ta); break;
+		default:              r = fpisnormal(ta); break;
+		}
+	}
+	fpadd(&b, r);
+	return mkexpr(EXPRCOMMA, &typeint, b.head);
+}
+
 static struct expr *
 builtinfunc(struct scope *s, enum builtinkind kind)
 {
@@ -908,6 +1063,26 @@ builtinfunc(struct scope *s, enum builtinkind kind)
 		e = exprconvert(assignexpr(s), &typefloat);
 		e = mkexpr(EXPRBUILTIN, &typefloat, e);
 		e->u.builtin.kind = BUILTINFABSF;
+		break;
+	case BUILTINISNAN:
+	case BUILTINISINF:
+	case BUILTINISFINITE:
+	case BUILTINISNORMAL:
+	case BUILTINISUNORDERED:
+	case BUILTINISGREATER:
+	case BUILTINISGREATEREQUAL:
+	case BUILTINISLESS:
+	case BUILTINISLESSEQUAL:
+	case BUILTINISLESSGREATER:
+	case BUILTINFPCLASSIFY:
+		e = fpbuiltin(s, kind);
+		break;
+	case BUILTINSIGNBIT:
+		e = assignexpr(s);
+		if (!(e->type->prop & PROPREAL))
+			e = exprconvert(e, &typedouble);
+		e = mkexpr(EXPRBUILTIN, &typeint, e);
+		e->u.builtin.kind = BUILTINSIGNBIT;
 		break;
 	case BUILTINCONSTANTP:
 		e = mkconstexpr(&typeint, eval(condexpr(s))->kind == EXPRCONST);

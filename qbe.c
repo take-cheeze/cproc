@@ -1508,6 +1508,26 @@ funcexpr(struct func *f, struct expr *e)
 		case BUILTINUNREACHABLE:
 			funchlt(f);
 			return NULL;
+		case BUILTINSIGNBIT:
+			/* the sign bit: bit 15 of a _Float16 pattern, the top bit of the sign-and-exponent byte of the 16-byte
+			 * types (byte 9 of long double, byte 15 of __float128), and the top byte of float and double, which are
+			 * stored to a temporary (entry block, as softtemp) to read it */
+			l = funcexpr(f, e->base);
+			t = e->base->type;
+			if (t->kind == TYPEFLOAT16)
+				return funcinst(f, IAND, 'w', funcinst(f, ISHR, 'w', l, mkintconst(15)), mkintconst(1));
+			if (t->prop & PROPSOFT) {
+				v = funcinst(f, IADD, ptrclass, l, mkintconst(t->kind == TYPEFLOAT128 ? 15 : 9));
+			} else {
+				struct block *end = f->end;
+				f->end = f->start;
+				v = funcinst(f, t->size == 4 ? IALLOC4 : IALLOC8, ptrclass, mkintconst(t->size), NULL);
+				f->end = end;
+				funcinst(f, t->size == 4 ? ISTORES : ISTORED, 0, l, v);
+				v = funcinst(f, IADD, ptrclass, v, mkintconst(t->size - 1));
+			}
+			l = funcinst(f, ILOADUB, 'w', v, NULL);
+			return funcinst(f, ISHR, 'w', l, mkintconst(7));
 		case BUILTINFABSF:
 			/* clear the sign bit of the float in a 4-byte temporary (entry block, as softtemp) */
 			l = funcexpr(f, e->base);
@@ -1527,6 +1547,9 @@ funcexpr(struct func *f, struct expr *e)
 		}
 		return NULL;
 	case EXPRTEMP:
+		/* a reference to a temporary (its base is the definition, expr.c fpuse) reads the definition's value */
+		if (e->base)
+			e = e->base;
 		assert(e->u.temp);
 		return e->u.temp;
 	case EXPRSIZEOF:
