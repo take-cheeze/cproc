@@ -99,6 +99,8 @@ struct func {
 	unsigned lastid;
 	struct array asan;   /* -fsanitize=address: the stack objects with redzones (asanalloc), unpoisoned by funcret */
 	const char *asanfile;   /* -fsanitize=address: the file of the first check, for dbgfile before the function */
+	struct array asanrets;   /* -fsanitize=address: the blocks that return (funcret), for asandynret */
+	struct value *asanlo, *asanhi;   /* -fsanitize=address: the dynamic allocations' bounds (asandynalloc); NULL if none */
 };
 
 /* a stack object with redzones: the base of its allocation (an entry block temporary) and the allocation's size */
@@ -851,6 +853,101 @@ asanalloc(struct func *f, struct decl *d)
 	d->value = obj;
 }
 
+/* an instruction appended to block b as is: no access check (funcinst checks loads and stores), for the bookkeeping below */
+static struct value *
+asanraw(struct func *f, struct block *b, int op, int class, struct value *arg0, struct value *arg1)
+{
+	struct inst *inst;
+
+	inst = mkinst(f, op, class, arg0, arg1);
+	arrayaddptr(&b->insts, inst);
+	return &inst->res;
+}
+
+/*
+-fsanitize=address: a dynamic allocation (alloca, a variable-length array) is not in the entry block, so its redzones cannot
+be unpoisoned in funcret by a temporary that dominates every return. asanlo and asanhi are two entry-block slots (created
+at the first dynamic allocation, as softtemp does) that hold the lowest base and the highest end of this function's
+dynamic allocations. QBE's alloc only moves the stack down, so the latest base is the lowest, and asanhi is the maximum,
+kept branch-free: d = end - hi; hi += d & ~(d >> 63). They start at 0, and asandynret tests lo for it.
+*/
+static void
+asanslots(struct func *f)
+{
+	f->asanlo = asanraw(f, f->start, IALLOC8, ptrclass, mkintconst(8), NULL);
+	f->asanhi = asanraw(f, f->start, IALLOC8, ptrclass, mkintconst(8), NULL);
+	asanraw(f, f->start, ISTOREL, 0, mkintconst(0), f->asanlo);
+	asanraw(f, f->start, ISTOREL, 0, mkintconst(0), f->asanhi);
+}
+
+/*
+-fsanitize=address: a dynamic allocation of size bytes in the current block, laid out as asanalloc lays out a stack object
+(redzones of ASANRZ bytes on each side, the size rounded up to 8). The whole allocation is unpoisoned, then the redzones
+are poisoned, here at the allocation: a return before it never poisons it. QBE does not reclaim the allocation until the
+function returns (a loop allocates again on each pass), so asandynret unpoisons [asanlo, asanhi) at each return.
+Returns the object's address.
+*/
+static struct value *
+asandynalloc(struct func *f, struct value *size)
+{
+	struct value *size8, *total, *base, *obj, *right, *end, *h, *d, *m;
+
+	if (!f->asanlo)
+		asanslots(f);
+	size8 = funcinst(f, IAND, ptrclass, funcinst(f, IADD, ptrclass, size, mkintconst(7)), mkintconst(-8));
+	total = funcinst(f, IADD, ptrclass, size8, mkintconst(2 * ASANRZ));
+	base = funcinst(f, IALLOC16, ptrclass, total, NULL);
+	obj = funcinst(f, IADD, ptrclass, base, mkintconst(ASANRZ));
+	right = funcinst(f, IADD, ptrclass, obj, size8);
+	asancall(f, "__asan_unpoison_memory_region", base, total);
+	asancall(f, "__asan_poison_memory_region", base, mkintconst(ASANRZ));
+	asancall(f, "__asan_poison_memory_region", right, mkintconst(ASANRZ));
+	asanraw(f, f->end, ISTOREL, 0, base, f->asanlo);
+	end = funcinst(f, IADD, ptrclass, base, total);
+	h = asanraw(f, f->end, ILOADL, ptrclass, f->asanhi, NULL);
+	d = funcinst(f, ISUB, ptrclass, end, h);
+	m = funcinst(f, ISAR, ptrclass, d, mkintconst(63));
+	m = funcinst(f, IXOR, ptrclass, m, mkintconst(-1));
+	d = funcinst(f, IAND, ptrclass, d, m);
+	h = funcinst(f, IADD, ptrclass, h, d);
+	asanraw(f, f->end, ISTOREL, 0, h, f->asanhi);
+	return obj;
+}
+
+/*
+-fsanitize=address: the returns of a function with dynamic allocations. Each return block b (recorded by funcret) becomes
+jnz lo, unpoison, ret; unpoison: call __asan_unpoison_memory_region(lo, hi - lo); jmp ret. A return that ran before the
+first dynamic allocation at run time (a return before a VLA declaration, or one earlier in a loop body) has lo == 0, and
+then there is nothing to unpoison: the branch skips the call instead of passing it an empty range at address 0.
+Called by emitfunc after the function body is generated, when every return is known. f->end is the last block.
+*/
+static void
+asandynret(struct func *f)
+{
+	struct block **bp, *b, *u, *r;
+	struct value *lo, *hi;
+	size_t i, n = f->asanrets.len / sizeof(*bp);
+
+	for (i = 0; i < n; i++) {
+		bp = (struct block **)f->asanrets.val + i;
+		b = *bp;
+		u = mkblock("asanunpoison");
+		r = mkblock("asanret");
+		lo = asanraw(f, b, ILOADL, ptrclass, f->asanlo, NULL);
+		r->jump = b->jump;
+		b->jump.kind = JUMP_JNZ;
+		b->jump.arg = lo;
+		b->jump.blk[0] = u;
+		b->jump.blk[1] = r;
+		funclabel(f, u);
+		hi = asanraw(f, u, ILOADL, ptrclass, f->asanhi, NULL);
+		asancall(f, "__asan_unpoison_memory_region", lo, funcinst(f, ISUB, ptrclass, hi, lo));
+		u->jump.kind = JUMP_JMP;
+		u->jump.blk[0] = r;
+		funclabel(f, r);
+	}
+}
+
 static void
 funcalloc(struct func *f, struct decl *d)
 {
@@ -865,6 +962,13 @@ funcalloc(struct func *f, struct decl *d)
 	if (asanon && d->type->size && !(d->type->prop & PROPVM) && d->u.obj.align <= 16) {
 		asanalloc(f, d);
 		f->end = end;
+		return;
+	}
+	/* a variable-length array: allocated where it is declared, as below, with redzones (asandynalloc) */
+	if (asanon && !d->type->size && (d->type->prop & PROPVM) && d->u.obj.align <= 16) {
+		assert(d->type->kind == TYPEARRAY);
+		assert(d->type->u.array.size);
+		d->value = asandynalloc(f, d->type->u.array.size);
 		return;
 	}
 	if (d->type->size) {
@@ -1016,6 +1120,8 @@ mkfunc(struct decl *decl, char *name, struct type *t, struct scope *s)
 	f->lastid = 0;
 	f->asan = (struct array){0};
 	f->asanfile = NULL;
+	f->asanrets = (struct array){0};
+	f->asanlo = f->asanhi = NULL;
 	mapinit(&f->gotos, 8);
 	emittype(t->base);
 
@@ -1135,6 +1241,11 @@ funcret(struct func *f, struct value *v)
 		for (i = 0; i < f->asan.len / sizeof(*o); i++) {
 			o = (struct asanobj *)f->asan.val + i;
 			asancall(f, "__asan_unpoison_memory_region", o->base, mkintconst(o->size));
+		}
+		if (asanon) {
+			/* the dynamic allocations are only known at the end of the function (asandynret) */
+			struct block **r = arrayadd(&f->asanrets, sizeof(*r));
+			*r = b;
 		}
 		b->jump.kind = JUMP_RET;
 		b->jump.arg = v;
@@ -1703,6 +1814,8 @@ funcexpr(struct func *f, struct expr *e)
 			return funcinst(f, IVAARG, qbetype(e->type).base, l, NULL);
 		case BUILTINALLOCA:
 			l = funcexpr(f, e->base);
+			if (asanon)
+				return asandynalloc(f, l);
 			return funcinst(f, IALLOC16, ptrclass, l, NULL);
 		case BUILTINUNREACHABLE:
 			funchlt(f);
@@ -2125,6 +2238,8 @@ emitfunc(struct func *f, bool global)
 			v = mkintconst(0);
 		funcret(f, v);
 	}
+	if (asanon && f->asanlo)
+		asandynret(f);
 	if (global)
 		puts("export");
 	fputs("function ", stdout);
