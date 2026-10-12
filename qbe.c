@@ -112,6 +112,9 @@ struct asanobj {
 	struct value *obj;   /* the object itself (base + ASANRZ), poisoned as stack-use-after-scope when its block is left */
 	unsigned long long obj8;   /* the object's size rounded up to a granule: the bytes poisoned */
 	unsigned block;   /* the block that declares it (the innermost open block at asanalloc, asantop) */
+	/* a dynamic block (asandynalloc: base is NULL): the address and the size (rounded up) are kept in entry-block slots,
+	 * since the block is poisoned where a scope ends, which need not be dominated by the allocation */
+	struct value *objslot, *sizeslot;
 };
 
 static const int ptrclass = 'l';
@@ -869,25 +872,40 @@ static void
 asanalloc(struct func *f, struct decl *d)
 {
 	struct block *end = f->end;
-	unsigned long long size8 = (d->type->size + 7) & ~7ULL, total = size8 + 2 * ASANRZ;
-	struct value *base, *obj, *right;
+	unsigned long long size8 = (d->type->size + 7) & ~7ULL, align = d->u.obj.align, total = size8 + 2 * ASANRZ;
+	struct value *base, *obj, *right, *left, *rlen;
 	struct asanobj *o;
 
 	f->end = f->start;
-	base = funcinst(f, IALLOC16, ptrclass, mkintconst(total), NULL);
-	obj = funcinst(f, IADD, ptrclass, base, mkintconst(ASANRZ));
-	right = funcinst(f, IADD, ptrclass, obj, mkintconst(size8));
+	if (align <= 16) {
+		base = funcinst(f, IALLOC16, ptrclass, mkintconst(total), NULL);
+		obj = funcinst(f, IADD, ptrclass, base, mkintconst(ASANRZ));
+		right = funcinst(f, IADD, ptrclass, obj, mkintconst(size8));
+		left = mkintconst(ASANRZ);
+		rlen = mkintconst(ASANRZ);
+	} else {
+		/* over-aligned: the object is at the first multiple of align after base + ASANRZ; the left redzone is what lies
+		 * before it, the right one what lies after it up to the end of the block (all multiples of 8) */
+		total = size8 + align + 2 * ASANRZ;
+		base = funcinst(f, IALLOC16, ptrclass, mkintconst(total), NULL);
+		obj = funcinst(f, IADD, ptrclass, base, mkintconst(ASANRZ + align - 1));
+		obj = funcinst(f, IAND, ptrclass, obj, mkintconst(-(long long)align));
+		right = funcinst(f, IADD, ptrclass, obj, mkintconst(size8));
+		left = funcinst(f, ISUB, ptrclass, obj, base);
+		rlen = funcinst(f, ISUB, ptrclass, funcinst(f, IADD, ptrclass, base, mkintconst(total)), right);
+	}
 	f->end = end;
 	/* the poison is at the declaration, not in the entry block: a return that comes before this declaration never poisons it */
 	asancall(f, "__asan_unpoison_memory_region", base, mkintconst(total));
-	asancall(f, "__asan_poison_memory_region", base, mkintconst(ASANRZ));
-	asancall(f, "__asan_poison_memory_region", right, mkintconst(ASANRZ));
+	asancall(f, "__asan_poison_memory_region", base, left);
+	asancall(f, "__asan_poison_memory_region", right, rlen);
 	o = arrayadd(&f->asan, sizeof(*o));
 	o->base = base;
 	o->size = total;
 	o->obj = obj;
 	o->obj8 = size8;
 	o->block = asantop(f);
+	o->objslot = o->sizeslot = NULL;
 	d->value = obj;
 }
 
@@ -926,9 +944,10 @@ function returns (a loop allocates again on each pass), so asandynret unpoisons 
 Returns the object's address.
 */
 static struct value *
-asandynalloc(struct func *f, struct value *size)
+asandynalloc(struct func *f, struct value *size, bool scoped)
 {
 	struct value *size8, *total, *base, *obj, *right, *end, *h, *d, *m;
+	struct asanobj *o;
 
 	if (!f->asanlo)
 		asanslots(f);
@@ -949,6 +968,22 @@ asandynalloc(struct func *f, struct value *size)
 	d = funcinst(f, IAND, ptrclass, d, m);
 	h = funcinst(f, IADD, ptrclass, h, d);
 	asanraw(f, f->end, ISTOREL, 0, h, f->asanhi);
+	/* a variable-length array lives until the end of its block, so it is poisoned where that block ends (asanend, asanleave,
+	 * asangoto). An alloca lives until the function returns, as C requires: it is not a scope object. */
+	if (!scoped)
+		return obj;
+	o = arrayadd(&f->asan, sizeof(*o));
+	o->base = NULL;
+	o->size = 0;
+	o->obj = NULL;
+	o->obj8 = 0;
+	o->block = asantop(f);
+	o->objslot = asanraw(f, f->start, IALLOC8, ptrclass, mkintconst(8), NULL);
+	o->sizeslot = asanraw(f, f->start, IALLOC8, ptrclass, mkintconst(8), NULL);
+	asanraw(f, f->start, ISTOREL, 0, mkintconst(0), o->objslot);
+	asanraw(f, f->start, ISTOREL, 0, mkintconst(0), o->sizeslot);
+	asanraw(f, f->end, ISTOREL, 0, obj, o->objslot);
+	asanraw(f, f->end, ISTOREL, 0, size8, o->sizeslot);
 	return obj;
 }
 
@@ -994,16 +1029,35 @@ after its join point), break and continue (asanleave), and goto (asangoto, asanl
 unpoisons the whole frame and nothing of it runs after. A goto is how EDG lowers break, continue and the exits of a switch
 in C++ (`goto __T1;` to a label after the loop), so the goto case matters as much as asanleave.
 */
+/* the address and size of o's object, as values of the current block (a dynamic block reads its slots) */
+static void
+asanobjrange(struct func *f, struct asanobj *o, struct value **obj, struct value **size)
+{
+	if (!o->objslot) {
+		*obj = o->obj;
+		*size = mkintconst(o->obj8);
+		return;
+	}
+	*obj = asanraw(f, f->end, ILOADL, ptrclass, o->objslot, NULL);
+	*size = asanraw(f, f->end, ILOADL, ptrclass, o->sizeslot, NULL);
+}
+
 static void
 asanpoisonobj(struct func *f, struct asanobj *o)
 {
-	asancall(f, "__asan_poison_stack_memory", o->obj, mkintconst(o->obj8));
+	struct value *obj, *size;
+
+	asanobjrange(f, o, &obj, &size);
+	asancall(f, "__asan_poison_stack_memory", obj, size);
 }
 
 static void
 asanunpoisonobj(struct func *f, struct asanobj *o)
 {
-	asancall(f, "__asan_unpoison_memory_region", o->obj, mkintconst(o->obj8));
+	struct value *obj, *size;
+
+	asanobjrange(f, o, &obj, &size);
+	asancall(f, "__asan_unpoison_memory_region", obj, size);
 }
 
 /* the objects of the blocks in set that are not open in keep (the blocks a jump leaves, or enters): poisoned or unpoisoned */
@@ -1177,7 +1231,7 @@ funcalloc(struct func *f, struct decl *d)
 	assert(!d->type->incomplete);
 	calcvla(f, d->type);
 	end = f->end;
-	if (asanon && d->type->size && !(d->type->prop & PROPVM) && d->u.obj.align <= 16) {
+	if (asanon && d->type->size && !(d->type->prop & PROPVM)) {
 		asanalloc(f, d);
 		f->end = end;
 		return;
@@ -1186,7 +1240,7 @@ funcalloc(struct func *f, struct decl *d)
 	if (asanon && !d->type->size && (d->type->prop & PROPVM) && d->u.obj.align <= 16) {
 		assert(d->type->kind == TYPEARRAY);
 		assert(d->type->u.array.size);
-		d->value = asandynalloc(f, d->type->u.array.size);
+		d->value = asandynalloc(f, d->type->u.array.size, true);
 		return;
 	}
 	if (d->type->size) {
@@ -1460,7 +1514,8 @@ funcret(struct func *f, struct value *v)
 		/* -fsanitize=address: the redzones of this frame's objects are addressable again when the frame is left */
 		for (i = 0; i < f->asan.len / sizeof(*o); i++) {
 			o = (struct asanobj *)f->asan.val + i;
-			asancall(f, "__asan_unpoison_memory_region", o->base, mkintconst(o->size));
+			if (o->base)   /* a dynamic block (asandynalloc) has no base: asandynret unpoisons it */
+				asancall(f, "__asan_unpoison_memory_region", o->base, mkintconst(o->size));
 		}
 		if (asanon) {
 			/* the dynamic allocations are only known at the end of the function (asandynret) */
@@ -2037,7 +2092,7 @@ funcexpr(struct func *f, struct expr *e)
 		case BUILTINALLOCA:
 			l = funcexpr(f, e->base);
 			if (asanon)
-				return asandynalloc(f, l);
+				return asandynalloc(f, l, false);
 			return funcinst(f, IALLOC16, ptrclass, l, NULL);
 		case BUILTINUNREACHABLE:
 			funchlt(f);
