@@ -103,6 +103,7 @@ struct func {
 	struct value *asanlo, *asanhi;   /* -fsanitize=address: the dynamic allocations' bounds (asandynalloc); NULL if none */
 	struct array asanopen;   /* -fsanitize=address: the blocks being compiled, outermost first (unsigned numbers; asanbegin) */
 	unsigned asanblocks;   /* -fsanitize=address: the blocks begun so far, for numbering them */
+	struct array asanjmps;   /* -fsanitize=address: the calls of setjmp (struct asanjmp), poisoned in asanfinish */
 };
 
 /* a stack object with redzones: the base of its allocation (an entry block temporary) and the allocation's size */
@@ -115,6 +116,13 @@ struct asanobj {
 	/* a dynamic block (asandynalloc: base is NULL): the address and the size (rounded up) are kept in entry-block slots,
 	 * since the block is poisoned where a scope ends, which need not be dominated by the allocation */
 	struct value *objslot, *sizeslot;
+};
+
+/* a call of setjmp (asansetjmp): the block that poisons the objects out of scope at the call (pad, see asanfinish) and the
+ * block after it. Both returns of the call pass through pad; open is the set of blocks open at the call. */
+struct asanjmp {
+	struct block *pad, *next;
+	struct array *open;
 };
 
 static const int ptrclass = 'l';
@@ -1220,6 +1228,73 @@ asanleave(struct func *f, size_t mark)
 			asanpoisonobj(f, (struct asanobj *)f->asan.val + i);
 }
 
+/*
+A call of setjmp (or _setjmp, __sigsetjmp, sigsetjmp, the names glibc and EDG use; EDG's try and throw are a _setjmp and a
+longjmp). The call returns twice, the second time from a longjmp that left blocks since the call, and the code after it
+cannot tell which way it returned. The longjmp itself is not seen here, and nothing runs between it and the return, so the
+return is where the objects it left are poisoned. An object is in scope at the call only if its block is open there, so
+every other object of the function is out of scope at the return (C: a block's objects are out of scope outside it), and
+asanfinish poisons them in pad, which both returns pass through. The objects of the open blocks are left alone. A block
+entered again unpoisons its objects at their declaration, as before. This needs no record of the longjmp, which is what
+makes it work for a longjmp in another function that lands in this one too, and for EDG's throw (its runtime runs the
+destructors of the left objects before it longjmps, so poisoning at the throw would poison objects still in use).
+*/
+static bool
+asansetjmpname(const char *name)
+{
+	return !strcmp(name, "setjmp") || !strcmp(name, "_setjmp") || !strcmp(name, "sigsetjmp") || !strcmp(name, "__sigsetjmp");
+}
+
+static void
+asansetjmp(struct func *f)
+{
+	struct asanjmp *j;
+	struct block *pad, *next;
+	struct array *open = NULL;
+	size_t i, n = f->asanopen.len / sizeof(unsigned);
+
+	asanset(&open);
+	for (i = 0; i < n; i++)
+		asanadd(open, ((unsigned *)f->asanopen.val)[i]);
+	pad = mkblock("asansetjmp");
+	next = mkblock("asansetjmp_next");
+	funcjmp(f, pad);
+	funclabel(f, pad);
+	funclabel(f, next);
+	j = arrayadd(&f->asanjmps, sizeof(*j));
+	j->pad = pad;
+	j->next = next;
+	j->open = open;
+}
+
+/*
+The pads of the setjmp calls (asansetjmp), filled now that every object of the function is known: an object declared after
+the call, in a block not open there, is poisoned too, and its declaration unpoisons it. A pad has no jump until here, since
+funcinst appends only to a block without one, so it is filled first and then jumps to the block after its call.
+*/
+static void
+asanfinish(struct func *f)
+{
+	struct block *end = f->end;
+	struct asanjmp *j;
+	struct asanobj *o;
+	size_t i, k, nobj, njmp = f->asanjmps.len / sizeof(*j);
+
+	for (k = 0; k < njmp; k++) {
+		j = (struct asanjmp *)f->asanjmps.val + k;
+		f->end = j->pad;
+		nobj = f->asan.len / sizeof(*o);
+		for (i = 0; i < nobj; i++) {
+			o = (struct asanobj *)f->asan.val + i;
+			/* block 0 is the parameters (asantop): in scope everywhere, so never poisoned */
+			if (o->block && !asaninset(j->open, o->block))
+				asanpoisonobj(f, o);
+		}
+		funcjmp(f, j->next);
+	}
+	f->end = end;
+}
+
 static void
 funcalloc(struct func *f, struct decl *d)
 {
@@ -1396,6 +1471,7 @@ mkfunc(struct decl *decl, char *name, struct type *t, struct scope *s)
 	f->asanlo = f->asanhi = NULL;
 	f->asanopen = (struct array){0};
 	f->asanblocks = 0;
+	f->asanjmps = (struct array){0};
 	mapinit(&f->gotos, 8);
 	emittype(t->base);
 
@@ -1901,6 +1977,9 @@ funcexpr(struct func *f, struct expr *e)
 		}
 		if (e->type->kind == TYPEFLOAT16)
 			v = f16fromsse(f, v);
+		/* after the whole call (its IARG instructions follow the ICALL): the call's block ends, and its return is a pad */
+		if (asanon && callee->kind == EXPRIDENT && callee->u.ident.decl->kind == DECLFUNC && asansetjmpname(callee->u.ident.decl->name))
+			asansetjmp(f);
 		e = e->base;
 		if (e->kind == EXPRUNARY && e->op == TBAND) {
 			e = e->base;
@@ -2508,6 +2587,8 @@ emitfunc(struct func *f, bool global)
 	if (f->asanfile)
 		printf("dbgfile \"%s\"\n", f->asanfile);
 
+	if (asanon)
+		asanfinish(f);
 	if (f->end->jump.kind == JUMP_NONE) {
 		v = NULL;
 		/* implicitly return 0 from main if we reach the end of the function */
