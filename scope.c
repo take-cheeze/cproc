@@ -59,6 +59,8 @@ mkscope(struct scope *parent)
 	s->breaklabel = parent->breaklabel;
 	s->continuelabel = parent->continuelabel;
 	s->switchcases = parent->switchcases;
+	s->asanbreak = parent->asanbreak;
+	s->asancontinue = parent->asancontinue;
 	s->parent = parent;
 
 	return s;

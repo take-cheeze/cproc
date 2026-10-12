@@ -208,6 +208,8 @@ struct scope {
 	struct block *continuelabel;
 	struct switchcases *switchcases;
 	struct scope *parent;
+	/* -fsanitize=address: the stack objects registered when the loop or switch body whose breaklabel or continuelabel this is began (asanmark) */
+	size_t asanbreak, asancontinue;
 };
 
 enum exprkind {
@@ -428,6 +430,12 @@ void emittentativedefns(void);
 void checkf128calls(void);
 void emitasanctor(void);
 
+/* -fsanitize=address, use after scope (qbe.c): blocks and the jumps out of them; all are no-ops without asanon */
+void asanbegin(struct func *);
+void asanend(struct func *);
+size_t asanmark(struct func *);
+void asanleave(struct func *, size_t);
+
 /* scope */
 
 void scopeinit(void);
@@ -473,12 +481,17 @@ void stmt(struct func *, struct scope *);
 struct gotolabel {
 	struct block *label;
 	bool defined;
+	/* -fsanitize=address (qbe.c asangoto, asanlabel): sets of block numbers, null when empty. The blocks open at the label
+	 * (asanopen, once defined); for the gotos before it: the blocks open at any of them (asanfrom) and at all of them (asanall) */
+	struct array *asanopen, *asanfrom, *asanall;
 };
 
 struct switchcases {
 	void *root;
 	struct type *type;
 	struct block *defaultlabel;
+	/* -fsanitize=address (qbe.c asanswitch, asancase): the blocks open at the switch, which the dispatch enters the cases from */
+	struct array *asanopen;
 };
 
 void switchcase(struct switchcases *, unsigned long long, struct block *);
@@ -500,6 +513,10 @@ void funcjnz(struct func *, struct value *, struct type *, struct block *, struc
 void funcret(struct func *, struct value *);
 void funchlt(struct func *);
 struct gotolabel *funcgoto(struct func *, char *);
+void asangoto(struct func *, struct gotolabel *);
+void asanlabel(struct func *, struct gotolabel *);
+void asanswitch(struct func *, struct switchcases *);
+void asancase(struct func *, struct switchcases *);
 void funcswitch(struct func *, struct value *, struct switchcases *, struct block *);
 void funcinit(struct func *, struct decl *, struct init *, bool);
 

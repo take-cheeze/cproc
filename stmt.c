@@ -23,6 +23,7 @@ label(struct func *f, struct scope *s)
 			error(&tok.loc, "'case' label must be in switch");
 		b = mkblock("switch_case");
 		funclabel(f, b);
+		asancase(f, s->switchcases);
 		i = intconstexpr(s, true);
 		switchcase(s->switchcases, i, b);
 		expect(TCOLON, "after case expression");
@@ -36,6 +37,7 @@ label(struct func *f, struct scope *s)
 		expect(TCOLON, "after 'default'");
 		s->switchcases->defaultlabel = mkblock("switch_default");
 		funclabel(f, s->switchcases->defaultlabel);
+		asancase(f, s->switchcases);
 		break;
 	default:
 		if (tok.kind < TIDENT)
@@ -46,6 +48,7 @@ label(struct func *f, struct scope *s)
 		g = funcgoto(f, name);
 		g->defined = true;
 		funclabel(f, g->label);
+		asanlabel(f, g);
 		break;
 	}
 	return true;
@@ -69,6 +72,7 @@ stmt(struct func *f, struct scope *s)
 	struct value *v;
 	struct block *b[4];
 	struct switchcases swtch;
+	struct gotolabel *g;
 
 	attr(NULL, 0);
 	switch (tok.kind) {
@@ -76,10 +80,12 @@ stmt(struct func *f, struct scope *s)
 	case TLBRACE:
 		next();
 		s = mkscope(s);
+		asanbegin(f);
 		while (tok.kind != TRBRACE) {
 			if (!label(f, s) && !decl(s, f))
 				stmt(f, s);
 		}
+		asanend(f);
 		s = delscope(s);
 		next();
 		break;
@@ -143,6 +149,7 @@ stmt(struct func *f, struct scope *s)
 		swtch.root = NULL;
 		swtch.type = e->type;
 		swtch.defaultlabel = NULL;
+		asanswitch(f, &swtch);
 
 		b[0] = mkblock("switch_cond");
 		b[1] = mkblock("switch_join");
@@ -152,6 +159,7 @@ stmt(struct func *f, struct scope *s)
 		s = mkscope(s);
 		s->breaklabel = b[1];
 		s->switchcases = &swtch;
+		s->asanbreak = asanmark(f);
 		labelstmt(f, s);
 		funcjmp(f, b[1]);
 
@@ -184,6 +192,7 @@ stmt(struct func *f, struct scope *s)
 		s = mkscope(s);
 		s->continuelabel = b[0];
 		s->breaklabel = b[2];
+		s->asanbreak = s->asancontinue = asanmark(f);
 		labelstmt(f, s);
 		s = delscope(s);
 		funcjmp(f, b[0]);
@@ -201,6 +210,7 @@ stmt(struct func *f, struct scope *s)
 		s = mkscope(s);
 		s->continuelabel = b[1];
 		s->breaklabel = b[2];
+		s->asanbreak = s->asancontinue = asanmark(f);
 		funclabel(f, b[0]);
 		labelstmt(f, s);
 		s = delscope(s);
@@ -223,6 +233,7 @@ stmt(struct func *f, struct scope *s)
 		next();
 		expect(TLPAREN, "after 'for'");
 		s = mkscope(s);
+		asanbegin(f);
 		if (!decl(s, f)) {
 			if (tok.kind != TSEMICOLON) {
 				e = expr(s);
@@ -254,6 +265,7 @@ stmt(struct func *f, struct scope *s)
 		s = mkscope(s);
 		s->breaklabel = b[3];
 		s->continuelabel = b[2];
+		s->asanbreak = s->asancontinue = asanmark(f);
 		labelstmt(f, s);
 		s = delscope(s);
 
@@ -264,6 +276,7 @@ stmt(struct func *f, struct scope *s)
 		}
 		funcjmp(f, b[0]);
 		funclabel(f, b[3]);
+		asanend(f);
 		s = delscope(s);
 		break;
 
@@ -271,13 +284,16 @@ stmt(struct func *f, struct scope *s)
 	case TGOTO:
 		next();
 		name = expect(TIDENT, "after 'goto'");
-		funcjmp(f, funcgoto(f, name)->label);
+		g = funcgoto(f, name);
+		asangoto(f, g);
+		funcjmp(f, g->label);
 		expect(TSEMICOLON, "after 'goto' statement");
 		break;
 	case TCONTINUE:
 		next();
 		if (!s->continuelabel)
 			error(&tok.loc, "'continue' statement must be in loop");
+		asanleave(f, s->asancontinue);
 		funcjmp(f, s->continuelabel);
 		expect(TSEMICOLON, "after 'continue' statement");
 		break;
@@ -285,6 +301,7 @@ stmt(struct func *f, struct scope *s)
 		next();
 		if (!s->breaklabel)
 			error(&tok.loc, "'break' statement must be in loop or switch");
+		asanleave(f, s->asanbreak);
 		funcjmp(f, s->breaklabel);
 		expect(TSEMICOLON, "after 'break' statement");
 		break;

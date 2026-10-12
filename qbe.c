@@ -101,12 +101,17 @@ struct func {
 	const char *asanfile;   /* -fsanitize=address: the file of the first check, for dbgfile before the function */
 	struct array asanrets;   /* -fsanitize=address: the blocks that return (funcret), for asandynret */
 	struct value *asanlo, *asanhi;   /* -fsanitize=address: the dynamic allocations' bounds (asandynalloc); NULL if none */
+	struct array asanopen;   /* -fsanitize=address: the blocks being compiled, outermost first (unsigned numbers; asanbegin) */
+	unsigned asanblocks;   /* -fsanitize=address: the blocks begun so far, for numbering them */
 };
 
 /* a stack object with redzones: the base of its allocation (an entry block temporary) and the allocation's size */
 struct asanobj {
 	struct value *base;
 	unsigned long long size;
+	struct value *obj;   /* the object itself (base + ASANRZ), poisoned as stack-use-after-scope when its block is left */
+	unsigned long long obj8;   /* the object's size rounded up to a granule: the bytes poisoned */
+	unsigned block;   /* the block that declares it (the innermost open block at asanalloc, asantop) */
 };
 
 static const int ptrclass = 'l';
@@ -830,6 +835,36 @@ catch this object), the redzones are poisoned, and funcret unpoisons the allocat
 */
 #define ASANRZ 32
 
+/* -fsanitize=address: sets of block numbers (struct array of unsigned); a null set is empty */
+static bool
+asaninset(const struct array *a, unsigned id)
+{
+	size_t i;
+
+	if (!a)
+		return false;
+	for (i = 0; i < a->len / sizeof(unsigned); i++)
+		if (((unsigned *)a->val)[i] == id)
+			return true;
+	return false;
+}
+
+static void
+asanadd(struct array *a, unsigned id)
+{
+	if (!asaninset(a, id))
+		*(unsigned *)arrayadd(a, sizeof(unsigned)) = id;
+}
+
+/* the innermost open block, 0 outside any block (the parameters) */
+static unsigned
+asantop(struct func *f)
+{
+	size_t n = f->asanopen.len / sizeof(unsigned);
+
+	return n ? ((unsigned *)f->asanopen.val)[n - 1] : 0;
+}
+
 static void
 asanalloc(struct func *f, struct decl *d)
 {
@@ -850,6 +885,9 @@ asanalloc(struct func *f, struct decl *d)
 	o = arrayadd(&f->asan, sizeof(*o));
 	o->base = base;
 	o->size = total;
+	o->obj = obj;
+	o->obj8 = size8;
+	o->block = asantop(f);
 	d->value = obj;
 }
 
@@ -946,6 +984,186 @@ asandynret(struct func *f)
 		u->jump.blk[0] = r;
 		funclabel(f, r);
 	}
+}
+
+/*
+-fsanitize=address, use after scope: when a block is left, the objects it declared are poisoned as stack-use-after-scope
+(__asan_poison_stack_memory, the marker gcc's own instrumentation uses), and the declaration that re-enters the block
+unpoisons them again (asanalloc, at the declaration). The ways out covered here are the normal end of the block (asanend,
+after its join point), break and continue (asanleave), and goto (asangoto, asanlabel). A return needs nothing: funcret
+unpoisons the whole frame and nothing of it runs after. A goto is how EDG lowers break, continue and the exits of a switch
+in C++ (`goto __T1;` to a label after the loop), so the goto case matters as much as asanleave.
+*/
+static void
+asanpoisonobj(struct func *f, struct asanobj *o)
+{
+	asancall(f, "__asan_poison_stack_memory", o->obj, mkintconst(o->obj8));
+}
+
+static void
+asanunpoisonobj(struct func *f, struct asanobj *o)
+{
+	asancall(f, "__asan_unpoison_memory_region", o->obj, mkintconst(o->obj8));
+}
+
+/* the objects of the blocks in set that are not open in keep (the blocks a jump leaves, or enters): poisoned or unpoisoned */
+static void
+asanmove(struct func *f, const struct array *set, const struct array *keep, bool poison)
+{
+	size_t i;
+	struct asanobj *o;
+
+	for (i = 0; i < f->asan.len / sizeof(*o); i++) {
+		o = (struct asanobj *)f->asan.val + i;
+		if (asaninset(set, o->block) && !asaninset(keep, o->block)) {
+			if (poison)
+				asanpoisonobj(f, o);
+			else
+				asanunpoisonobj(f, o);
+		}
+	}
+}
+
+/* a block begins: its declarations are numbered (asanalloc records the number) and it is open until asanend */
+void
+asanbegin(struct func *f)
+{
+	if (asanon)
+		asanadd(&f->asanopen, ++f->asanblocks);
+}
+
+/* the number of stack objects with redzones registered so far: the mark of a loop or switch body (asanleave) */
+size_t
+asanmark(struct func *f)
+{
+	return f->asan.len / sizeof(struct asanobj);
+}
+
+/* the normal end of a block, after its join point and before its scope is deleted: poison the objects it declared */
+void
+asanend(struct func *f)
+{
+	size_t i;
+	unsigned top;
+
+	if (!asanon)
+		return;
+	top = asantop(f);
+	if (!f->end->jump.kind) {
+		for (i = 0; i < asanmark(f); i++) {
+			struct asanobj *o = (struct asanobj *)f->asan.val + i;
+			if (o->block == top)
+				asanpoisonobj(f, o);
+		}
+	}
+	f->asanopen.len -= sizeof(unsigned);
+}
+
+/*
+A goto to a label (asangoto), and the label (asanlabel). The blocks a jump leaves have their objects poisoned, and the blocks
+it enters have theirs unpoisoned: a block is open at a point only if its objects are in scope there (C++ allows a jump into
+a block past a declaration without initializer). A backward goto knows the label's open blocks; a forward goto does not,
+so it records the blocks open where it is (asanfrom, their union; asanall, their intersection) and the label does the work
+once it is defined. Every forward goto leaves only blocks that end before the label, so their objects are all registered.
+*/
+static struct array *
+asanset(struct array **p)
+{
+	if (!*p) {
+		*p = xmalloc(sizeof(**p));
+		**p = (struct array){0};
+	}
+	return *p;
+}
+
+/* a becomes its intersection with b: the members of a that are also in b */
+static void
+asanintersect(struct array *a, const struct array *b)
+{
+	size_t i, n = 0, len = a->len / sizeof(unsigned);
+	unsigned *v = a->val;
+
+	for (i = 0; i < len; i++)
+		if (asaninset(b, v[i]))
+			v[n++] = v[i];
+	a->len = n * sizeof(unsigned);
+}
+
+void
+asangoto(struct func *f, struct gotolabel *g)
+{
+	size_t i;
+
+	if (!asanon)
+		return;
+	if (g->defined) {
+		asanmove(f, &f->asanopen, g->asanopen, true);
+		asanmove(f, g->asanopen, &f->asanopen, false);
+		return;
+	}
+	if (!g->asanall) {
+		asanset(&g->asanall);
+		for (i = 0; i < f->asanopen.len / sizeof(unsigned); i++)
+			asanadd(g->asanall, ((unsigned *)f->asanopen.val)[i]);
+	} else {
+		asanintersect(g->asanall, &f->asanopen);
+	}
+	for (i = 0; i < f->asanopen.len / sizeof(unsigned); i++)
+		asanadd(asanset(&g->asanfrom), ((unsigned *)f->asanopen.val)[i]);
+}
+
+void
+asanlabel(struct func *f, struct gotolabel *g)
+{
+	size_t i;
+
+	if (!asanon)
+		return;
+	if (g->asanfrom) {
+		asanmove(f, g->asanfrom, &f->asanopen, true);
+		asanmove(f, &f->asanopen, g->asanall, false);
+	}
+	asanset(&g->asanopen);
+	g->asanopen->len = 0;
+	for (i = 0; i < f->asanopen.len / sizeof(unsigned); i++)
+		asanadd(g->asanopen, ((unsigned *)f->asanopen.val)[i]);
+}
+
+/* the dispatch of a switch enters its cases from the switch statement, where the blocks open are recorded (asanswitch) */
+void
+asanswitch(struct func *f, struct switchcases *sw)
+{
+	size_t i;
+
+	sw->asanopen = NULL;
+	if (!asanon)
+		return;
+	asanset(&sw->asanopen);
+	for (i = 0; i < f->asanopen.len / sizeof(unsigned); i++)
+		asanadd(sw->asanopen, ((unsigned *)f->asanopen.val)[i]);
+}
+
+/* a case or default label (after funclabel): the blocks open here that the switch was not in are entered, as for a goto */
+void
+asancase(struct func *f, struct switchcases *sw)
+{
+	if (asanon)
+		asanmove(f, &f->asanopen, sw->asanopen, false);
+}
+
+/*
+a break or continue: the objects declared in the body since its mark (asanmark, taken as the body begins) leave their blocks.
+Objects of blocks that already ended are poisoned again, which changes nothing; the objects declared before the body (a for
+statement's, say) are poisoned where the loop or switch ends, which every break reaches.
+*/
+void
+asanleave(struct func *f, size_t mark)
+{
+	size_t i;
+
+	if (asanon)
+		for (i = mark; i < asanmark(f); i++)
+			asanpoisonobj(f, (struct asanobj *)f->asan.val + i);
 }
 
 static void
@@ -1122,6 +1340,8 @@ mkfunc(struct decl *decl, char *name, struct type *t, struct scope *s)
 	f->asanfile = NULL;
 	f->asanrets = (struct array){0};
 	f->asanlo = f->asanhi = NULL;
+	f->asanopen = (struct array){0};
+	f->asanblocks = 0;
 	mapinit(&f->gotos, 8);
 	emittype(t->base);
 
@@ -1272,6 +1492,8 @@ funcgoto(struct func *f, char *name)
 	if (mapput(&f->gotos, &key, &idx)) {
 		g = xmalloc(sizeof(*g));
 		g->label = mkblock(name);
+		g->defined = false;
+		g->asanopen = g->asanfrom = g->asanall = NULL;
 		f->gotos.vals[idx].p = g;
 	}
 
