@@ -102,3 +102,6 @@ OP(ICALL,    "call")
 /* variadic */
 OP(IVASTART, "vastart")
 OP(IVAARG,   "vaarg")
+
+/* -fsanitize=address: the source line of the accesses that follow (qbe.c asanaccess) */
+OP(IDBGLOC,  "dbgloc")

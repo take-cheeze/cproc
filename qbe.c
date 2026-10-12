@@ -97,6 +97,14 @@ struct func {
 	struct block *start, *end;
 	struct map gotos;
 	unsigned lastid;
+	struct array asan;   /* -fsanitize=address: the stack objects with redzones (asanalloc), unpoisoned by funcret */
+	const char *asanfile;   /* -fsanitize=address: the file of the first check, for dbgfile before the function */
+};
+
+/* a stack object with redzones: the base of its allocation (an entry block temporary) and the allocation's size */
+struct asanobj {
+	struct value *base;
+	unsigned long long size;
 };
 
 static const int ptrclass = 'l';
@@ -244,6 +252,63 @@ mkinst(struct func *f, int op, int class, struct value *arg0, struct value *arg1
 	return inst;
 }
 
+/*
+-fsanitize=address (nfcxx: the environment variable NFCXX_ASAN, set by the driver): every load and store is preceded by a
+call of libasan's check on its address, __asan_load{1,2,4,8} and __asan_store{1,2,4,8}. Every access goes through funcinst,
+so this is the one place. A check is an ordinary call, so QBE cannot merge or forward the access past it.
+*/
+bool asanon;   /* set by main from NFCXX_ASAN */
+/* -fsanitize=address: the location of the expression being generated (funcexpr), for dbgloc before each check */
+static struct location asanloc;
+
+static struct value *funcinst(struct func *f, int op, int class, struct value *arg0, struct value *arg1);
+
+/* a call of the runtime function name with one or two pointer-sized arguments (b may be NULL) */
+static void
+asancall(struct func *f, const char *name, struct value *a, struct value *b)
+{
+	struct value *fn;
+	char *s;
+
+	s = xmalloc(strlen(name) + 1);
+	strcpy(s, name);
+	fn = xmalloc(sizeof(*fn));
+	fn->kind = VALUE_GLOBAL;
+	fn->u.name = s;
+	fn->id = 0;
+	funcinst(f, ICALL, 0, fn, NULL);
+	funcinst(f, IARG, ptrclass, a, NULL);
+	if (b)
+		funcinst(f, IARG, ptrclass, b, NULL);
+}
+
+static void
+asancheck(struct func *f, const char *name, struct value *addr)
+{
+	if (asanloc.line) {
+		funcinst(f, IDBGLOC, 0, mkintconst(asanloc.line), NULL);
+		if (!f->asanfile)
+			f->asanfile = asanloc.file;
+	}
+	asancall(f, name, addr, NULL);
+}
+
+static void
+asanaccess(struct func *f, int op, struct value *arg0, struct value *arg1)
+{
+	switch (op) {
+	/* a load's address is arg0; a store's is arg1 (the value stored is arg0) */
+	case ILOADUB: case ILOADSB: asancheck(f, "__asan_load1", arg0); break;
+	case ILOADUH: case ILOADSH: asancheck(f, "__asan_load2", arg0); break;
+	case ILOADW:  case ILOADS:  asancheck(f, "__asan_load4", arg0); break;
+	case ILOADL:  case ILOADD:  asancheck(f, "__asan_load8", arg0); break;
+	case ISTOREB: asancheck(f, "__asan_store1", arg1); break;
+	case ISTOREH: asancheck(f, "__asan_store2", arg1); break;
+	case ISTOREW: case ISTORES: asancheck(f, "__asan_store4", arg1); break;
+	case ISTOREL: case ISTORED: asancheck(f, "__asan_store8", arg1); break;
+	}
+}
+
 static struct value *
 funcinst(struct func *f, int op, int class, struct value *arg0, struct value *arg1)
 {
@@ -254,6 +319,8 @@ funcinst(struct func *f, int op, int class, struct value *arg0, struct value *ar
 		b = mkblock("dead");
 		funclabel(f, b);
 	}
+	if (asanon)
+		asanaccess(f, op, arg0, arg1);
 	inst = mkinst(f, op, class, arg0, arg1);
 	arrayaddptr(&f->end->insts, inst);
 	return &inst->res;
@@ -753,6 +820,37 @@ calcvla(struct func *f, struct type *t)
 	}
 }
 
+/*
+-fsanitize=address: a stack object with a redzone of ASANRZ bytes on each side, allocated in the entry block. The object's
+size is rounded up to a granule (8 bytes) so the right redzone starts on one: the bytes between the size and the rounding
+are not covered. The object's whole allocation is unpoisoned on entry (poison left by a frame that longjmp left must not
+catch this object), the redzones are poisoned, and funcret unpoisons the allocation before the function returns.
+*/
+#define ASANRZ 32
+
+static void
+asanalloc(struct func *f, struct decl *d)
+{
+	struct block *end = f->end;
+	unsigned long long size8 = (d->type->size + 7) & ~7ULL, total = size8 + 2 * ASANRZ;
+	struct value *base, *obj, *right;
+	struct asanobj *o;
+
+	f->end = f->start;
+	base = funcinst(f, IALLOC16, ptrclass, mkintconst(total), NULL);
+	obj = funcinst(f, IADD, ptrclass, base, mkintconst(ASANRZ));
+	right = funcinst(f, IADD, ptrclass, obj, mkintconst(size8));
+	f->end = end;
+	/* the poison is at the declaration, not in the entry block: a return that comes before this declaration never poisons it */
+	asancall(f, "__asan_unpoison_memory_region", base, mkintconst(total));
+	asancall(f, "__asan_poison_memory_region", base, mkintconst(ASANRZ));
+	asancall(f, "__asan_poison_memory_region", right, mkintconst(ASANRZ));
+	o = arrayadd(&f->asan, sizeof(*o));
+	o->base = base;
+	o->size = total;
+	d->value = obj;
+}
+
 static void
 funcalloc(struct func *f, struct decl *d)
 {
@@ -764,6 +862,11 @@ funcalloc(struct func *f, struct decl *d)
 	assert(!d->type->incomplete);
 	calcvla(f, d->type);
 	end = f->end;
+	if (asanon && d->type->size && !(d->type->prop & PROPVM) && d->u.obj.align <= 16) {
+		asanalloc(f, d);
+		f->end = end;
+		return;
+	}
 	if (d->type->size) {
 		f->end = f->start;
 		v = mkintconst(d->type->size);
@@ -911,6 +1014,8 @@ mkfunc(struct decl *decl, char *name, struct type *t, struct scope *s)
 	f->type = t;
 	f->start = f->end = mkblock("start");
 	f->lastid = 0;
+	f->asan = (struct array){0};
+	f->asanfile = NULL;
 	mapinit(&f->gotos, 8);
 	emittype(t->base);
 
@@ -1014,6 +1119,8 @@ void
 funcret(struct func *f, struct value *v)
 {
 	struct block *b = f->end;
+	struct asanobj *o;
+	size_t i;
 
 	if (!b->jump.kind) {
 		if (v && f->type->base->kind == TYPELDOUBLE) {
@@ -1024,6 +1131,11 @@ funcret(struct func *f, struct value *v)
 		}
 		if (v && f->type->base->kind == TYPEFLOAT16)
 			v = f16tosse(f, v);
+		/* -fsanitize=address: the redzones of this frame's objects are addressable again when the frame is left */
+		for (i = 0; i < f->asan.len / sizeof(*o); i++) {
+			o = (struct asanobj *)f->asan.val + i;
+			asancall(f, "__asan_unpoison_memory_region", o->base, mkintconst(o->size));
+		}
 		b->jump.kind = JUMP_RET;
 		b->jump.arg = v;
 	}
@@ -1282,6 +1394,9 @@ funcexpr(struct func *f, struct expr *e)
 {
 	struct expr *callee;
 	enum instkind op = INONE;
+
+	if (e->loc.line)
+		asanloc = e->loc;
 	struct decl *d;
 	struct value *l, *r, *v, **argvals;
 	struct lvalue lval;
@@ -1999,6 +2114,10 @@ emitfunc(struct func *f, bool global)
 	struct decl *p;
 	struct value *v;
 
+	/* dbgfile is top-level: it names the file of the .loc lines (dbgloc) of this function */
+	if (f->asanfile)
+		printf("dbgfile \"%s\"\n", f->asanfile);
+
 	if (f->end->jump.kind == JUMP_NONE) {
 		v = NULL;
 		/* implicitly return 0 from main if we reach the end of the function */
@@ -2115,16 +2234,29 @@ dataitem(struct expr *expr, unsigned long long size)
 	}
 }
 
+/*
+-fsanitize=address: a global of the unit is followed, in its own data item, by the rest of its 8-byte granule and ASANRZ zero
+bytes (emitdata). The unit's constructor (emitasanctor, in .init_array) poisons that tail, so an access past the object
+reports. A symbol is only the object's address, so the redzone has to be inside the item.
+*/
+struct asanglobal {
+	struct value *v;
+	unsigned long long granule;   /* the object's size rounded up to 8: the start of its redzone */
+};
+static struct array asanglobals;
+
 void
 emitdata(struct decl *d, struct init *init)
 {
 	struct init *cur;
 	struct type *t;
-	unsigned long long offset = 0, start, end, bits = 0;
+	unsigned long long offset = 0, start, end, bits = 0, size, pad = 0;
+	struct asanglobal *g;
 	size_t i;
 	int align;
 
 	align = d->u.obj.align;
+	size = d->type->size;
 	for (cur = init; cur; cur = cur->next)
 		cur->expr = eval(cur->expr);
 	if (d->u.obj.storage == SDTHREAD)
@@ -2196,7 +2328,37 @@ emitdata(struct decl *d, struct init *init)
 		++offset;
 	}
 	assert(offset <= d->type->size);
-	if (offset < d->type->size)
-		printf("z %llu ", d->type->size - offset);
+	if (asanon && size && d->u.obj.storage != SDTHREAD) {
+		pad = ((size + 7) & ~7ULL) - size + ASANRZ;
+		g = arrayadd(&asanglobals, sizeof(*g));
+		g->v = d->value;
+		g->granule = (size + 7) & ~7ULL;
+	}
+	if (offset < size || pad)
+		printf("z %llu ", size - offset + pad);
 	puts("}");
+}
+
+/* the constructor of the unit: poisons the redzone of each global emitdata wrote (see asanglobal), then the .init_array entry */
+void
+emitasanctor(void)
+{
+	struct asanglobal *g;
+	size_t i, n = asanglobals.len / sizeof(*g);
+
+	if (n == 0)
+		return;
+	puts("function $__nfcxx_asan_globals() {");
+	puts("@start");
+	for (i = 0; i < n; i++) {
+		g = (struct asanglobal *)asanglobals.val + i;
+		printf("\t%%g%zu =l add ", i);
+		emitname(g->v);
+		printf(", %llu\n", g->granule);
+		printf("\tcall $__asan_poison_memory_region(l %%g%zu, l %d)\n", i, ASANRZ);
+	}
+	puts("\tret");
+	puts("}");
+	puts("section \".init_array\" \"aw\"");
+	puts("data $__nfcxx_asan_ctor = align 8 { l $__nfcxx_asan_globals }");
 }

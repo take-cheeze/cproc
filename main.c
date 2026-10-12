@@ -12,6 +12,8 @@ usage(void)
 	exit(2);
 }
 
+extern bool asanon;
+
 int
 main(int argc, char *argv[])
 {
@@ -19,6 +21,7 @@ main(int argc, char *argv[])
 	char *output = NULL, *target = NULL;
 
 	argv0 = progname(argv[0], "cproc-qbe");
+	asanon = getenv("NFCXX_ASAN") != NULL;
 	ARGBEGIN {
 	case 'E':
 		pponly = true;
@@ -64,6 +67,7 @@ main(int argc, char *argv[])
 			}
 		}
 		emittentativedefns();
+		emitasanctor();
 		checkf128calls();
 	}
 

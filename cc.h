@@ -243,6 +243,8 @@ struct stringlit {
 
 struct expr {
 	enum exprkind kind;
+	/* where the expression starts (set by mkexpr from the current token; the qbe backend's -fsanitize=address uses it) */
+	struct location loc;
 	/* whether this expression is an lvalue */
 	bool lvalue;
 	/* whether this expression is a pointer decayed from an array or function designator */
@@ -424,6 +426,7 @@ struct decl *stringdecl(struct expr *);
 
 void emittentativedefns(void);
 void checkf128calls(void);
+void emitasanctor(void);
 
 /* scope */
 

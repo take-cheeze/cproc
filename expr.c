@@ -14,6 +14,7 @@ mkexpr(enum exprkind k, struct type *t, struct expr *b)
 	struct expr *e;
 
 	e = xmalloc(sizeof(*e));
+	e->loc = tok.loc;
 	e->qual = QUALNONE;
 	e->type = t;
 	e->lvalue = false;
