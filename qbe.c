@@ -116,6 +116,13 @@ struct asanobj {
 	/* a dynamic block (asandynalloc: base is NULL): the address and the size (rounded up) are kept in entry-block slots,
 	 * since the block is poisoned where a scope ends, which need not be dominated by the allocation */
 	struct value *objslot, *sizeslot;
+	/* -fsanitize=address, use after return: the fake frame that __asan_stack_malloc_N returned for this object (NULL when it
+	 * returned none, and the object is in the real frame), its size and class for __asan_stack_free_N (asanfree), and its
+	 * description: desc is the text of a data item named desclabel, which emitfunc writes before the function */
+	struct value *fake;
+	unsigned long long fsize;
+	int fclass;
+	char *desclabel, *desc;
 };
 
 /* a call of setjmp (asansetjmp): the block that poisons the objects out of scope at the call (pad, see asanfinish) and the
@@ -280,10 +287,11 @@ bool asanon;   /* set by main from NFCXX_ASAN */
 static struct location asanloc;
 
 static struct value *funcinst(struct func *f, int op, int class, struct value *arg0, struct value *arg1);
+static struct value *asanraw(struct func *f, struct block *b, int op, int class, struct value *arg0, struct value *arg1);
 
-/* a call of the runtime function name with one or two pointer-sized arguments (b may be NULL) */
-static void
-asancall(struct func *f, const char *name, struct value *a, struct value *b)
+/* the global function name, as a call target */
+static struct value *
+asanfn(const char *name)
 {
 	struct value *fn;
 	char *s;
@@ -294,10 +302,28 @@ asancall(struct func *f, const char *name, struct value *a, struct value *b)
 	fn->kind = VALUE_GLOBAL;
 	fn->u.name = s;
 	fn->id = 0;
-	funcinst(f, ICALL, 0, fn, NULL);
+	return fn;
+}
+
+/* a call of the runtime function name with one or two pointer-sized arguments (b may be NULL) */
+static void
+asancall(struct func *f, const char *name, struct value *a, struct value *b)
+{
+	funcinst(f, ICALL, 0, asanfn(name), NULL);
 	funcinst(f, IARG, ptrclass, a, NULL);
 	if (b)
 		funcinst(f, IARG, ptrclass, b, NULL);
+}
+
+/* a call of the runtime function name with one pointer-sized argument a, whose result (a pointer) is returned */
+static struct value *
+asancallret(struct func *f, const char *name, struct value *a)
+{
+	struct value *r;
+
+	r = funcinst(f, ICALL, ptrclass, asanfn(name), NULL);
+	funcinst(f, IARG, ptrclass, a, NULL);
+	return r;
 }
 
 static void
@@ -876,17 +902,66 @@ asantop(struct func *f)
 	return n ? ((unsigned *)f->asanopen.val)[n - 1] : 0;
 }
 
+/*
+-fsanitize=address, use after return: the fake frame of an object (libasan's fake stack, which the runtime keeps per thread).
+A frame is asked for at the entry, with the frame size rounded up to 64 bytes: __asan_stack_malloc_N(size), N the smallest
+class with 64 << N >= size (N <= 10, so size <= 64 KiB), returns 0 when detect_stack_use_after_return is off or the class is
+full, and then the object stays in the real frame. The same classes and sizes gcc passes (`movl $64, %edi` for 64 bytes,
+`__asan_stack_malloc_2` with 192). The frame's header is what gcc writes: magic 0x41B58AB3, the description (a data item,
+"1 OFFSET SIZE NAMELEN NAME:LINE", as libasan reads it for the report), and the pc (the function, for the frame's name).
+The object is at ASANRZ into the frame, as in the real frame. asanselect picks the frame when there is one. Objects over
+16-byte alignment get none (the object's offset would depend on the address). asanfree gives the frame back at each return.
+*/
+#define ASANFRAMEMAGIC 0x41B58AB3LL
+static unsigned asandescs;
+
+/* the class of a fake frame of size bytes (a multiple of 64), or -1 when it is too big for one */
+static int
+asanclass(unsigned long long size)
+{
+	int c;
+
+	for (c = 0; c <= 10; c++)
+		if ((64ULL << c) >= size)
+			return c;
+	return -1;
+}
+
+/* base = fake when fake is not NULL, else real: m is all ones when fake is a non-null pointer (below 2^63, so -fake has its top
+ * bit set) and zero when it is NULL, and base = real ^ ((real ^ fake) & m) (branch-free, as asanhi) */
+static struct value *
+asanselect(struct func *f, struct value *real, struct value *fake)
+{
+	struct value *m, *x;
+
+	m = funcinst(f, IOR, ptrclass, fake, funcinst(f, ISUB, ptrclass, mkintconst(0), fake));
+	m = funcinst(f, ISAR, ptrclass, m, mkintconst(63));
+	x = funcinst(f, IAND, ptrclass, funcinst(f, IXOR, ptrclass, real, fake), m);
+	return funcinst(f, IXOR, ptrclass, real, x);
+}
+
 static void
 asanalloc(struct func *f, struct decl *d)
 {
 	struct block *end = f->end;
 	unsigned long long size8 = (d->type->size + 7) & ~7ULL, align = d->u.obj.align, total = size8 + 2 * ASANRZ;
-	struct value *base, *obj, *right, *left, *rlen;
+	unsigned long long frame = 0;
+	struct value *real, *base, *obj, *right, *left, *rlen, *fake = NULL, *p;
 	struct asanobj *o;
+	int cls = -1;
+	char name[64], *nl;
 
 	f->end = f->start;
 	if (align <= 16) {
-		base = funcinst(f, IALLOC16, ptrclass, mkintconst(total), NULL);
+		real = funcinst(f, IALLOC16, ptrclass, mkintconst(total), NULL);
+		base = real;
+		frame = (total + 63) & ~63ULL;
+		cls = asanclass(frame);
+		if (cls >= 0) {
+			snprintf(name, sizeof(name), "__asan_stack_malloc_%d", cls);
+			fake = asancallret(f, name, mkintconst(frame));
+			base = asanselect(f, real, fake);
+		}
 		obj = funcinst(f, IADD, ptrclass, base, mkintconst(ASANRZ));
 		right = funcinst(f, IADD, ptrclass, obj, mkintconst(size8));
 		left = mkintconst(ASANRZ);
@@ -902,18 +977,37 @@ asanalloc(struct func *f, struct decl *d)
 		left = funcinst(f, ISUB, ptrclass, obj, base);
 		rlen = funcinst(f, ISUB, ptrclass, funcinst(f, IADD, ptrclass, base, mkintconst(total)), right);
 	}
+	/* the header, stored raw into the entry block (no check: nothing of the frame is unpoisoned yet): the magic, the
+	 * description's address and the pc of the function */
+	o = arrayadd(&f->asan, sizeof(*o));
+	o->desclabel = o->desc = NULL;
+	if (fake) {
+		asanraw(f, f->start, ISTOREL, 0, mkintconst(ASANFRAMEMAGIC), base);
+		o->desclabel = xmalloc(32);
+		snprintf(o->desclabel, 32, "asandesc.%u", ++asandescs);
+		p = funcinst(f, IADD, ptrclass, base, mkintconst(8));
+		asanraw(f, f->start, ISTOREL, 0, asanfn(o->desclabel), p);
+		p = funcinst(f, IADD, ptrclass, base, mkintconst(16));
+		asanraw(f, f->start, ISTOREL, 0, f->decl->value, p);
+		nl = xmalloc(strlen(d->name ? d->name : "") + 32);
+		sprintf(nl, "%s:%zu", d->name ? d->name : "", d->loc.line);
+		o->desc = xmalloc(strlen(nl) + 64);
+		sprintf(o->desc, "1 %d %llu %zu %s", ASANRZ, d->type->size, strlen(nl), nl);
+	}
 	f->end = end;
 	/* the poison is at the declaration, not in the entry block: a return that comes before this declaration never poisons it */
 	asancall(f, "__asan_unpoison_memory_region", base, mkintconst(total));
 	asancall(f, "__asan_poison_memory_region", base, left);
 	asancall(f, "__asan_poison_memory_region", right, rlen);
-	o = arrayadd(&f->asan, sizeof(*o));
 	o->base = base;
 	o->size = total;
 	o->obj = obj;
 	o->obj8 = size8;
 	o->block = asantop(f);
 	o->objslot = o->sizeslot = NULL;
+	o->fake = fake;
+	o->fsize = fake ? frame : 0;
+	o->fclass = cls;
 	d->value = obj;
 }
 
@@ -985,6 +1079,8 @@ asandynalloc(struct func *f, struct value *size, bool scoped)
 	o->size = 0;
 	o->obj = NULL;
 	o->obj8 = 0;
+	o->fake = NULL;
+	o->desclabel = o->desc = NULL;
 	o->block = asantop(f);
 	o->objslot = asanraw(f, f->start, IALLOC8, ptrclass, mkintconst(8), NULL);
 	o->sizeslot = asanraw(f, f->start, IALLOC8, ptrclass, mkintconst(8), NULL);
@@ -993,6 +1089,55 @@ asandynalloc(struct func *f, struct value *size, bool scoped)
 	asanraw(f, f->end, ISTOREL, 0, obj, o->objslot);
 	asanraw(f, f->end, ISTOREL, 0, size8, o->sizeslot);
 	return obj;
+}
+
+/*
+-fsanitize=address, use after return: the fake frames (asanalloc) are given back where the function returns, as gcc's
+__asan_stack_free_N does: libasan poisons the frame with the stack-use-after-return shadow, so a pointer into it that is
+read later is reported. __asan_stack_free_N dereferences its pointer, so each frame is freed on a branch that skips it
+when the object is in the real frame. Every return block b becomes a chain: for each fake frame, jnz fake, free, next; then
+the return, in a block r that takes b's jump (asanrets then names r, for asandynret). Called by emitfunc after the body.
+*/
+static void
+asanfree(struct func *f)
+{
+	struct block **bp, *b, *u, *n, *r, *cur;
+	struct asanobj *o;
+	size_t i, j, nret = f->asanrets.len / sizeof(*bp), nobj = f->asan.len / sizeof(*o);
+	char *name;
+
+	for (i = 0; i < nret; i++) {
+		bp = (struct block **)f->asanrets.val + i;
+		b = *bp;
+		r = mkblock("asanret");
+		r->jump = b->jump;
+		cur = b;
+		for (j = 0; j < nobj; j++) {
+			o = (struct asanobj *)f->asan.val + j;
+			if (!o->fake)
+				continue;
+			u = mkblock("asanfree");
+			n = mkblock("asanfreenext");
+			cur->jump.kind = JUMP_JNZ;
+			cur->jump.arg = o->fake;
+			cur->jump.blk[0] = u;
+			cur->jump.blk[1] = n;
+			funclabel(f, u);
+			name = xmalloc(32);
+			snprintf(name, 32, "__asan_stack_free_%d", o->fclass);
+			asancall(f, name, o->fake, mkintconst(o->fsize));
+			u->jump.kind = JUMP_JMP;
+			u->jump.blk[0] = n;
+			funclabel(f, n);
+			cur = n;
+		}
+		if (cur == b)
+			continue;
+		cur->jump.kind = JUMP_JMP;
+		cur->jump.blk[0] = r;
+		funclabel(f, r);
+		*bp = r;
+	}
 }
 
 /*
@@ -2586,6 +2731,17 @@ emitfunc(struct func *f, bool global)
 	/* dbgfile is top-level: it names the file of the .loc lines (dbgloc) of this function */
 	if (f->asanfile)
 		printf("dbgfile \"%s\"\n", f->asanfile);
+	/* -fsanitize=address, use after return: the descriptions of the fake frames (asanalloc), read by libasan's report */
+	if (asanon) {
+		struct asanobj *o;
+		size_t i, n = f->asan.len / sizeof(*o);
+
+		for (i = 0; i < n; i++) {
+			o = (struct asanobj *)f->asan.val + i;
+			if (o->desc)
+				printf("data $%s = { b \"%s\", b 0 }\n", o->desclabel, o->desc);
+		}
+	}
 
 	if (asanon)
 		asanfinish(f);
@@ -2596,6 +2752,8 @@ emitfunc(struct func *f, bool global)
 			v = mkintconst(0);
 		funcret(f, v);
 	}
+	if (asanon)
+		asanfree(f);
 	if (asanon && f->asanlo)
 		asandynret(f);
 	if (global)

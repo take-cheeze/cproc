@@ -72,6 +72,7 @@ mkdecl(char *name, enum declkind k, struct type *t, enum typequal tq, enum linka
 	d = xmalloc(sizeof(*d));
 	memset(d, 0, sizeof(*d));
 	d->name = name;
+	d->loc = tok.loc;
 	d->kind = k;
 	d->linkage = linkage;
 	d->type = t;
