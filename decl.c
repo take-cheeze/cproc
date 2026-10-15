@@ -645,6 +645,7 @@ declaratortypes(struct scope *s, struct list *result, char **name, int *align, s
 			t->u.func.isvararg = false;
 			t->u.func.params = NULL;
 			t->u.func.nparam = 0;
+			t->u.func.unprototyped = tok.kind == TRPAREN;
 			paramend = &t->u.func.params;
 			s = mkscope(s);
 			d = NULL;

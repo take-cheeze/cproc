@@ -161,6 +161,24 @@ typerank(struct type *t)
 	return -1;
 }
 
+/* A prototype that an unprototyped function type can stand for: no ellipsis, and no parameter that a
+   default argument promotion changes (integers narrower than int, float). */
+static bool
+unprototypedok(struct type *t)
+{
+	struct decl *d;
+
+	if (t->u.func.isvararg)
+		return false;
+	for (d = t->u.func.params; d; d = d->next) {
+		if ((d->type->prop & PROPINT) && d->type->size < sizeof(int))
+			return false;
+		if ((d->type->prop & PROPFLOAT) && d->type->size < sizeof(double))
+			return false;
+	}
+	return true;
+}
+
 bool
 typecompatible(struct type *t1, struct type *t2)
 {
@@ -192,6 +210,13 @@ typecompatible(struct type *t1, struct type *t2)
 			return false;
 		goto derived;
 	case TYPEFUNC:
+		if (t1->u.func.unprototyped || t2->u.func.unprototyped) {
+			/* 6.7.6.3p15: a function declared with () is compatible with a prototype
+			   whose parameters the default argument promotions leave unchanged */
+			if (!unprototypedok(t1->u.func.unprototyped ? t2 : t1))
+				return false;
+			goto derived;
+		}
 		if (t1->u.func.isvararg != t2->u.func.isvararg)
 			return false;
 		for (p1 = t1->u.func.params, p2 = t2->u.func.params; p1 && p2; p1 = p1->next, p2 = p2->next) {

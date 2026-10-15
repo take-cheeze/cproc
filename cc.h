@@ -114,6 +114,7 @@ struct type {
 		} array;
 		struct {
 			bool isvararg;
+			bool unprototyped;  /* written as "()", not "(void)" (6.7.6.3p15) */
 			struct decl *params;
 			size_t nparam;
 		} func;
