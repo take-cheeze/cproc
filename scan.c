@@ -125,7 +125,7 @@ ident(struct scanner *s)
 	int tok;
 
 	s->usebuf = true;
-	while (isalnum(s->chr) || s->chr == '_')
+	while (isalnum(s->chr) || s->chr == '_' || s->chr == '$')  /* '$' in identifiers: a GCC and EDG extension */
 		nextchar(s);
 	tok = tokenget(s->buf.str, s->buf.len);
 	s->usebuf = false;
@@ -406,7 +406,7 @@ again:
 	default:
 		if (isdigit(s->chr))
 			return number(s);
-		if (isalpha(s->chr) || s->chr == '_')
+		if (isalpha(s->chr) || s->chr == '_' || s->chr == '$')
 			return ident(s);
 		s->usebuf = true;
 		nextchar(s);
