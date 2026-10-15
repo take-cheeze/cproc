@@ -58,6 +58,10 @@ scopeinit(void)
 		{.name = "__atomic_fetch_xor", .kind = DECLBUILTIN, .u.builtin = BUILTINC11FETCHXOR},
 	};
 	static struct decl valist;
+	/* __builtin_strstr (libc++'s <cstring> calls it): a char *(char *, char *) function whose symbol is strstr, so
+	 * the call goes to the library function, as GCC's builtin does */
+	static struct decl strstr, strstrargs[2];
+	struct type *strstrtype;
 	struct decl *d;
 
 	for (d = builtins; d < builtins + countof(builtins); ++d)
@@ -66,6 +70,26 @@ scopeinit(void)
 	valist.kind = DECLTYPE;
 	valist.type = targ->typevalist;
 	scopeputdecl(&filescope, &valist);
+
+	strstrtype = mktype(TYPEFUNC, 0);
+	strstrtype->base = mkpointertype(&typechar, QUALNONE);
+	strstrtype->qual = QUALNONE;
+	strstrtype->u.func.isvararg = false;
+	strstrtype->u.func.unprototyped = false;
+	strstrtype->u.func.nparam = 2;
+	strstrtype->u.func.params = &strstrargs[0];
+	strstrargs[0].kind = DECLOBJECT;
+	strstrargs[0].type = mkpointertype(&typechar, QUALNONE);
+	strstrargs[0].next = &strstrargs[1];
+	strstrargs[1].kind = DECLOBJECT;
+	strstrargs[1].type = strstrargs[0].type;
+	strstr.name = "__builtin_strstr";
+	strstr.kind = DECLFUNC;
+	strstr.linkage = LINKEXTERN;
+	strstr.type = strstrtype;
+	strstr.asmname = "strstr";
+	strstr.value = mkglobal(&strstr);
+	scopeputdecl(&filescope, &strstr);
 }
 
 struct scope *
