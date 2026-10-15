@@ -464,6 +464,103 @@ softtemp(struct func *f)
 	return v;
 }
 
+static struct value *softcall(struct func *f, int class, struct value *fn, unsigned n, struct softarg *arg);
+
+/* an atomic builtin (expr.c, atomicbuiltin) as a call of libatomic's sized function __atomic_OP_N for the size N of the
+ * pointee: the pointer, the value(s) and the memory order, in the sized functions' own convention (compare-exchange
+ * takes the expected pointer and returns a bool). libSystem exports them on macOS. */
+static struct value *
+funcatomic(struct func *f, struct expr *e)
+{
+	struct expr *a[5];
+	struct softarg sa[5];
+	struct type *pt;
+	struct value *r;
+	const char *op;
+	char name[32];
+	unsigned n = 0, i, size;
+	int vclass, rclass;
+
+	for (struct expr *x = e->base; x; x = x->next)
+		a[n++] = x;
+	pt = a[0]->type->base;
+	size = pt->size;
+	vclass = qbetype(pt).base;
+	rclass = 0;
+	switch (e->u.builtin.kind) {
+	case BUILTINC11INIT:
+	case BUILTINC11STORE:
+		op = "store";
+		break;
+	case BUILTINC11LOAD:
+		op = "load";
+		rclass = vclass;
+		break;
+	case BUILTINC11XCHG:
+		op = "exchange";
+		rclass = vclass;
+		break;
+	case BUILTINC11CAS:
+		op = "compare_exchange";
+		rclass = 'w';
+		break;
+	case BUILTINC11FETCHADD:
+		op = "fetch_add";
+		rclass = vclass;
+		break;
+	case BUILTINC11FETCHSUB:
+		op = "fetch_sub";
+		rclass = vclass;
+		break;
+	case BUILTINC11FETCHAND:
+		op = "fetch_and";
+		rclass = vclass;
+		break;
+	case BUILTINC11FETCHOR:
+		op = "fetch_or";
+		rclass = vclass;
+		break;
+	case BUILTINC11FETCHXOR:
+		op = "fetch_xor";
+		rclass = vclass;
+		break;
+	default:
+		fatal("internal error; not an atomic builtin");
+	}
+	snprintf(name, sizeof(name), "__atomic_%s_%u", op, size);
+	/* the sized functions: (ptr, value, order), (ptr, order) for load, (ptr, expected, desired, success, failure) for
+	 * compare-exchange; INIT is a relaxed store (order 0) */
+	switch (e->u.builtin.kind) {
+	case BUILTINC11LOAD:
+		n = 2;
+		sa[0] = (struct softarg){ptrclass, funcexpr(f, a[0])};
+		sa[1] = (struct softarg){'w', funcexpr(f, a[1])};
+		break;
+	case BUILTINC11CAS:
+		sa[0] = (struct softarg){ptrclass, funcexpr(f, a[0])};
+		sa[1] = (struct softarg){ptrclass, funcexpr(f, a[1])};
+		sa[2] = (struct softarg){vclass, funcexpr(f, a[2])};
+		sa[3] = (struct softarg){'w', funcexpr(f, a[3])};
+		sa[4] = (struct softarg){'w', funcexpr(f, a[4])};
+		n = 5;
+		break;
+	case BUILTINC11INIT:
+		sa[0] = (struct softarg){ptrclass, funcexpr(f, a[0])};
+		sa[1] = (struct softarg){vclass, funcexpr(f, a[1])};
+		sa[2] = (struct softarg){'w', mkintconst(0)};
+		n = 3;
+		break;
+	default:
+		sa[0] = (struct softarg){ptrclass, funcexpr(f, a[0])};
+		sa[1] = (struct softarg){vclass, funcexpr(f, a[1])};
+		sa[2] = (struct softarg){'w', funcexpr(f, a[2])};
+		n = 3;
+		break;
+	}
+	r = softcall(f, rclass, asanfn(name), n, sa);
+	return rclass ? r : NULL;
+}
+
 /* a call of fn (class is the class of its result, 0 for none) with n arguments */
 static struct value *
 softcall(struct func *f, int class, struct value *fn, unsigned n, struct softarg *arg)
@@ -2337,6 +2434,17 @@ funcexpr(struct func *f, struct expr *e)
 			if (asanon)
 				return asandynalloc(f, l, false);
 			return funcinst(f, IALLOC16, ptrclass, l, NULL);
+		case BUILTINC11INIT:
+		case BUILTINC11LOAD:
+		case BUILTINC11STORE:
+		case BUILTINC11XCHG:
+		case BUILTINC11CAS:
+		case BUILTINC11FETCHADD:
+		case BUILTINC11FETCHSUB:
+		case BUILTINC11FETCHAND:
+		case BUILTINC11FETCHOR:
+		case BUILTINC11FETCHXOR:
+			return funcatomic(f, e);
 		case BUILTINUNREACHABLE:
 			funchlt(f);
 			return NULL;

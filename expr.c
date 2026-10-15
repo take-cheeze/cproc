@@ -1050,6 +1050,69 @@ fpbuiltin(struct scope *s, enum builtinkind kind)
 	return mkexpr(EXPRCOMMA, &typeint, b.head);
 }
 
+/* __c11_atomic_* and the GCC __atomic_*_n / __atomic_fetch_* forms (libc++ calls the first kind from its inline wrappers).
+ * The operand size comes from the pointee type, 1, 2, 4 or 8 bytes; qbe.c lowers each call to libatomic's sized
+ * function (__atomic_load_8 and so on), which libSystem exports on macOS. The arguments are the pointer, then the
+ * values, then the memory order: compare-exchange takes the expected pointer, the desired value and two orders, and
+ * the GCC form's weak flag (the fourth argument) is dropped. */
+static struct expr *
+atomicbuiltin(struct scope *s, enum builtinkind kind)
+{
+	struct expr *e, *first, *arg, *prev;
+	struct type *pointee;
+	unsigned n = 0, want;
+
+	first = assignexpr(s);
+	if (first->type->kind != TYPEPOINTER)
+		error(&tok.loc, "atomic operation needs a pointer");
+	pointee = first->type->base;
+	if (!(pointee->prop & PROPSCALAR) || (pointee->size != 1 && pointee->size != 2 && pointee->size != 4 && pointee->size != 8))
+		error(&tok.loc, "atomic operation on an unsupported type");
+	prev = first;
+	while (consume(TCOMMA)) {
+		arg = assignexpr(s);
+		prev->next = arg;
+		prev = arg;
+		++n;
+	}
+	switch (kind) {
+	case BUILTINC11INIT:
+		want = 1;
+		break;
+	case BUILTINC11LOAD:
+		want = 1;
+		break;
+	case BUILTINC11CAS:
+		want = 4;
+		break;
+	default:
+		want = 2;
+		break;
+	}
+	if (kind == BUILTINC11CAS && n == 5) {
+		/* the GCC form: drop the weak flag (the third argument after the pointer) */
+		struct expr *desired = first->next->next;
+		desired->next = desired->next->next;
+		n = 4;
+	}
+	if (n != want)
+		error(&tok.loc, "wrong number of arguments to an atomic builtin");
+	switch (kind) {
+	case BUILTINC11INIT:
+	case BUILTINC11STORE:
+		e = mkexpr(EXPRBUILTIN, &typevoid, first);
+		break;
+	case BUILTINC11CAS:
+		e = mkexpr(EXPRBUILTIN, &typebool, first);
+		break;
+	default:
+		e = mkexpr(EXPRBUILTIN, pointee, first);
+		break;
+	}
+	e->u.builtin.kind = kind;
+	return e;
+}
+
 static struct expr *
 builtinfunc(struct scope *s, enum builtinkind kind)
 {
@@ -1175,6 +1238,18 @@ builtinfunc(struct scope *s, enum builtinkind kind)
 			e->base = mkunaryexpr(TBAND, e->base);
 		if (consume(TCOMMA))
 			delexpr(assignexpr(s));
+		break;
+	case BUILTINC11INIT:
+	case BUILTINC11LOAD:
+	case BUILTINC11STORE:
+	case BUILTINC11XCHG:
+	case BUILTINC11CAS:
+	case BUILTINC11FETCHADD:
+	case BUILTINC11FETCHSUB:
+	case BUILTINC11FETCHAND:
+	case BUILTINC11FETCHOR:
+	case BUILTINC11FETCHXOR:
+		e = atomicbuiltin(s, kind);
 		break;
 	default:
 		fatal("internal error; unknown builtin");
