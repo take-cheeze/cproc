@@ -62,6 +62,8 @@ scopeinit(void)
 	 * the call goes to the library function, as GCC's builtin does */
 	static struct decl strstr, strstrargs[2];
 	struct type *strstrtype;
+	struct mapkey k;
+	size_t i;
 	struct decl *d;
 
 	for (d = builtins; d < builtins + countof(builtins); ++d)
@@ -83,13 +85,15 @@ scopeinit(void)
 	strstrargs[0].next = &strstrargs[1];
 	strstrargs[1].kind = DECLOBJECT;
 	strstrargs[1].type = strstrargs[0].type;
-	strstr.name = "__builtin_strstr";
+	/* the decl is named strstr (its symbol, mangled by the back end), and filed under the builtin's name */
+	strstr.name = "strstr";
 	strstr.kind = DECLFUNC;
 	strstr.linkage = LINKEXTERN;
 	strstr.type = strstrtype;
-	strstr.asmname = "strstr";
 	strstr.value = mkglobal(&strstr);
-	scopeputdecl(&filescope, &strstr);
+	mapkey(&k, "__builtin_strstr", strlen("__builtin_strstr"));
+	mapput(&filescope.decls, &k, &i);
+	filescope.decls.vals[i].p = &strstr;
 }
 
 struct scope *
