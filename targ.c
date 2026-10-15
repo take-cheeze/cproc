@@ -20,6 +20,18 @@ static const struct target alltargs[] = {
 		.signedchar = 1,
 	},
 	{
+		/* Apple arm64: va_list is a plain pointer (void *, the SDK's __darwin_va_list), and the variadic arguments are
+		 * on the stack (QBE's apple_selvastart and apple_selvaarg read the va_list object by address). */
+		.name = "aarch64-apple",
+		.typevalist = &(struct type){
+			.kind = TYPEPOINTER, .prop = PROPSCALAR,
+			.align = 8, .size = 8,
+			.base = &typevoid,
+		},
+		.typewchar = &typeint,
+		.signedchar = 1,
+	},
+	{
 		.name = "aarch64",
 		.typevalist = &(struct type){
 			.kind = TYPESTRUCT,

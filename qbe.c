@@ -1998,6 +1998,25 @@ anyf128arg(struct expr *e)
 	return false;
 }
 
+/* The address of a va_list object. A pointer-typed va_list (Apple arm64) is the object itself, so its address is
+ * needed; an array-typed one (x86-64, Linux aarch64) already evaluates to its address. */
+struct value *
+funcvalistaddr(struct func *f, struct expr *e)
+{
+	if (targ->typevalist->kind == TYPEPOINTER) {
+		/* the argument may be converted to the va_list type, or taken by address (the parser's array-style view of
+		 * va_list): the object is under the cast and the address-of */
+		for (;;) {
+			if (e->kind == EXPRCAST || (e->kind == EXPRUNARY && e->op == TBAND))
+				e = e->base;
+			else
+				break;
+		}
+		return funclval(f, e).addr;
+	}
+	return funcexpr(f, e);
+}
+
 struct value *
 funcexpr(struct func *f, struct expr *e)
 {
@@ -2302,7 +2321,7 @@ funcexpr(struct func *f, struct expr *e)
 	case EXPRBUILTIN:
 		switch (e->u.builtin.kind) {
 		case BUILTINVASTART:
-			l = funcexpr(f, e->base);
+			l = funcvalistaddr(f, e->base);
 			funcinst(f, IVASTART, 0, l, NULL);
 			break;
 		case BUILTINVAARG:
@@ -2311,7 +2330,7 @@ funcexpr(struct func *f, struct expr *e)
 			/* https://todo.sr.ht/~mcf/cproc/52 */
 			if (!(e->type->prop & PROPSCALAR) || e->type->prop & PROPSOFT)
 				return funcvaargagg(f, e);
-			l = funcexpr(f, e->base);
+			l = funcvalistaddr(f, e->base);
 			return funcinst(f, IVAARG, qbetype(e->type).base, l, NULL);
 		case BUILTINALLOCA:
 			l = funcexpr(f, e->base);
