@@ -6,6 +6,38 @@
 
 struct scope filescope;
 
+/* a builtin that calls the library function symbol: a function of type ret(ptypes...), filed under the builtin's name */
+static void
+scopeputalias(const char *builtin, char *symbol, struct type *ret, unsigned nparam, struct type **ptypes)
+{
+	struct decl *f, *arg, *last = NULL;
+	struct type *t;
+	struct mapkey k;
+	size_t i;
+	unsigned n;
+
+	t = mktype(TYPEFUNC, 0);
+	t->base = ret;
+	t->qual = QUALNONE;
+	t->u.func.isvararg = false;
+	t->u.func.unprototyped = false;
+	t->u.func.nparam = nparam;
+	t->u.func.params = NULL;
+	for (n = 0; n < nparam; ++n) {
+		arg = mkdecl(NULL, DECLOBJECT, ptypes[n], QUALNONE, LINKNONE);
+		if (last)
+			last->next = arg;
+		else
+			t->u.func.params = arg;
+		last = arg;
+	}
+	f = mkdecl(symbol, DECLFUNC, t, QUALNONE, LINKEXTERN);
+	f->value = mkglobal(f);
+	mapkey(&k, builtin, strlen(builtin));
+	mapput(&filescope.decls, &k, &i);
+	filescope.decls.vals[i].p = f;
+}
+
 void
 scopeinit(void)
 {
@@ -58,12 +90,6 @@ scopeinit(void)
 		{.name = "__atomic_fetch_xor", .kind = DECLBUILTIN, .u.builtin = BUILTINC11FETCHXOR},
 	};
 	static struct decl valist;
-	/* __builtin_strstr (libc++'s <cstring> calls it): a char *(char *, char *) function whose symbol is strstr, so
-	 * the call goes to the library function, as GCC's builtin does */
-	static struct decl strstr, strstrargs[2];
-	struct type *strstrtype;
-	struct mapkey k;
-	size_t i;
 	struct decl *d;
 
 	for (d = builtins; d < builtins + countof(builtins); ++d)
@@ -73,27 +99,12 @@ scopeinit(void)
 	valist.type = targ->typevalist;
 	scopeputdecl(&filescope, &valist);
 
-	strstrtype = mktype(TYPEFUNC, 0);
-	strstrtype->base = mkpointertype(&typechar, QUALNONE);
-	strstrtype->qual = QUALNONE;
-	strstrtype->u.func.isvararg = false;
-	strstrtype->u.func.unprototyped = false;
-	strstrtype->u.func.nparam = 2;
-	strstrtype->u.func.params = &strstrargs[0];
-	strstrargs[0].kind = DECLOBJECT;
-	strstrargs[0].type = mkpointertype(&typechar, QUALCONST);
-	strstrargs[0].next = &strstrargs[1];
-	strstrargs[1].kind = DECLOBJECT;
-	strstrargs[1].type = strstrargs[0].type;
-	/* the decl is named strstr (its symbol, mangled by the back end), and filed under the builtin's name */
-	strstr.name = "strstr";
-	strstr.kind = DECLFUNC;
-	strstr.linkage = LINKEXTERN;
-	strstr.type = strstrtype;
-	strstr.value = mkglobal(&strstr);
-	mapkey(&k, "__builtin_strstr", strlen("__builtin_strstr"));
-	mapput(&filescope.decls, &k, &i);
-	filescope.decls.vals[i].p = &strstr;
+	/* libc++'s <cstring> and <string> call these (the GCC and clang builtins): each is a call to the library function
+	 * of the same name, so the back end names the decl's symbol and the builtin is filed under its own name */
+	scopeputalias("__builtin_strstr", "strstr", mkpointertype(&typechar, QUALNONE), 2,
+		(struct type *[]){mkpointertype(&typechar, QUALCONST), mkpointertype(&typechar, QUALCONST)});
+	scopeputalias("__builtin_char_memchr", "memchr", mkpointertype(&typevoid, QUALNONE), 3,
+		(struct type *[]){mkpointertype(&typevoid, QUALCONST), &typeint, &typeulong});
 }
 
 struct scope *
