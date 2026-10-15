@@ -806,8 +806,10 @@ primaryexpr(struct scope *s)
 				error(&tok.loc, "invalid floating constant suffix '%s'", end);
 			if (e->type == &typefloat128)
 				softliteral(e->u.constant.soft, tok.lit);
+#ifndef typeldouble
 			else if (e->type == &typeldouble)
 				softimage(e->u.constant.soft, e->type, strtold(tok.lit, NULL));
+#endif
 		} else {
 			src = tok.lit;
 			if (base == 2)

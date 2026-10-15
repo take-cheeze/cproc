@@ -381,6 +381,11 @@ extern struct type typeshort, typeushort;
 extern struct type typeint, typeuint;
 extern struct type typelong, typeulong;
 extern struct type typellong, typeullong;
+/* Apple arm64 (scripts/setup-qbe.sh): long double is a double, as in clang's ABI there, so cproc's long double is the
+ * double type. Everywhere else long double is the 16-byte soft type of type.c. */
+#if defined(__APPLE__) && defined(__aarch64__)
+#define typeldouble typedouble
+#endif
 extern struct type typefloat, typedouble, typeldouble, typefloat128, typefloat16;
 extern struct type typeint128, typeuint128;
 extern struct type typenullptr;

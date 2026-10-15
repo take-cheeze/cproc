@@ -38,10 +38,13 @@ struct type typeullong  = INTTYPE(TYPELLONG, 8, false, 0);
 struct type typefloat   = FLTTYPE(TYPEFLOAT, 4);
 struct type typedouble  = FLTTYPE(TYPEDOUBLE, 8);
 /* long double and __float128 are 16-byte objects with no QBE scalar class (see qbe.c, PROPSOFT) */
+#ifndef typeldouble
+/* long double and __float128 are 16-byte objects with no QBE scalar class (see qbe.c, PROPSOFT) */
 struct type typeldouble = {
 	.kind = TYPELDOUBLE, .size = 16, .align = 16,
 	.prop = PROPSCALAR|PROPARITH|PROPREAL|PROPSOFT,
 };
+#endif
 struct type typefloat128 = {
 	.kind = TYPEFLOAT128, .size = 16, .align = 16,
 	.prop = PROPSCALAR|PROPARITH|PROPREAL|PROPSOFT,
