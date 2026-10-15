@@ -253,8 +253,25 @@ case "$target" in
 	: ${DEFAULT_CPP:=clang -E}
 	startfiles='0'
 	endfiles='"-l", "System"'
+	case "$target" in
+	aarch64-*) defines=$defines'
+	"-D", "__arm64__",
+'
+	;;
+	esac
 	defines=$defines'
 	"-D", "__APPLE__",
+	"-D", "__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__=260000",
+	"-D", "__CHAR_BIT__=8",
+	"-D", "__SCHAR_MAX__=0x7f",
+	"-D", "__SHRT_MAX__=0x7fff",
+	"-D", "__INT_MAX__=0x7fffffff",
+	"-D", "__LONG_MAX__=__LONG_LONG_MAX__",
+	"-D", "__LONG_LONG_MAX__=0x7fffffffffffffffL",
+	"-D", "__WINT_TYPE__=int",
+	"-D", "__WCHAR_TYPE__=int",
+	"-D", "__SIZE_TYPE__=unsigned long",
+	"-D", "__PTRDIFF_TYPE__=long",
 	"-D", "__unix__",
 
 	"-D", "_Nullable=",
