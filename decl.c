@@ -235,6 +235,17 @@ tagspec(struct scope *s)
 		if (!t->u.structunion.members)
 			t->align = 1;
 		next();
+		/* a trailing GNU attribute after the body, struct S { ... } __attribute__((aligned(N))), raises the alignment */
+		{
+			struct attr trail;
+
+			trail.kind = 0;
+			trail.align = 0;
+			trail.section = NULL;
+			gnuattr(&trail, ATTRALIGNED);
+			if (trail.kind & ATTRALIGNED && trail.align > t->align)
+				t->align = trail.align;
+		}
 		if (!b.pack)
 			t->size = ALIGNUP(t->size, t->align);
 		break;
