@@ -79,7 +79,7 @@ scopeinit(void)
 	strstrtype->u.func.nparam = 2;
 	strstrtype->u.func.params = &strstrargs[0];
 	strstrargs[0].kind = DECLOBJECT;
-	strstrargs[0].type = mkpointertype(&typechar, QUALNONE);
+	strstrargs[0].type = mkpointertype(&typechar, QUALCONST);
 	strstrargs[0].next = &strstrargs[1];
 	strstrargs[1].kind = DECLOBJECT;
 	strstrargs[1].type = strstrargs[0].type;
