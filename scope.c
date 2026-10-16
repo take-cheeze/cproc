@@ -103,6 +103,22 @@ scopeinit(void)
 	 * of the same name, so the back end names the decl's symbol and the builtin is filed under its own name */
 	scopeputalias("__builtin_strstr", "strstr", mkpointertype(&typechar, QUALNONE), 2,
 		(struct type *[]){mkpointertype(&typechar, QUALCONST), mkpointertype(&typechar, QUALCONST)});
+	/* string functions (C11 7.24.5): libc++'s <string.h> and <string> call these */
+	scopeputalias("__builtin_strchr", "strchr", mkpointertype(&typechar, QUALNONE), 2,
+		(struct type *[]){mkpointertype(&typechar, QUALCONST), &typeint});
+	scopeputalias("__builtin_strrchr", "strrchr", mkpointertype(&typechar, QUALNONE), 2,
+		(struct type *[]){mkpointertype(&typechar, QUALCONST), &typeint});
+	scopeputalias("__builtin_strpbrk", "strpbrk", mkpointertype(&typechar, QUALNONE), 2,
+		(struct type *[]){mkpointertype(&typechar, QUALCONST), mkpointertype(&typechar, QUALCONST)});
+	scopeputalias("__builtin_strlen", "strlen", &typeulong, 1,
+		(struct type *[]){mkpointertype(&typechar, QUALCONST)});
+	/* memory functions (C11 7.24.1): the void * forms libc++'s <cstring> and <string> call */
+	scopeputalias("__builtin_memchr", "memchr", mkpointertype(&typevoid, QUALNONE), 3,
+		(struct type *[]){mkpointertype(&typevoid, QUALCONST), &typeint, &typeulong});
+	scopeputalias("__builtin_memcmp", "memcmp", &typeint, 3,
+		(struct type *[]){mkpointertype(&typevoid, QUALCONST), mkpointertype(&typevoid, QUALCONST), &typeulong});
+	scopeputalias("__builtin_memmove", "memmove", mkpointertype(&typevoid, QUALNONE), 3,
+		(struct type *[]){mkpointertype(&typevoid, QUALNONE), mkpointertype(&typevoid, QUALCONST), &typeulong});
 	scopeputalias("__builtin_char_memchr", "memchr", mkpointertype(&typevoid, QUALNONE), 3,
 		(struct type *[]){mkpointertype(&typevoid, QUALCONST), &typeint, &typeulong});
 }
