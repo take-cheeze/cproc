@@ -1990,6 +1990,8 @@ intclass(struct type *t)
 	}
 }
 
+struct value *funcvalistaddr(struct func *f, struct expr *e);
+
 /*
 va_arg for a struct/union of at most 16 bytes whose eightbytes are all class INTEGER
 (x86_64 SysV only; QBE's vaarg handles scalars). Such an argument is in the general
@@ -2003,6 +2005,18 @@ funcvaargagg(struct func *f, struct expr *e)
 	struct block *b[3];
 	unsigned long long size;
 
+	if (strcmp(targ->name, "aarch64-apple") == 0) {
+		/* Apple arm64: every variadic argument is in the 8-byte aligned stack slots that the va_list pointer walks
+		 * (QBE's apple_selvaarg), so an aggregate of alignment 8 or less is its address, and the pointer moves on by
+		 * its size rounded up to 8. */
+		if (!e->type->size || e->type->align > 8)
+			error(&tok.loc, "va_arg with non-scalar type is not yet supported (aggregates of alignment 8 or less on aarch64-apple)");
+		size = ALIGNUP(e->type->size, 8);
+		ap = funcvalistaddr(f, e->base);
+		tmp = funcinst(f, ILOADL, 'l', ap, NULL);
+		funcinst(f, ISTOREL, 0, funcinst(f, IADD, 'l', tmp, mkintconst(size)), ap);
+		return tmp;
+	}
 	if (e->type->kind == TYPELDOUBLE) {
 		/* a long double is class X87 (memory): the next 16-byte aligned slot of the overflow area */
 		ap = funcexpr(f, e->base);
