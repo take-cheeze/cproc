@@ -1,0 +1,67 @@
+export
+function w $load(l %.1, l %.3) {
+@start.1
+	%.2 =l alloc8 8
+	storel %.1, %.2
+	%.4 =l alloc8 8
+	storel %.3, %.4
+@body.2
+	%.5 =l loadl %.2
+	%.6 =w call $__atomic_load_4(l %.5, w 5)
+	%.7 =l loadl %.4
+	storew %.6, %.7
+	%.8 =l loadl %.4
+	%.9 =w loadw %.8
+	ret %.9
+}
+export
+function $store(l %.1, l %.3) {
+@start.3
+	%.2 =l alloc8 8
+	storel %.1, %.2
+	%.4 =l alloc8 8
+	storel %.3, %.4
+@body.4
+	%.5 =l loadl %.2
+	%.6 =l loadl %.4
+	%.7 =w loadw %.6
+	call $__atomic_store_4(l %.5, w %.7, w 5)
+	ret
+}
+export
+function w $exchange(l %.1, l %.3, l %.5) {
+@start.5
+	%.2 =l alloc8 8
+	storel %.1, %.2
+	%.4 =l alloc8 8
+	storel %.3, %.4
+	%.6 =l alloc8 8
+	storel %.5, %.6
+@body.6
+	%.7 =l loadl %.2
+	%.8 =l loadl %.4
+	%.9 =w loadw %.8
+	%.10 =w call $__atomic_exchange_4(l %.7, w %.9, w 5)
+	%.11 =l loadl %.6
+	storew %.10, %.11
+	%.12 =l loadl %.6
+	%.13 =w loadw %.12
+	ret %.13
+}
+export
+function w $cas(l %.1, l %.3, l %.5) {
+@start.7
+	%.2 =l alloc8 8
+	storel %.1, %.2
+	%.4 =l alloc8 8
+	storel %.3, %.4
+	%.6 =l alloc8 8
+	storel %.5, %.6
+@body.8
+	%.7 =l loadl %.2
+	%.8 =l loadl %.4
+	%.9 =l loadl %.6
+	%.10 =w loadw %.9
+	%.11 =w call $__atomic_compare_exchange_4(l %.7, l %.8, w %.10, w 5, w 5)
+	ret %.11
+}

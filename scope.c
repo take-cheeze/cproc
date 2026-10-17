@@ -88,6 +88,10 @@ scopeinit(void)
 		{.name = "__atomic_fetch_or", .kind = DECLBUILTIN, .u.builtin = BUILTINC11FETCHOR},
 		{.name = "__c11_atomic_fetch_xor", .kind = DECLBUILTIN, .u.builtin = BUILTINC11FETCHXOR},
 		{.name = "__atomic_fetch_xor", .kind = DECLBUILTIN, .u.builtin = BUILTINC11FETCHXOR},
+		{.name = "__atomic_load", .kind = DECLBUILTIN, .u.builtin = BUILTINATOMICLOAD},
+		{.name = "__atomic_store", .kind = DECLBUILTIN, .u.builtin = BUILTINATOMICSTORE},
+		{.name = "__atomic_exchange", .kind = DECLBUILTIN, .u.builtin = BUILTINATOMICXCHG},
+		{.name = "__atomic_compare_exchange", .kind = DECLBUILTIN, .u.builtin = BUILTINATOMICCAS},
 	};
 	static struct decl valist;
 	struct decl *d;

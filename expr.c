@@ -1113,6 +1113,8 @@ atomicbuiltin(struct scope *s, enum builtinkind kind)
 	return e;
 }
 
+static struct expr *genericatomic(struct scope *, enum builtinkind);
+
 static struct expr *
 builtinfunc(struct scope *s, enum builtinkind kind)
 {
@@ -1250,6 +1252,12 @@ builtinfunc(struct scope *s, enum builtinkind kind)
 	case BUILTINC11FETCHOR:
 	case BUILTINC11FETCHXOR:
 		e = atomicbuiltin(s, kind);
+		break;
+	case BUILTINATOMICLOAD:
+	case BUILTINATOMICSTORE:
+	case BUILTINATOMICXCHG:
+	case BUILTINATOMICCAS:
+		e = genericatomic(s, kind);
 		break;
 	default:
 		fatal("internal error; unknown builtin");
@@ -1665,6 +1673,83 @@ mkassignexpr(struct expr *l, struct expr *r)
 	e->u.assign.l = l;
 	e->u.assign.r = exprassign(r, l->type);
 	return e;
+}
+
+/* The generic GCC forms take pointers for the values and for the result, and lower to the C11 forms above:
+ * __atomic_load(p, out, o) is *out = load(p, o); __atomic_store(p, in, o) is store(p, *in, o);
+ * __atomic_exchange(p, in, out, o) is *out = exchange(p, *in, o); and __atomic_compare_exchange(p, expected, desired,
+ * weak, success, failure) is cas(p, expected, *desired, success, failure), with the weak flag dropped (it does not
+ * change the result on the targets cproc supports). */
+static struct expr *
+genericatomic(struct scope *s, enum builtinkind kind)
+{
+	struct expr *first, *arg[5], *e, *value;
+	struct type *pointee;
+	unsigned n = 0, want;
+
+	first = assignexpr(s);
+	if (first->type->kind != TYPEPOINTER)
+		error(&tok.loc, "atomic operation needs a pointer");
+	pointee = first->type->base;
+	if (!(pointee->prop & PROPSCALAR) || (pointee->size != 1 && pointee->size != 2 && pointee->size != 4 && pointee->size != 8))
+		error(&tok.loc, "atomic operation on an unsupported type");
+	while (consume(TCOMMA)) {
+		if (n == 5)
+			error(&tok.loc, "wrong number of arguments to an atomic builtin");
+		arg[n++] = assignexpr(s);
+	}
+	switch (kind) {
+	case BUILTINATOMICLOAD:
+	case BUILTINATOMICSTORE:
+		want = 2;
+		break;
+	case BUILTINATOMICXCHG:
+		want = 3;
+		break;
+	default:
+		want = 5;
+		break;
+	}
+	if (n != want)
+		error(&tok.loc, "wrong number of arguments to an atomic builtin");
+	switch (kind) {
+	case BUILTINATOMICLOAD:
+		if (arg[0]->type->kind != TYPEPOINTER)
+			error(&tok.loc, "atomic load needs a pointer for the result");
+		first->next = arg[1];
+		e = mkexpr(EXPRBUILTIN, pointee, first);
+		e->u.builtin.kind = BUILTINC11LOAD;
+		return mkassignexpr(mkunaryexpr(TMUL, arg[0]), e);
+	case BUILTINATOMICSTORE:
+		if (arg[0]->type->kind != TYPEPOINTER)
+			error(&tok.loc, "atomic store needs a pointer to the value");
+		value = mkunaryexpr(TMUL, arg[0]);
+		first->next = value;
+		value->next = arg[1];
+		e = mkexpr(EXPRBUILTIN, &typevoid, first);
+		e->u.builtin.kind = BUILTINC11STORE;
+		return e;
+	case BUILTINATOMICXCHG:
+		if (arg[0]->type->kind != TYPEPOINTER || arg[1]->type->kind != TYPEPOINTER)
+			error(&tok.loc, "atomic exchange needs pointers to the value and the result");
+		value = mkunaryexpr(TMUL, arg[0]);
+		first->next = value;
+		value->next = arg[2];
+		e = mkexpr(EXPRBUILTIN, pointee, first);
+		e->u.builtin.kind = BUILTINC11XCHG;
+		return mkassignexpr(mkunaryexpr(TMUL, arg[1]), e);
+	default:
+		if (arg[0]->type->kind != TYPEPOINTER || arg[1]->type->kind != TYPEPOINTER)
+			error(&tok.loc, "atomic compare-exchange needs pointers to the expected and desired values");
+		value = mkunaryexpr(TMUL, arg[1]);
+		first->next = arg[0];
+		arg[0]->next = value;
+		value->next = arg[3];
+		arg[3]->next = arg[4];
+		e = mkexpr(EXPRBUILTIN, &typebool, first);
+		e->u.builtin.kind = BUILTINC11CAS;
+		return e;
+	}
 }
 
 struct expr *
