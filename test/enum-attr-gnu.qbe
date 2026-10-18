@@ -1,0 +1,10 @@
+export
+function w $main() {
+@start.1
+@body.2
+	%.1 =w mul 1, 10
+	%.2 =w add 0, %.1
+	%.3 =w mul 7, 100
+	%.4 =w add %.2, %.3
+	ret %.4
+}

@@ -267,6 +267,7 @@ tagspec(struct scope *s)
 			name = tokenstr(tok.kind);
 			next();
 			attr(NULL, 0);
+			gnuattr(NULL, 0);
 			if (consume(TASSIGN)) {
 				e = eval(condexpr(s));
 				if (e->kind != EXPRCONST || !(e->type->prop & PROPINT))
