@@ -1130,6 +1130,10 @@ decl(struct scope *s, struct func *f)
 		gnuattr(&a, 0);  /* appertains to identifier */
 		kind = sc & SCTYPEDEF ? DECLTYPE : t->kind == TYPEFUNC ? DECLFUNC : DECLOBJECT;
 		prior = scopegetdecl(s, name, false);
+		/* a prototype of a builtin's name replaces the builtin, as GCC allows (libc++ and mrustc's generated C declare
+		 * the __atomic_* forms, which are builtins here) */
+		if (prior && prior->kind == DECLBUILTIN && kind == DECLFUNC)
+			prior = NULL;
 		if (prior && prior->kind != kind)
 			error(&tok.loc, "'%s' redeclared with different kind", name);
 		switch (kind) {
