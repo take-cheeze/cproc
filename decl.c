@@ -1130,6 +1130,10 @@ decl(struct scope *s, struct func *f)
 		gnuattr(&a, 0);  /* appertains to identifier */
 		kind = sc & SCTYPEDEF ? DECLTYPE : t->kind == TYPEFUNC ? DECLFUNC : DECLOBJECT;
 		prior = scopegetdecl(s, name, false);
+		/* a file-scope function may declare a name that is a builtin (as GCC allows for library-like builtins, such as
+		 * the generic __atomic_* forms): the declaration replaces the builtin, and calls go to the declared function */
+		if (prior && prior->kind == DECLBUILTIN && kind == DECLFUNC && s == &filescope)
+			prior = NULL;
 		if (prior && prior->kind != kind)
 			error(&tok.loc, "'%s' redeclared with different kind", name);
 		switch (kind) {
