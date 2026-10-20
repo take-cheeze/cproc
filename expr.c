@@ -1115,6 +1115,32 @@ atomicbuiltin(struct scope *s, enum builtinkind kind)
 
 static struct expr *genericatomic(struct scope *, enum builtinkind);
 
+/* __atomic_test_and_set(p, o) and __atomic_clear(p, o) (GCC): the byte at p is exchanged with 1, or stored with 0, with
+ * the order o, as the C11 forms on an unsigned char. test_and_set's result is whether the old byte was nonzero. */
+static struct expr *
+byteatomicbuiltin(struct scope *s, enum builtinkind kind)
+{
+	struct expr *first, *byte, *value, *order, *e;
+
+	first = assignexpr(s);
+	if (first->type->kind != TYPEPOINTER)
+		error(&tok.loc, "atomic operation needs a pointer");
+	expect(TCOMMA, "after the pointer of an atomic builtin");
+	order = assignexpr(s);
+	byte = exprconvert(first, mkpointertype(&typeuchar, QUALNONE));
+	value = mkconstexpr(&typeuchar, kind == BUILTINATOMICTESTANDSET);
+	byte->next = value;
+	value->next = order;
+	if (kind == BUILTINATOMICTESTANDSET) {
+		e = mkexpr(EXPRBUILTIN, &typeuchar, byte);
+		e->u.builtin.kind = BUILTINC11XCHG;
+		return exprconvert(mkbinaryexpr(&tok.loc, TNEQ, e, mkconstexpr(&typeuchar, 0)), &typebool);
+	}
+	e = mkexpr(EXPRBUILTIN, &typevoid, byte);
+	e->u.builtin.kind = BUILTINC11STORE;
+	return e;
+}
+
 static struct expr *
 builtinfunc(struct scope *s, enum builtinkind kind)
 {
@@ -1258,6 +1284,10 @@ builtinfunc(struct scope *s, enum builtinkind kind)
 	case BUILTINATOMICXCHG:
 	case BUILTINATOMICCAS:
 		e = genericatomic(s, kind);
+		break;
+	case BUILTINATOMICTESTANDSET:
+	case BUILTINATOMICCLEAR:
+		e = byteatomicbuiltin(s, kind);
 		break;
 	default:
 		fatal("internal error; unknown builtin");
