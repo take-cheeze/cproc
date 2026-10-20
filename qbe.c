@@ -104,8 +104,13 @@ struct func {
 	struct array asanopen;   /* -fsanitize=address: the blocks being compiled, outermost first (unsigned numbers; asanbegin) */
 	unsigned asanblocks;   /* -fsanitize=address: the blocks begun so far, for numbering them */
 	struct array asanjmps;   /* -fsanitize=address: the calls of setjmp (struct asanjmp), poisoned in asanfinish */
-	const char *ehcleanup;   /* the cleanup function of the object ehaddr (nfcxx's cleanup attribute, ehcleanupobj) */
-	struct value *ehaddr;
+	struct array ehobjs;     /* nfcxx's cleanup attribute: the objects (struct ehobj, in declaration order; ehcleanupobj) */
+};
+
+/* a block-scope object with a cleanup attribute: the cleanup function and the object's address */
+struct ehobj {
+	const char *cleanup;
+	struct value *addr;
 };
 
 /* a stack object with redzones: the base of its allocation (an entry block temporary) and the allocation's size */
@@ -1709,8 +1714,7 @@ mkfunc(struct decl *decl, char *name, struct type *t, struct scope *s)
 	f->type = t;
 	f->start = f->end = mkblock("start");
 	f->lastid = 0;
-	f->ehcleanup = NULL;
-	f->ehaddr = NULL;
+	f->ehobjs = (struct array){0};
 	f->asan = (struct array){0};
 	f->asanfile = NULL;
 	f->asanrets = (struct array){0};
@@ -2551,16 +2555,17 @@ zero(struct func *func, struct value *addr, int align, unsigned long long offset
 	}
 }
 
-/* GNU cleanup(f) on a block-scope object d (nfcxx's EH frame): when a throw unwinds the function, its landing pad (emitfunc)
-   calls f(&d) and resumes the unwind. nfcxx's cleanup functions do nothing at the normal end of the scope (they run only
-   during a throw), so the normal end is not lowered; one such object per function. */
+/* GNU cleanup(f) on a block-scope object d (nfcxx's EH frames): when a throw unwinds the function, its landing pad (emitfunc)
+   calls f(&d) for each such object, the last declared first, and resumes the unwind. nfcxx's cleanup functions do nothing
+   at the normal end of the scope (they run only during a throw), so the normal end is not lowered. */
 static void
 ehcleanupobj(struct func *f, struct decl *d)
 {
-	if (f->ehcleanup)
-		error(&tok.loc, "only one cleanup object per function is supported (nfcxx), '%s' is the second", d->name);
-	f->ehcleanup = d->u.obj.cleanup;
-	f->ehaddr = d->value;
+	struct ehobj *o;
+
+	o = arrayadd(&f->ehobjs, sizeof(*o));
+	o->cleanup = d->u.obj.cleanup;
+	o->addr = d->value;
 }
 
 void
@@ -2958,14 +2963,21 @@ emitfunc(struct func *f, bool global)
 			inst = emitinst(inst, instend);
 		emitjump(&b->jump);
 	}
-	if (f->ehcleanup) {
-		/* the landing pad: the object's cleanup, then the unwind resumes with the exception the system unwinder holds */
+	if (f->ehobjs.len) {
+		/* the landing pad: the cleanups of the objects (the last declared first), then the unwind resumes with the
+		 * exception the system unwinder holds */
+		struct ehobj *o;
+		size_t i = f->ehobjs.len / sizeof(*o);
+
 		puts("@eh.lp");
-		fputs("\tcall $", stdout);
-		fputs(f->ehcleanup, stdout);
-		fputs("(l ", stdout);
-		emitvalue(f->ehaddr);
-		puts(")");
+		while (i-- > 0) {
+			o = (struct ehobj *)f->ehobjs.val + i;
+			fputs("\tcall $", stdout);
+			fputs(o->cleanup, stdout);
+			fputs("(l ", stdout);
+			emitvalue(o->addr);
+			puts(")");
+		}
 		puts("\t%.ehe =l call $__nfcxx_eh_unwind_exc()");
 		puts("\tcall $_Unwind_Resume(l %.ehe)");
 		puts("\thlt");
