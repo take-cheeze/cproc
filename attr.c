@@ -30,6 +30,7 @@ parseattr(struct attr *a, enum attrkind allowed, enum attrprefix prefix)
 {
 	const char *name, *prefixname = "";
 	char namebuf[32], *section;
+	const char *cleanup;
 	enum attrkind kind;
 	int paren;
 
@@ -75,6 +76,13 @@ parseattr(struct attr *a, enum attrkind allowed, enum attrprefix prefix)
 			kind = ATTRDESTRUCTOR;
 		} else if (strcmp(name, "packed") == 0) {
 			kind = ATTRPACKED;
+		} else if (strcmp(name, "cleanup") == 0) {
+			kind = ATTRCLEANUP;
+			expect(TLPAREN, "after 'cleanup'");
+			cleanup = expect(TIDENT, "for cleanup function");
+			if (a)
+				a->cleanup = cleanup;
+			expect(TRPAREN, "after cleanup function");
 		} else if (strcmp(name, "section") == 0) {
 			kind = ATTRSECTION;
 			expect(TLPAREN, "after 'section'");

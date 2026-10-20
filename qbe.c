@@ -104,6 +104,8 @@ struct func {
 	struct array asanopen;   /* -fsanitize=address: the blocks being compiled, outermost first (unsigned numbers; asanbegin) */
 	unsigned asanblocks;   /* -fsanitize=address: the blocks begun so far, for numbering them */
 	struct array asanjmps;   /* -fsanitize=address: the calls of setjmp (struct asanjmp), poisoned in asanfinish */
+	const char *ehcleanup;   /* the cleanup function of the object ehaddr (nfcxx's cleanup attribute, ehcleanupobj) */
+	struct value *ehaddr;
 };
 
 /* a stack object with redzones: the base of its allocation (an entry block temporary) and the allocation's size */
@@ -1707,6 +1709,8 @@ mkfunc(struct decl *decl, char *name, struct type *t, struct scope *s)
 	f->type = t;
 	f->start = f->end = mkblock("start");
 	f->lastid = 0;
+	f->ehcleanup = NULL;
+	f->ehaddr = NULL;
 	f->asan = (struct array){0};
 	f->asanfile = NULL;
 	f->asanrets = (struct array){0};
@@ -2547,6 +2551,18 @@ zero(struct func *func, struct value *addr, int align, unsigned long long offset
 	}
 }
 
+/* GNU cleanup(f) on a block-scope object d (nfcxx's EH frame): when a throw unwinds the function, its landing pad (emitfunc)
+   calls f(&d) and resumes the unwind. nfcxx's cleanup functions do nothing at the normal end of the scope (they run only
+   during a throw), so the normal end is not lowered; one such object per function. */
+static void
+ehcleanupobj(struct func *f, struct decl *d)
+{
+	if (f->ehcleanup)
+		error(&tok.loc, "only one cleanup object per function is supported (nfcxx), '%s' is the second", d->name);
+	f->ehcleanup = d->u.obj.cleanup;
+	f->ehaddr = d->value;
+}
+
 void
 funcinit(struct func *func, struct decl *d, struct init *init, bool hasinit)
 {
@@ -2556,6 +2572,8 @@ funcinit(struct func *func, struct decl *d, struct init *init, bool hasinit)
 	size_t i, w;
 
 	funcalloc(func, d);
+	if (d->u.obj.cleanup)
+		ehcleanupobj(func, d);
 	if (!hasinit)
 		return;
 	for (; init; init = init->next) {
@@ -2939,6 +2957,18 @@ emitfunc(struct func *f, bool global)
 		for (inst = b->insts.val; inst != instend;)
 			inst = emitinst(inst, instend);
 		emitjump(&b->jump);
+	}
+	if (f->ehcleanup) {
+		/* the landing pad: the object's cleanup, then the unwind resumes with the exception the system unwinder holds */
+		puts("@eh.lp");
+		fputs("\tcall $", stdout);
+		fputs(f->ehcleanup, stdout);
+		fputs("(l ", stdout);
+		emitvalue(f->ehaddr);
+		puts(")");
+		puts("\t%.ehe =l call $__nfcxx_eh_unwind_exc()");
+		puts("\tcall $_Unwind_Resume(l %.ehe)");
+		puts("\thlt");
 	}
 	puts("}");
 }

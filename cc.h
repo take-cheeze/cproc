@@ -207,6 +207,8 @@ struct decl {
 			/* alignment of object storage (may be stricter than type requires) */
 			int align;
 			enum storageduration storage;
+			/* GNU cleanup(f) on a block-scope object: f(&object) runs when a throw unwinds its function (nfcxx, qbe.c) */
+			const char *cleanup;
 		} obj;
 		struct {
 			/* the function might have an "inline definition" (C11 6.7.4p7) */
@@ -429,12 +431,14 @@ enum attrkind {
 	ATTRDESTRUCTOR  = 1<<4,
 	ATTRPACKED      = 1<<5,
 	ATTRSECTION     = 1<<6,
+	ATTRCLEANUP     = 1<<7,
 };
 
 struct attr {
 	enum attrkind kind;
 	int align;
 	char *section;
+	const char *cleanup;
 };
 
 bool attr(struct attr *, enum attrkind);

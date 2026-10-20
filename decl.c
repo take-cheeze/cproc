@@ -589,6 +589,9 @@ stored in the `qual` field of the type itself (elsewhere this field
 is used for the qualifiers of the base type). This is corrected in
 declarator().
 */
+/* the cleanup attribute of the last declarator that has one (declaratortypes), for the object declaration that reads it */
+static const char *declcleanup;
+
 static void
 declaratortypes(struct scope *s, struct list *result, char **name, int *align, struct scope **funcscope, bool allowabstract)
 {
@@ -713,12 +716,14 @@ declaratortypes(struct scope *s, struct list *result, char **name, int *align, s
 		case T__ATTRIBUTE__:
 			if (allowedattr == -1)
 				error(&tok.loc, "attribute not allowed after parenthesized declarator");
-			gnuattr(&a, allowedattr);
+			gnuattr(&a, allowedattr | ATTRCLEANUP);
 		attr:
 			/* attribute applies to identifier if ptr->prev == result, otherwise type ptr->prev */
 			if (ptr->prev == result) {
 				if (a.kind & ATTRALIGNED && a.align > *align)
 					*align = a.align;
+				if (a.kind & ATTRCLEANUP)
+					declcleanup = a.cleanup;
 			}
 			break;
 		default:
@@ -1112,6 +1117,7 @@ decl(struct scope *s, struct func *f)
 		return true;
 	}
 	for (;;) {
+		declcleanup = NULL;
 		qt = declarator(s, base, &name, NULL, &funcscope, false);
 		t = qt.type;
 		tq = qt.qual;
@@ -1153,6 +1159,10 @@ decl(struct scope *s, struct func *f)
 			d = declcommon(s, kind, name, asmname, t, tq, sc, prior);
 			if (d->u.obj.align < align)
 				d->u.obj.align = align;
+			d->u.obj.cleanup = declcleanup;
+			declcleanup = NULL;
+			if (d->u.obj.cleanup && s == &filescope)
+				error(&tok.loc, "cleanup attribute on '%s', which is not a block-scope object", name);
 			if (d->linkage == LINKNONE && !(sc & SCSTATIC)) {
 				d->u.obj.storage = SDAUTO;
 			} else {
