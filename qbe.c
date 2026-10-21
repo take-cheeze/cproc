@@ -2823,7 +2823,9 @@ emitinst(struct inst **instp, struct inst **instend)
 		for (first = 1; instp != instend; ++instp) {
 			inst = *instp;
 			if (inst->kind == IVARARG) {
-				fputs(", ...", stdout);
+				/* no comma before the marker when no fixed argument precedes it */
+				fputs(first ? "..." : ", ...", stdout);
+				first = 0;
 				continue;
 			}
 			if (inst->kind != IARG)
