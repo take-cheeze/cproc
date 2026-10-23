@@ -590,6 +590,13 @@ eval(struct expr *expr)
 				binary(expr->u.binary.r, expr->op, l->u.binary.r, r);
 				expr->op = TADD;
 				expr->u.binary.l = l->u.binary.l;
+			} else if (expr->op == TSUB && l->kind == EXPRUNARY && l->op == TBAND && l->type->kind == TYPEPOINTER) {
+				/*
+				&x - C  ->  &x + (-C), so that a static initializer of an array decayed to a pointer (arr - 1) is an
+				address plus a constant, as &arr[0] - 1 already is. The constant wraps, as the pointer does.
+				*/
+				r->u.constant.u = -r->u.constant.u;
+				expr->op = TADD;
 			}
 			break;
 		case TLOR:
