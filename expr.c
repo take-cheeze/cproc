@@ -213,6 +213,13 @@ pointeecompatible(struct type *t, struct type *et)
 {
 	struct type a, b;
 
+	/*
+	char pointees that differ only in signedness (unsigned char * and const char *) are accepted, as gcc
+	accepts them with -Wpointer-sign, a warning in C that is on by default in gcc's C modes. The
+	qualifiers are checked by the caller.
+	*/
+	if (t->kind == TYPECHAR && et->kind == TYPECHAR)
+		return true;
 	if (t->kind != TYPEARRAY || et->kind != TYPEARRAY)
 		return typecompatible(t, et);
 	a = *t;

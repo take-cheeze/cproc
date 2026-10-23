@@ -1,0 +1,15 @@
+export
+function w $main() {
+@start.1
+	%.1 =l alloc4 2
+	%.3 =l alloc8 8
+@body.2
+	storeb 1, %.1
+	%.2 =l add %.1, 1
+	storeb 2, %.2
+	storel %.1, %.3
+	call extern $f(l %.1)
+	%.4 =l loadl %.3
+	%.5 =w call extern $g(l %.4)
+	ret %.5
+}
