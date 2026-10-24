@@ -8,6 +8,9 @@
 #include "util.h"
 #include "cc.h"
 
+/* the function whose body is being parsed, for GNU statement expressions (expr.c) */
+struct func *curfunc;
+
 static struct decl *tentativedefns, **tentativedefnsend = &tentativedefns;
 
 struct qualtype {
@@ -1213,7 +1216,9 @@ decl(struct scope *s, struct func *f)
 				assert(funcscope);
 				s = funcscope;
 				f = mkfunc(d, name, t, s);
+				curfunc = f;
 				stmt(f, s);
+				curfunc = NULL;
 				if (d->u.func.isnoreturn)
 					funchlt(f);
 				/* XXX: need to keep track of function in case a later declaration specifies extern */

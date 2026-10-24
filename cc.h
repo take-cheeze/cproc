@@ -257,11 +257,19 @@ enum exprkind {
 	EXPRBUILTIN,
 	EXPRTEMP,
 	EXPRSIZEOF,
+	/* GNU statement expression ({ ... }) */
+	EXPRSTMT,
 };
 
 struct stringlit {
 	size_t size;
 	void *data;
+};
+
+/* the blocks of a statement expression's body, emitted into a chain of their own (funcdetach) and linked into the function
+where the expression is evaluated (funcsplice) */
+struct stmtchain {
+	struct block *saved, *entry, *tail;
 };
 
 struct expr {
@@ -322,6 +330,11 @@ struct expr {
 			struct type *type;
 		} szof;
 		struct value *temp;
+		struct {
+			struct stmtchain chain;
+			struct value *value;
+			bool spliced;
+		} stmt;
 	} u;
 };
 
@@ -503,6 +516,9 @@ struct init *parseinit(struct scope *, struct type *);
 /* stmt */
 
 void stmt(struct func *, struct scope *);
+struct expr *stmtblock(struct func *, struct scope *);
+extern struct func *curfunc;
+struct expr *decay(struct expr *);
 
 /* backend */
 
@@ -534,6 +550,9 @@ struct func *mkfunc(struct decl *, char *, struct type *, struct scope *);
 void delfunc(struct func *);
 struct type *functype(struct func *);
 void funclabel(struct func *, struct block *);
+void funcdetach(struct func *, struct stmtchain *);
+void funcreattach(struct func *, struct stmtchain *);
+void funcsplice(struct func *, struct stmtchain *);
 struct value *funcbranch(struct func *, struct expr *, struct block *, struct block *);
 struct value *funcexpr(struct func *, struct expr *);
 void funcjmp(struct func *, struct block *);

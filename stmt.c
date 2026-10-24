@@ -62,6 +62,40 @@ labelstmt(struct func *f, struct scope *s)
 	stmt(f, s);
 }
 
+/*
+The items of a GNU statement expression's braces. Declarations and statements are emitted as in a compound statement; the
+last item, if it is an expression statement, is returned unevaluated: it gives the value of the statement expression.
+*/
+struct expr *
+stmtblock(struct func *f, struct scope *s)
+{
+	struct expr *last = NULL;
+
+	next();
+	s = mkscope(s);
+	while (tok.kind != TRBRACE) {
+		if (last) {
+			funcexpr(f, last);
+			delexpr(last);
+			last = NULL;
+		}
+		attr(NULL, 0);
+		if (label(f, s) || decl(s, f))
+			continue;
+		switch (tok.kind) {
+		case TLBRACE: case TSEMICOLON: case TIF: case TSWITCH: case TWHILE: case TDO: case TFOR:
+		case TGOTO: case TCONTINUE: case TBREAK: case TRETURN: case T__ASM__:
+			stmt(f, s);
+			continue;
+		}
+		last = expr(s);
+		expect(TSEMICOLON, "after expression statement");
+	}
+	s = delscope(s);
+	next();
+	return last;
+}
+
 /* 6.8 Statements and blocks */
 void
 stmt(struct func *f, struct scope *s)

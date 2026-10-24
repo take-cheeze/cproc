@@ -1,0 +1,119 @@
+export
+function w $early(w %.1) {
+@start.1
+	%.2 =l alloc4 4
+	storew %.1, %.2
+	%.3 =l alloc4 4
+	%.10 =l alloc4 4
+@body.2
+	jmp @stmtexpr.3
+@stmtexpr.3
+	%.4 =w loadw %.2
+	%.5 =w call extern $g(w %.4)
+	storew %.5, %.3
+	%.6 =w loadw %.3
+	%.7 =w csltw %.6, 0
+	jnz %.7, @if_true.4, @if_false.5
+@if_true.4
+	%.8 =w neg 1
+	ret %.8
+@if_false.5
+	%.9 =w loadw %.3
+	storew %.9, %.10
+	%.11 =w loadw %.10
+	%.12 =w add %.11, 1
+	ret %.12
+}
+export
+function w $cond(w %.1) {
+@start.6
+	%.2 =l alloc4 4
+	storew %.1, %.2
+	%.3 =l alloc4 4
+@body.7
+	%.7 =w loadw %.2
+	jnz %.7, @cond_true.9, @cond_false.10
+@cond_true.9
+	jmp @stmtexpr.8
+@stmtexpr.8
+	%.4 =w call extern $g(w 1)
+	storew %.4, %.3
+	%.5 =w loadw %.3
+	%.6 =w mul %.5, 2
+	jmp @cond_join.11
+@cond_false.10
+@cond_join.11
+	%.8 =w phi @stmtexpr.8 %.6, @cond_false.10 7
+	ret %.8
+}
+export
+function w $logic(w %.1) {
+@start.12
+	%.2 =l alloc4 4
+	storew %.1, %.2
+@body.13
+	%.4 =w loadw %.2
+	jnz %.4, @logic_and.18, @logic_false.16
+@logic_and.18
+	jmp @stmtexpr.14
+@stmtexpr.14
+	%.3 =w call extern $g(w 2)
+	jnz %.3, @logic_true.15, @logic_false.16
+@logic_true.15
+	jmp @logic_join.17
+@logic_false.16
+@logic_join.17
+	%.5 =w phi @logic_true.15 1, @logic_false.16 0
+	ret %.5
+}
+export
+function w $loop() {
+@start.19
+	%.1 =l alloc4 4
+@body.20
+	storew 0, %.1
+@while_cond.22
+	jmp @stmtexpr.21
+@stmtexpr.21
+	%.2 =w loadw %.1
+	%.3 =w add %.2, 1
+	storew %.3, %.1
+	%.4 =w loadw %.1
+	%.5 =w csltw %.4, 5
+	jnz %.5, @while_body.23, @while_join.24
+@while_body.23
+	jmp @while_cond.22
+@while_join.24
+	%.6 =w loadw %.1
+	ret %.6
+}
+export
+function w $nested() {
+@start.25
+	%.1 =l alloc4 4
+	%.2 =l alloc4 4
+@body.26
+	jmp @stmtexpr.27
+@stmtexpr.27
+	storew 3, %.1
+	jmp @stmtexpr.28
+@stmtexpr.28
+	%.3 =w loadw %.1
+	%.4 =w add %.3, 1
+	storew %.4, %.2
+	%.5 =w loadw %.2
+	%.6 =w mul %.5, 2
+	ret %.6
+}
+export
+function $voidexpr(l %.1) {
+@start.29
+	%.2 =l alloc8 8
+	storel %.1, %.2
+@body.30
+	jmp @stmtexpr.31
+@stmtexpr.31
+	%.3 =l loadl %.2
+	storew 1, %.3
+	ret
+}
