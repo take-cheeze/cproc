@@ -32,6 +32,7 @@ OP(ILOADUB,  "loadub")
 OP(IALLOC4,  "alloc4")
 OP(IALLOC8,  "alloc8")
 OP(IALLOC16, "alloc16")
+OP(IBLIT,    "blit")
 
 /* comparisons */
 OP(ICEQW,    "ceqw")

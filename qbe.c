@@ -55,7 +55,7 @@ struct qbetype {
 struct inst {
 	enum instkind kind;
 	int class;
-	struct value res, *arg[2];
+	struct value res, *arg[3];  /* arg[2]: the size of a blit */
 };
 
 struct jump {
@@ -277,6 +277,7 @@ mkinst(struct func *f, int op, int class, struct value *arg0, struct value *arg1
 	inst->class = class;
 	inst->arg[0] = arg0;
 	inst->arg[1] = arg1;
+	inst->arg[2] = NULL;
 	if (class && op != IARG)
 		functemp(f, &inst->res);
 	else
@@ -1611,6 +1612,21 @@ funccopy(struct func *f, struct value *dst, struct value *src, unsigned long lon
 	 * below always runs once and would write one byte past the zero-size destination */
 	if (size == 0)
 		return;
+	/* A larger copy is one blit, which QBE expands into word copies at fixed offsets (or a call to memmove).
+	 * The unit by unit copy below makes a chain of address temporaries, a pair per unit: a 2 KB array of bytes
+	 * was 4096 instructions, and their temporaries were spilled to the stack (16 KB of spill slots in one
+	 * function of mold 3 built through mrustc). Under -fsanitize=address the copy stays unit by unit, so that
+	 * each access is checked. */
+	if (size > 16 && !asanon && size <= 0x7fffffff) {
+		struct inst *inst;
+
+		inst = mkinst(f, IBLIT, 0, src, dst);
+		inst->arg[2] = mkintconst(size);
+		if (f->end->jump.kind)
+			funclabel(f, mkblock("dead"));
+		arrayaddptr(&f->end->insts, inst);
+		return;
+	}
 	class = 'w';
 	switch (align) {
 	case 1: load = ILOADUB, store = ISTOREB; break;
@@ -2873,6 +2889,10 @@ emitinst(struct inst **instp, struct inst **instend)
 		if (inst->arg[1]) {
 			fputs(", ", stdout);
 			emitvalue(inst->arg[1]);
+		}
+		if (inst->arg[2]) {
+			fputs(", ", stdout);
+			emitvalue(inst->arg[2]);
 		}
 	}
 	putchar('\n');
