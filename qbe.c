@@ -2728,7 +2728,8 @@ emittype(struct type *t)
 	static bool softemitted, ldemitted;
 	struct member *m, *other;
 	struct type *sub;
-	unsigned long long off;
+	unsigned long long off, qoff;
+	int natalign;
 
 	if (t->kind == TYPELDOUBLE) {
 		/* long double: class X87 in the SysV ABI, so an argument is in memory (a dark type of 16 bytes), and a result is
@@ -2766,7 +2767,21 @@ emittype(struct type *t)
 		printf(" = align %d { %llu }\n", t->align, t->size);
 		return;
 	}
-	fputs(" = { ", stdout);
+	/* QBE places each member at its natural alignment, and aligns and sizes the aggregate by its members. A C
+	 * alignment above that (_Alignas, __attribute__((aligned(N))), Rust's repr(align)) is given to QBE explicitly:
+	 * byte padding before a member whose C offset is further on, `align` on the type, and padding at its end. */
+	natalign = 1;
+	for (m = t->u.structunion.members; m; m = m->next) {
+		for (sub = m->type; sub->kind == TYPEARRAY; sub = sub->base)
+			;
+		if (sub->align > natalign)
+			natalign = sub->align;
+	}
+	fputs(" = ", stdout);
+	if (t->align > natalign)
+		printf("align %d ", t->align);
+	fputs("{ ", stdout);
+	qoff = 0;
 	for (m = t->u.structunion.members, off = 0; m;) {
 		if (t->kind == TYPESTRUCT) {
 			/* look for a subsequent member with a larger storage unit */
@@ -2782,6 +2797,14 @@ emittype(struct type *t)
 		}
 		for (sub = m->type; sub->kind == TYPEARRAY; sub = sub->base)
 			;
+		if (t->kind == TYPESTRUCT) {
+			qoff = ALIGNUP(qoff, sub->align);
+			if (m->offset > qoff) {
+				printf("b %llu, ", m->offset - qoff);
+				qoff = m->offset;
+			}
+			qoff += m->type->size;
+		}
 		emitclass(qbetype(sub).data, sub->value);
 		if (m->type->size > sub->size)
 			printf(" %llu", m->type->size / sub->size);
@@ -2794,6 +2817,12 @@ emittype(struct type *t)
 			fputs(" } ", stdout);
 			m = m->next;
 		}
+	}
+	/* the C size can be larger than QBE's rounding of the members (a trailing _Alignas member, a union of an
+	 * over-aligned type): pad to it */
+	if (t->kind == TYPESTRUCT) {
+		if (t->size > ALIGNUP(qoff, t->align > natalign ? t->align : natalign))
+			printf("b %llu, ", t->size - qoff);
 	}
 	puts("}");
 }

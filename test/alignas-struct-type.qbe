@@ -1,0 +1,21 @@
+type :s1.1 = align 128 { l, }
+export
+function :s1.1 $f1(:s1.1 %.1) {
+@start.1
+@body.2
+	ret %.1
+}
+type :s2.2 = align 64 { b, b 28, w, b 28, b, }
+export
+function :s2.2 $f2(:s2.2 %.1) {
+@start.3
+@body.4
+	ret %.1
+}
+type :s3.3 = { :s1.1, l, }
+export
+function :s3.3 $f3(:s3.3 %.1) {
+@start.5
+@body.6
+	ret %.1
+}
