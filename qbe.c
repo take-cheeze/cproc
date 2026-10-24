@@ -4028,8 +4028,14 @@ emitsymattr(struct decl *d)
 {
 	bool undef;
 
-	if (!asmout)
-		error(&tok.loc, "the weak and visibility attributes need the inline-asm side file (x86_64 ELF, -a)");
+	/* without the side file (Mach-O, the CIL backend) the attributes stay without effect, as before cproc took them:
+	 * nfcxx's weak-symbols.rb marks EDG's COMDAT functions weak in the assembly there. Under -p (the Linux kernel,
+	 * x86-64 ELF) they would be lost, so that is refused. */
+	if (!asmout) {
+		if (prune)
+			error(&tok.loc, "the weak and visibility attributes need the inline-asm side file (x86_64 ELF, -a)");
+		return;
+	}
 	if (!d->value)
 		return;
 	undef = !d->defined && !d->tentative && !d->alias;
