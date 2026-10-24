@@ -2686,6 +2686,397 @@ funcswitch(struct func *f, struct value *v, struct switchcases *c, struct block 
 	casesearch(f, qbetype(c->type).base, v, c->root, defaultlabel, 0, -1);
 }
 
+/*
+GNU extended inline assembly, lowered the way Cranelift's rustc backend lowers asm!: each statement becomes an
+out-of-line function (a "thunk") written as assembly to a side file (main's -a), and the call site passes a pointer to a
+stack slot that carries the operand values. The thunk owns register allocation -- it loads inputs from the slot into the
+registers the constraints ask for, runs the user's template, and stores outputs back -- so the QBE IL never has to model
+inline asm. x86_64 only, a deliberately small constraint subset; everything else is refused rather than miscompiled.
+*/
+FILE *asmout;
+static unsigned asmthunkid;
+
+/* x86_64 general registers, by size: [reg][0]=8, [1]=4, [2]=2, [3]=1 byte */
+enum { RAX, RCX, RDX, RBX, RSI, RDI, RBP, RSP, R8, R9, R10, R11, R12, R13, R14, R15 };
+static const char *const regname[16][4] = {
+	{"rax","eax","ax","al"},   {"rcx","ecx","cx","cl"},   {"rdx","edx","dx","dl"},
+	{"rbx","ebx","bx","bl"},   {"rsi","esi","si","sil"},  {"rdi","edi","di","dil"},
+	{"rbp","ebp","bp","bpl"},  {"rsp","esp","sp","spl"},
+	{"r8","r8d","r8w","r8b"},   {"r9","r9d","r9w","r9b"},   {"r10","r10d","r10w","r10b"},
+	{"r11","r11d","r11w","r11b"},{"r12","r12d","r12w","r12b"},{"r13","r13d","r13w","r13b"},
+	{"r14","r14d","r14w","r14b"},{"r15","r15d","r15w","r15b"},
+};
+/* caller-saved GP registers offered to a plain "r" operand (rdi is used only transiently for the slot pointer) */
+static const int rpool[] = {RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11};
+static int
+regsizecol(int sz)
+{
+	return sz == 8 ? 0 : sz == 4 ? 1 : sz == 2 ? 2 : 3;
+}
+
+/* the register a fixed-register constraint letter names, or -1 */
+static int
+fixedreg(int c)
+{
+	switch (c) {
+	case 'a': return RAX;
+	case 'b': return RBX;
+	case 'c': return RCX;
+	case 'd': return RDX;
+	case 'S': return RSI;
+	case 'D': return RDI;
+	}
+	return -1;
+}
+
+/* map a clobber name ("rax", "eax", ...) to a register index, or -1 */
+static int
+clobberreg(const char *name)
+{
+	int r, s;
+
+	if (*name == '%')
+		++name;
+	for (r = 0; r < 16; ++r)
+		for (s = 0; s < 4; ++s)
+			if (strcmp(name, regname[r][s]) == 0)
+				return r;
+	return -1;
+}
+
+struct asmrec {
+	int reg;      /* register index, or -1 for an immediate */
+	int size;     /* operand size in bytes (1,2,4,8) */
+	long slot;    /* byte offset of this operand's slot, or -1 (immediate, or tied: shares another's) */
+	bool feed;    /* the thunk loads this operand from its slot on entry */
+	bool prestore;/* the caller stores a value into this operand's slot before the call ("+" outputs and inputs) */
+	bool back;    /* the thunk stores this operand to its slot on exit, and the caller reads it back */
+	long imm;     /* immediate value, when reg == -1 */
+	struct expr *expr;
+	struct lvalue lval;   /* an output's destination (outputs only) */
+	char *symname;
+};
+
+/* operand size from a type: scalars up to 8 bytes; anything else is refused */
+static int
+asmopsize(struct type *t)
+{
+	if (!(t->prop & PROPSCALAR) || t->size == 0 || t->size > 8)
+		error(&tok.loc, "unsupported type for an asm operand");
+	return t->size;
+}
+
+/* strip and record the leading constraint modifiers (= + & %); return the remaining class/tie body */
+static const char *
+asmconstraintbody(const char *c, bool *isout, bool *inout)
+{
+	*isout = *inout = false;
+	for (;; ++c) {
+		switch (*c) {
+		case '=': *isout = true; continue;
+		case '+': *isout = *inout = true; continue;
+		case '&': case '%': continue;   /* early-clobber and commutativity: always satisfied by the thunk */
+		}
+		break;
+	}
+	return c;
+}
+
+/* substitute one operand reference into the thunk, given its already-parsed modifier and index */
+static void
+asmsubst(struct asmrec *rec, unsigned total, int mod, unsigned idx)
+{
+	struct asmrec *r;
+
+	if (idx >= total)
+		error(&tok.loc, "asm operand index out of range");
+	r = &rec[idx];
+	if (r->reg < 0) {   /* immediate */
+		switch (mod) {
+		case 'c': fprintf(asmout, "%ld", r->imm); break;
+		case 'n': fprintf(asmout, "$%ld", -r->imm); break;
+		default:  fprintf(asmout, "$%ld", r->imm); break;
+		}
+		return;
+	}
+	switch (mod) {
+	case 'b': fprintf(asmout, "%%%s", regname[r->reg][3]); break;
+	case 'w': fprintf(asmout, "%%%s", regname[r->reg][2]); break;
+	case 'k': fprintf(asmout, "%%%s", regname[r->reg][1]); break;
+	case 'q': fprintf(asmout, "%%%s", regname[r->reg][0]); break;
+	case 0:   fprintf(asmout, "%%%s", regname[r->reg][regsizecol(r->size)]); break;
+	default:  error(&tok.loc, "unsupported asm operand modifier '%%%c'", mod);
+	}
+}
+
+/* write the thunk body: template with %N / %[name] / %%/%= expanded */
+static void
+asmtemplate(const char *t, struct asmrec *rec, unsigned total, char **names, unsigned expid)
+{
+	const char *p;
+	unsigned i;
+	int mod;
+
+	for (p = t; *p; ++p) {
+		if (*p != '%') {
+			fputc(*p, asmout);
+			continue;
+		}
+		++p;
+		if (*p == '%') { fputc('%', asmout); continue; }
+		if (*p == '=') { fprintf(asmout, "%u", expid); continue; }
+		if (*p == '{' || *p == '}' || *p == '|')
+			error(&tok.loc, "asm dialect alternatives ('%%{') are not supported");
+		mod = 0;
+		if (*p && !isdigit((unsigned char)*p) && *p != '[') {
+			mod = *p;
+			++p;
+		}
+		if (*p == '[') {   /* %[name] symbolic reference */
+			char buf[64];
+			unsigned n = 0;
+			++p;
+			while (*p && *p != ']' && n < sizeof buf - 1)
+				buf[n++] = *p++;
+			buf[n] = 0;
+			if (*p != ']')
+				error(&tok.loc, "unterminated asm operand name");
+			for (i = 0; i < total; ++i)
+				if (names[i] && strcmp(names[i], buf) == 0)
+					break;
+			if (i == total)
+				error(&tok.loc, "unknown asm operand '%%[%s]'", buf);
+			asmsubst(rec, total, mod, i);
+			continue;
+		}
+		if (!isdigit((unsigned char)*p))
+			error(&tok.loc, "bad asm operand reference");
+		i = 0;
+		while (isdigit((unsigned char)*p))
+			i = i * 10 + (*p++ - '0');
+		--p;
+		asmsubst(rec, total, mod, i);
+	}
+}
+
+void
+funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, struct asmoperand *in, unsigned nin, char **clob, unsigned nclob, bool isvolatile)
+{
+	struct asmrec rec[32];
+	char *names[32];
+	bool used[16] = {0}, save[16] = {0};
+	unsigned total = nout + nin, i, j, pool = 0, expid;
+	long slotsize = 0;
+	int holder = -1, nsave, pad;
+	struct value *base, *addr, *v, *fn;
+	struct type *t;
+
+	(void)isvolatile;   /* every lowered asm is a call, which QBE never reorders or removes */
+	if (strcmp(targ->name, "x86_64-sysv") != 0)
+		error(&tok.loc, "inline assembly is only supported on x86_64");
+	if (!asmout)
+		error(&tok.loc, "inline assembly is not available in this compilation mode");
+	if (total > 32)
+		error(&tok.loc, "too many asm operands");
+
+	/* first mark the registers the fixed-register and clobber constraints pin down */
+	for (i = 0; i < total; ++i) {
+		struct asmoperand *op = i < nout ? &out[i] : &in[i - nout];
+		bool isout, inout;
+		int fr = fixedreg((unsigned char)*asmconstraintbody(op->constraint, &isout, &inout));
+		if (fr >= 0)
+			used[fr] = true;
+	}
+	for (i = 0; i < nclob; ++i) {
+		int r;
+		if (strcmp(clob[i], "memory") == 0 || strcmp(clob[i], "cc") == 0)
+			continue;
+		r = clobberreg(clob[i]);
+		if (r < 0)
+			error(&tok.loc, "unknown asm clobber '%s'", clob[i]);
+		if (r == RSP || r == RBP)
+			error(&tok.loc, "asm may not clobber the stack or frame pointer");
+		used[r] = true;
+		save[r] = true;   /* a callee-saved clobber is preserved by the thunk (harmless on caller-saved; filtered below) */
+	}
+
+	/* parse every operand: assign registers, lay out the slot, classify direction */
+	for (i = 0; i < total; ++i) {
+		struct asmoperand *op = i < nout ? &out[i] : &in[i - nout];
+		bool isout, inout, isin = i >= nout;
+		const char *body = asmconstraintbody(op->constraint, &isout, &inout);
+		int fr;
+
+		names[i] = op->symname;
+		rec[i].expr = op->expr;
+		rec[i].reg = -1;
+		rec[i].slot = -1;
+		rec[i].feed = rec[i].prestore = rec[i].back = false;
+		rec[i].imm = 0;
+		if (i < nout) {
+			if (!isout)
+				error(&tok.loc, "asm output operand lacks '=' or '+'");
+			rec[i].feed = rec[i].prestore = inout;   /* "+": the current value is fed in */
+			rec[i].back = true;
+		} else if (isout) {
+			error(&tok.loc, "asm input operand has an output constraint");
+		}
+
+		if (isdigit((unsigned char)*body)) {   /* a tied operand: shares a matching output */
+			unsigned m = 0;
+			while (isdigit((unsigned char)*body))
+				m = m * 10 + (*body++ - '0');
+			if (i < nout || m >= nout)
+				error(&tok.loc, "bad matching asm constraint");
+			rec[i].reg = rec[m].reg;
+			rec[i].size = asmopsize(op->expr->type);
+			rec[m].feed = true;   /* the thunk loads the tied value the input writes into the output's slot */
+			continue;
+		}
+		if (*body == 'i' || *body == 'n' || *body == 'N') {   /* immediate */
+			struct expr *e;
+			if (i < nout)
+				error(&tok.loc, "immediate constraint on an asm output");
+			e = eval(op->expr);
+			if (e->kind != EXPRCONST || e->type->prop & PROPFLOAT)
+				error(&tok.loc, "asm immediate operand is not an integer constant");
+			rec[i].imm = e->u.constant.i;
+			rec[i].size = 8;
+			continue;   /* no register, no slot */
+		}
+		if (*body == 'm' || *body == 'o' || *body == 'V' || *body == 'g')
+			error(&tok.loc, "asm memory operands are not yet supported");
+		fr = fixedreg((unsigned char)*body);
+		if (fr >= 0) {
+			rec[i].reg = fr;
+		} else if (*body == 'r' || *body == 'q') {
+			while (pool < countof(rpool) && used[rpool[pool]])
+				++pool;
+			if (pool == countof(rpool))
+				error(&tok.loc, "too many register asm operands");
+			rec[i].reg = rpool[pool++];
+			used[rec[i].reg] = true;
+		} else {
+			error(&tok.loc, "unsupported asm constraint '%s'", op->constraint);
+		}
+		if (body[1] && !isdigit((unsigned char)body[1]))
+			error(&tok.loc, "multiple-alternative asm constraints are not supported");
+		rec[i].size = asmopsize(op->expr->type);
+		rec[i].slot = slotsize;
+		slotsize += 8;
+		if (isin)
+			rec[i].feed = rec[i].prestore = true;
+	}
+
+	/* choose a callee-saved register to hold the slot pointer; preserve it and any clobbered callee-saved register */
+	for (j = 0; j < 5; ++j) {
+		static const int cand[] = {RBX, R12, R13, R14, R15};
+		if (!used[cand[j]]) { holder = cand[j]; break; }
+	}
+	if (holder < 0)
+		error(&tok.loc, "asm uses too many registers");
+	save[RBX] = save[R12] = save[R13] = save[R14] = save[R15] = save[RBP] = save[holder];
+	/* recompute: only callee-saved registers that are clobbered (or a callee-saved fixed operand) need saving */
+	for (i = 0; i < 16; ++i)
+		save[i] = false;
+	for (i = 0; i < nclob; ++i) {
+		int r = (strcmp(clob[i], "memory") && strcmp(clob[i], "cc")) ? clobberreg(clob[i]) : -1;
+		if (r >= 0 && (r == RBX || r == R12 || r == R13 || r == R14 || r == R15))
+			save[r] = true;
+	}
+	for (i = 0; i < total; ++i)   /* a fixed callee-saved operand register (only "b"=rbx) is written, so preserve it */
+		if (rec[i].reg == RBX)
+			save[RBX] = true;
+	save[holder] = false;   /* the holder is pushed and popped separately */
+
+	expid = asmthunkid++;
+	fn = xmalloc(sizeof *fn);
+	fn->kind = VALUE_GLOBAL;
+	fn->u.name = xmalloc(32);
+	snprintf(fn->u.name, 32, "nfcxx_asm_thunk.%u", expid);
+	fn->id = 0;
+
+	/* ---- call site: build the slot, feed inputs, call, read outputs back ---- */
+	base = NULL;
+	if (slotsize) {
+		struct block *end = f->end;
+		f->end = f->start;
+		base = funcinst(f, IALLOC8, ptrclass, mkintconst(slotsize), NULL);
+		f->end = end;
+	}
+	for (i = 0; i < nout; ++i)   /* evaluate output destinations now; "+" feeds its current value in */
+		rec[i].lval = funclval(f, rec[i].expr);
+	for (i = 0; i < nout; ++i) {
+		if (!rec[i].prestore)
+			continue;
+		t = rec[i].expr->type;
+		addr = rec[i].slot ? funcinst(f, IADD, ptrclass, base, mkintconst(rec[i].slot)) : base;
+		v = funcload(f, t, rec[i].lval);
+		funcstore(f, t, 0, (struct lvalue){.addr = addr}, v);
+	}
+	for (i = nout; i < total; ++i) {
+		long slot;
+		bool o, io;
+		const char *b;
+		if (rec[i].reg < 0)
+			continue;   /* immediate: substituted into the thunk, no slot */
+		if (rec[i].slot >= 0) {
+			slot = rec[i].slot;   /* a plain register input */
+		} else {   /* a tied input: store into the matching output's slot */
+			unsigned m = 0;
+			b = asmconstraintbody(in[i - nout].constraint, &o, &io);
+			while (isdigit((unsigned char)*b))
+				m = m * 10 + (*b++ - '0');
+			slot = rec[m].slot;
+		}
+		t = rec[i].expr->type;
+		v = funcexpr(f, rec[i].expr);
+		addr = slot ? funcinst(f, IADD, ptrclass, base, mkintconst(slot)) : base;
+		funcstore(f, t, 0, (struct lvalue){.addr = addr}, v);
+	}
+	funcinst(f, ICALL, 0, fn, NULL);
+	funcinst(f, IARG, ptrclass, slotsize ? base : mkintconst(0), NULL);
+	for (i = 0; i < nout; ++i) {
+		t = rec[i].expr->type;
+		addr = rec[i].slot ? funcinst(f, IADD, ptrclass, base, mkintconst(rec[i].slot)) : base;
+		v = funcload(f, t, (struct lvalue){.addr = addr});
+		funcstore(f, t, 0, rec[i].lval, v);
+	}
+
+	/* ---- thunk: load inputs, run the template, store outputs ---- */
+	nsave = 0;
+	for (i = 0; i < 16; ++i)
+		nsave += save[i];
+	pad = (1 + nsave) % 2 ? 8 : 0;   /* keep %rsp 16-aligned for any call inside the template */
+	fprintf(asmout, "\t.text\n\t.p2align 4\nnfcxx_asm_thunk.%u:\n", expid);
+	fprintf(asmout, "\tpushq %%%s\n", regname[holder][0]);
+	for (i = 0; i < 16; ++i)
+		if (save[i])
+			fprintf(asmout, "\tpushq %%%s\n", regname[i][0]);
+	if (pad)
+		fprintf(asmout, "\tsubq $8, %%rsp\n");
+	fprintf(asmout, "\tmovq %%rdi, %%%s\n", regname[holder][0]);
+	for (i = 0; i < total; ++i)   /* load fed operands from the slot */
+		if (rec[i].slot >= 0 && rec[i].feed) {
+			int col = regsizecol(rec[i].size);
+			fprintf(asmout, "\tmov%c %ld(%%%s), %%%s\n", "qlwb"[col], rec[i].slot, regname[holder][0], regname[rec[i].reg][col]);
+		}
+	fputs("\t", asmout);
+	asmtemplate(template, rec, total, names, expid);
+	fputc('\n', asmout);
+	for (i = 0; i < total; ++i)   /* store written-back operands to the slot */
+		if (rec[i].slot >= 0 && rec[i].back) {
+			int col = regsizecol(rec[i].size);
+			fprintf(asmout, "\tmov%c %%%s, %ld(%%%s)\n", "qlwb"[col], regname[rec[i].reg][col], rec[i].slot, regname[holder][0]);
+		}
+	if (pad)
+		fprintf(asmout, "\taddq $8, %%rsp\n");
+	for (i = 16; i-- > 0;)
+		if (save[i])
+			fprintf(asmout, "\tpopq %%%s\n", regname[i][0]);
+	fprintf(asmout, "\tpopq %%%s\n\tret\n", regname[holder][0]);
+}
+
 /* emit */
 
 static void

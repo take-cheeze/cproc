@@ -18,7 +18,7 @@ int
 main(int argc, char *argv[])
 {
 	bool pponly = false;
-	char *output = NULL, *target = NULL;
+	char *output = NULL, *target = NULL, *asmfile = NULL;
 
 	argv0 = progname(argv[0], "cproc-qbe");
 	asanon = getenv("NFCXX_ASAN") != NULL;
@@ -29,6 +29,15 @@ main(int argc, char *argv[])
 	case 't':
 		target = EARGF(usage());
 		break;
+	case 'a':
+		asmfile = EARGF(usage());
+		break;
+	case 'c':
+		stdc23 = true;   /* treat true/false/nullptr/bool as C23 keywords, not identifiers (the default) */
+		break;
+	case 'K':
+		stdc23 = false;  /* before C23: true/false/nullptr/bool are identifiers (the Linux kernel's gnu11) */
+		break;
 	case 'o':
 		output = EARGF(usage());
 		break;
@@ -37,6 +46,9 @@ main(int argc, char *argv[])
 	} ARGEND
 
 	targinit(target);
+
+	if (asmfile && !(asmout = fopen(asmfile, "w")))
+		fatal("open %s:", asmfile);
 
 	if (output && !freopen(output, "w", stdout))
 		fatal("open %s:", output);
@@ -74,5 +86,10 @@ main(int argc, char *argv[])
 	fflush(stdout);
 	if (ferror(stdout))
 		fatal("write failed");
+	if (asmout) {
+		fflush(asmout);
+		if (ferror(asmout))
+			fatal("write failed");
+	}
 	return 0;
 }

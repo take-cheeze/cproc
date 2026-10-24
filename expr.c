@@ -831,11 +831,15 @@ primaryexpr(struct scope *s)
 		break;
 	case TTRUE:
 	case TFALSE:
+		if (!stdc23)
+			goto identref;   /* before C23, true/false are ordinary identifiers (macros or enum constants) */
 		e = mkexpr(EXPRCONST, &typebool, NULL);
 		e->u.constant.u = tok.kind == TTRUE;
 		next();
 		break;
 	case TNULLPTR:
+		if (!stdc23)
+			goto identref;
 		e = mkexpr(EXPRCONST, &typenullptr, NULL);
 		e->u.constant.u = 0;
 		next();
@@ -849,7 +853,8 @@ primaryexpr(struct scope *s)
 		e = generic(s);
 		break;
 	default:
-		if (tok.kind >= TIDENT) {
+	identref:
+		if (iscident(tok.kind)) {
 			d = scopegetdecl(s, tokenstr(tok.kind), 1);
 			if (!d)
 				error(&tok.loc, "undeclared identifier: %s", tokenstr(tok.kind));
@@ -1398,7 +1403,7 @@ postfixexpr(struct scope *s, struct expr *r)
 			if (t->kind != TYPESTRUCT && t->kind != TYPEUNION)
 				error(&tok.loc, "'%s' operator must be applied to pointer to struct/union", tokenstr(op));
 			next();
-			if (tok.kind < TIDENT)
+			if (!iscident(tok.kind))
 				error(&tok.loc, "expected identifier after '%s' operator", tokenstr(op));
 			lvalue = op == TARROW || r->base->lvalue;
 			offset = 0;

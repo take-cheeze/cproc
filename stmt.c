@@ -6,6 +6,22 @@
 #include "util.h"
 #include "cc.h"
 
+/* An asm section separator. The scanner lexes adjacent colons (as in "":::"memory") as a single TCOLONCOLON, so a
+ * '::' is consumed as one colon here and left as a TCOLON for the next call. Returns false when no separator is next. */
+static bool
+asmsep(void)
+{
+	if (tok.kind == TCOLONCOLON) {
+		tok.kind = TCOLON;
+		return true;
+	}
+	if (tok.kind == TCOLON) {
+		next();
+		return true;
+	}
+	return false;
+}
+
 /* 6.8.1 Labeled statements */
 static bool
 label(struct func *f, struct scope *s)
@@ -40,7 +56,7 @@ label(struct func *f, struct scope *s)
 		asancase(f, s->switchcases);
 		break;
 	default:
-		if (tok.kind < TIDENT)
+		if (!iscident(tok.kind))
 			return false;
 		name = tokenstr(tok.kind);
 		if (!peek(TCOLON))
@@ -353,7 +369,70 @@ stmt(struct func *f, struct scope *s)
 		expect(TSEMICOLON, "after 'return' statement");
 		break;
 
-	case T__ASM__:
-		error(&tok.loc, "inline assembly is not yet supported");
+	case T__ASM__: {
+		/* GNU extended asm: __asm__ [volatile] ( template [: outputs [: inputs [: clobbers]]] ) ; */
+		struct asmoperand out[16], in[16];
+		char *clob[16], *template;
+		unsigned nout = 0, nin = 0, nclob = 0;
+		bool isvol = false;
+		struct stringlit lit;
+
+		next();
+		while (tok.kind == TVOLATILE || tok.kind == TINLINE) {
+			if (tok.kind == TVOLATILE)
+				isvol = true;
+			next();
+		}
+		if (tok.kind == TGOTO)
+			error(&tok.loc, "'asm goto' is not yet supported");
+		expect(TLPAREN, "after 'asm'");
+		tokencheck(&tok, TSTRINGLIT, "for asm template");
+		stringconcat(&lit, true);
+		template = lit.data;
+		/* outputs, then inputs: each is [ [symbol] ] "constraint" ( operand ) */
+		for (unsigned sect = 0; sect < 2 && asmsep(); ++sect) {
+			struct asmoperand *ops = sect == 0 ? out : in;
+			unsigned *n = sect == 0 ? &nout : &nin;
+			while (tok.kind == TLBRACK || tok.kind == TSTRINGLIT) {
+				char *sym = NULL;
+				if (consume(TLBRACK)) {
+					sym = expect(TIDENT, "for asm operand name");
+					expect(TRBRACK, "after asm operand name");
+				}
+				tokencheck(&tok, TSTRINGLIT, "for asm operand constraint");
+				stringconcat(&lit, true);
+				if (*n == 16)
+					error(&tok.loc, "too many asm operands");
+				ops[*n].constraint = lit.data;
+				ops[*n].symname = sym;
+				expect(TLPAREN, "before asm operand");
+				ops[*n].expr = assignexpr(s);
+				expect(TRPAREN, "after asm operand");
+				++*n;
+				if (!consume(TCOMMA))
+					break;
+			}
+		}
+		/* clobbers */
+		if (asmsep()) {
+			while (tok.kind == TSTRINGLIT) {
+				stringconcat(&lit, true);
+				if (nclob == 16)
+					error(&tok.loc, "too many asm clobbers");
+				clob[nclob++] = lit.data;
+				if (!consume(TCOMMA))
+					break;
+			}
+		}
+		if (tok.kind == TCOLON || tok.kind == TCOLONCOLON)
+			error(&tok.loc, "'asm goto' is not yet supported");
+		expect(TRPAREN, "after asm");
+		expect(TSEMICOLON, "after asm statement");
+		if (f)
+			funcasm(f, template, out, nout, in, nin, clob, nclob, isvol);
+		else
+			error(&tok.loc, "file-scope asm is not yet supported");
+		break;
+	}
 	}
 }

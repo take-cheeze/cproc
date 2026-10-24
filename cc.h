@@ -351,6 +351,8 @@ extern struct token tok;
 
 void tokeninit(void);
 int tokenget(const void *, size_t);
+int iscident(enum tokenkind);
+extern bool stdc23;
 void tokenprint(const struct token *, FILE *);
 char *tokenstr(enum tokenkind);
 char *tokencheck(const struct token *, enum tokenkind, const char *);
@@ -520,6 +522,13 @@ struct expr *stmtblock(struct func *, struct scope *);
 extern struct func *curfunc;
 struct expr *decay(struct expr *);
 
+/* GNU extended inline assembly (nfcxx: lowered to an out-of-line thunk, see funcasm in the backend) */
+struct asmoperand {
+	char *constraint;   /* the constraint string, e.g. "=r", "r", "0", "i" */
+	char *symname;      /* the [name] of a symbolic operand reference, or null */
+	struct expr *expr;  /* an output's lvalue, or an input's value */
+};
+
 /* backend */
 
 struct gotolabel {
@@ -565,6 +574,8 @@ void asanlabel(struct func *, struct gotolabel *);
 void asanswitch(struct func *, struct switchcases *);
 void asancase(struct func *, struct switchcases *);
 void funcswitch(struct func *, struct value *, struct switchcases *, struct block *);
+void funcasm(struct func *, char *template, struct asmoperand *out, unsigned nout, struct asmoperand *in, unsigned nin, char **clob, unsigned nclob, bool isvolatile);
+extern FILE *asmout;   /* the side file for inline-asm thunks (-a); null means inline asm is unavailable */
 void funcinit(struct func *, struct decl *, struct init *, bool);
 
 void emitfunc(struct func *, bool);

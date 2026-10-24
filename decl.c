@@ -190,7 +190,7 @@ tagspec(struct scope *s)
 	tag = 0;
 	t = NULL;
 	et = NULL;
-	if (tok.kind >= TIDENT) {
+	if (iscident(tok.kind)) {
 		tag = tokenstr(tok.kind);
 		next();
 	}
@@ -266,7 +266,7 @@ tagspec(struct scope *s)
 		}
 		max = 0;
 		min = 0;
-		for (value = 0; tok.kind >= TIDENT; ++value) {
+		for (value = 0; iscident(tok.kind); ++value) {
 			name = tokenstr(tok.kind);
 			next();
 			attr(NULL, 0);
@@ -495,7 +495,7 @@ declspecs(struct scope *s, enum storageclass *sc, enum funcspec *fs, int *align)
 			break;
 
 		default:
-			if (op < TIDENT || t || ts)
+			if (!iscident(op) || t || ts)
 				goto done;
 			d = scopegetdecl(s, tokenstr(tok.kind), 1);
 			if (!d || d->kind != DECLTYPE)
@@ -617,6 +617,12 @@ declaratortypes(struct scope *s, struct list *result, char **name, int *align, s
 	if (name)
 		*name = NULL;
 	a.kind = 0;
+	/* GNU attributes between the pointer and the declarator name, e.g. void * __attribute__((...)) f() -- they
+	 * appertain to the declared entity (the kernel's __must_check, __user and friends sit here) */
+	while (tok.kind == T__ATTRIBUTE__)
+		gnuattr(&a, align ? ATTRALIGNED : 0);
+	if (align && (a.kind & ATTRALIGNED) && a.align > *align)
+		*align = a.align;
 	ptr = result->next;
 	switch (tok.kind) {
 	case TLPAREN:
@@ -627,7 +633,7 @@ declaratortypes(struct scope *s, struct list *result, char **name, int *align, s
 			case TLPAREN:
 				break;
 			default:
-				if (tok.kind >= TIDENT && !istypename(s, tokenstr(tok.kind)))
+				if (iscident(tok.kind) && !istypename(s, tokenstr(tok.kind)))
 					break;
 				goto func;
 			}
@@ -637,7 +643,7 @@ declaratortypes(struct scope *s, struct list *result, char **name, int *align, s
 		allowedattr = -1;
 		break;
 	default:
-		if (tok.kind >= TIDENT) {
+		if (iscident(tok.kind)) {
 			if (!name)
 				error(&tok.loc, "identifier not allowed in abstract declarator");
 			*name = tokenstr(tok.kind);
@@ -1091,6 +1097,7 @@ decl(struct scope *s, struct func *f)
 	struct init *init;
 	bool hasinit;
 	char *name, *asmname;
+	int specalign;
 	int allowfunc = !f;
 	struct decl *d, *prior;
 	enum declkind kind;
@@ -1119,9 +1126,11 @@ decl(struct scope *s, struct func *f)
 		/* XXX 6.7p2 error unless in function parameter/struct/union, or tag/enum members are declared */
 		return true;
 	}
+	specalign = align;
 	for (;;) {
 		declcleanup = NULL;
-		qt = declarator(s, base, &name, NULL, &funcscope, false);
+		align = specalign;   /* the declaration's _Alignas, raised per declarator by a trailing aligned attribute */
+		qt = declarator(s, base, &name, &align, &funcscope, false);
 		t = qt.type;
 		tq = qt.qual;
 		if (consume(T__ASM__)) {
@@ -1147,10 +1156,15 @@ decl(struct scope *s, struct func *f)
 			error(&tok.loc, "'%s' redeclared with different kind", name);
 		switch (kind) {
 		case DECLTYPE:
-			if (align)
-				error(&tok.loc, "typedef '%s' declared with alignment specifier", name);
 			if (asmname)
 				error(&tok.loc, "typedef '%s' declared with assembler label", name);
+			if (align > t->align) {
+				/* an aligned attribute on a typedef raises the alignment of a copy of the type (GNU) */
+				struct type *nt = xmalloc(sizeof *nt);
+				*nt = *t;
+				nt->align = align;
+				t = nt;
+			}
 			if (!prior)
 				scopeputdecl(s, mkdecl(name, DECLTYPE, t, tq, LINKNONE));
 			else if (!typesame(prior->type, t) || prior->qual != tq)

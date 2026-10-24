@@ -13,6 +13,29 @@ struct token tok;
 static struct map tokmap;  /* maps string to token */
 static struct array tokstr;  /* maps token to string */
 
+/* C23 keyword constants/types (true, false, nullptr, bool) are plain identifiers before C23 (C11/C17 and the gnu*
+ * dialects), where <stdbool.h>/<stddef.h> provide them as macros or the program declares its own. cproc -K selects
+ * that reading (stdc23 false); the Linux kernel builds as gnu11 and relies on the identifier meaning. */
+bool stdc23 = true;
+
+/* whether a token may be used as an ordinary identifier here: a real identifier, or -- before C23 -- one of the
+ * lowercase C23 keyword spellings. tokenstr() still yields the spelling, so no separate name tracking is needed. */
+int
+iscident(enum tokenkind kind)
+{
+	if (kind >= TIDENT)
+		return 1;
+	if (!stdc23)
+		switch (kind) {
+		case ALIAS_BOOL:   /* lowercase "bool"; "_Bool" is TBOOL and stays a keyword */
+		case TTRUE: case TFALSE: case TNULLPTR:
+			return 1;
+		default:
+			break;
+		}
+	return 0;
+}
+
 void
 tokeninit(void)
 {
@@ -140,7 +163,7 @@ tokencheck(const struct token *t, enum tokenkind kind, const char *msg)
 	char want[64], got[64];
 
 	if (kind == TPPIDENT || kind == TIDENT) {
-		if (t->kind < kind) {
+		if (kind == TIDENT ? !iscident(t->kind) : t->kind < kind) {
 			strcpy(want, "identifier");
 			goto err;
 		}

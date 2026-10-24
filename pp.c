@@ -563,14 +563,14 @@ next(void)
 	struct token *t;
 
 	do t = rawnext();
-	while (expand(t) || t->kind == TNEWLINE && !(ppflags & PPNEWLINE));
+	while (expand(t) || t->kind == TNEWLINE && !(ppflags & PPNEWLINE) || t->kind == ALIAS__EXTENSION__);
 	tok = *t;
 
 	/* keyword aliases */
 	switch (tok.kind) {
 	case ALIAS_ALIGNAS:       tok.kind = TALIGNAS;       break;
 	case ALIAS_ALIGNOF:       tok.kind = TALIGNOF;       break;
-	case ALIAS_BOOL:          tok.kind = TBOOL;          break;
+	case ALIAS_BOOL:          if (stdc23) tok.kind = TBOOL;  break;   /* else 'bool' stays an identifier (iscident) */
 	case ALIAS__INLINE:
 	case ALIAS__INLINE__:     tok.kind = TINLINE;        break;
 	case ALIAS__SIGNED:

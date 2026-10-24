@@ -63,7 +63,7 @@ TOKEN(THASHHASH,      "##")
 TOKEN(TALIGNAS,       "alignas")
 TOKEN(TALIGNOF,       "alignof")
 TOKEN(TAUTO,          "auto")
-TOKEN(TBOOL,          "bool")
+TOKEN(TBOOL,          "_Bool")
 TOKEN(TBREAK,         "break")
 TOKEN(TCASE,          "case")
 TOKEN(TCHAR,          "char")
@@ -138,7 +138,7 @@ TOKEN(T__VA_ARGS__,   "__VA_ARGS__")
 /* keyword aliases */
 TOKEN(ALIAS_ALIGNAS,       "_Alignas")
 TOKEN(ALIAS_ALIGNOF,       "_Alignof")
-TOKEN(ALIAS_BOOL,          "_Bool")
+TOKEN(ALIAS_BOOL,          "bool")   /* lowercase; the C23 keyword only under -c, else an identifier */
 TOKEN(ALIAS_STATIC_ASSERT, "_Static_assert")
 TOKEN(ALIAS_THREAD_LOCAL,  "_Thread_local")
 
@@ -152,3 +152,4 @@ TOKEN(ALIAS__TYPEOF,       "__typeof")
 TOKEN(ALIAS__TYPEOF__,     "__typeof__")
 TOKEN(ALIAS__VOLATILE__,   "__volatile__")  /* XXX: what needs this? */
 TOKEN(ALIAS__ASM,          "__asm")
+TOKEN(ALIAS__EXTENSION__,  "__extension__")  /* a pedantry marker: dropped by the scanner */
