@@ -577,8 +577,12 @@ eval(struct expr *expr)
 			break;
 		switch (expr->op) {
 		case TADD:
-			if (r->kind == EXPRBINARY)
+			if (r->kind == EXPRBINARY) {
+				/* the operands of the expression too: the folds below write into expr->u.binary.r (C + (x + C1)) */
 				c = l, l = r, r = c;
+				expr->u.binary.l = l;
+				expr->u.binary.r = r;
+			}
 			/* fallthrough */
 		case TSUB:
 			if (r->kind != EXPRCONST)
