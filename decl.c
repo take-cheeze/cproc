@@ -75,6 +75,21 @@ struct func *curfunc;
 static bool curclone;   /* a clone's body is being parsed (funcclone): nothing is recorded */
 static bool alignasseen;   /* the declaration being parsed has an _Alignas (not only GNU aligned) */
 
+/* GNU mode on a declaration of an integer type (glibc's typedef int register_t __attribute__((__mode__(__word__)))):
+ * the integer type of that size, of the same signedness, as gcc gives it */
+static struct type *
+modetype(struct type *t, int size)
+{
+	static struct type *const bysize[9][2] = {
+		[1] = {&typeuchar, &typeschar}, [2] = {&typeushort, &typeshort},
+		[4] = {&typeuint, &typeint}, [8] = {&typeulong, &typelong},
+	};
+
+	if (!(t->prop & PROPINT) || t->kind == TYPEBOOL)
+		error(&tok.loc, "GNU attribute mode on a type that is not an integer is not supported");
+	return bysize[size][t->u.arith.issigned];
+}
+
 static void structpackbits(struct type *, struct structbuilder *);
 
 /* GNU packed on a member declarator (declaratortypes): structdecl lays that member out with alignment 1 */
@@ -1184,14 +1199,16 @@ structdecl(struct scope *s, struct structbuilder *b)
 	struct qualtype base, mt;
 	char *name;
 	unsigned long long width;
-	int align, specalign;
+	int align, specalign, savedmode = declattr.modesize, basemode;
 
 	if (staticassert(s))
 		return;
 	if (consume(TSEMICOLON))   /* GNU: an empty member declaration (the kernel's cleanup.h guards, "T *lock; ;") */
 		return;
 	attr(NULL, 0);
+	declattr.modesize = 0;   /* a member's mode is its own, not the enclosing declaration's */
 	base = declspecs(s, NULL, NULL, &align);
+	basemode = declattr.modesize;
 	specalign = align;
 	if (!base.type)
 		error(&tok.loc, "no type in struct member declaration");
@@ -1211,7 +1228,10 @@ structdecl(struct scope *s, struct structbuilder *b)
 
 			align = specalign;   /* a member's aligned attribute does not carry to the next declarator */
 			declpacked = false;
+			declattr.modesize = basemode;
 			mt = declarator(s, base, &name, &align, NULL, false);
+			if (declattr.modesize)
+				mt.type = modetype(mt.type, declattr.modesize);
 			width = consume(TCOLON) ? intconstexpr(s, false) : -1;
 			b->pack = pack || declpacked;   /* int x __attribute__((packed)): this member alone has alignment 1 */
 			addmember(b, mt, name, align, width);
@@ -1221,6 +1241,7 @@ structdecl(struct scope *s, struct structbuilder *b)
 			break;
 		expect(TCOMMA, "or ';' after declarator");
 	}
+	declattr.modesize = savedmode;
 	next();
 }
 
@@ -1230,9 +1251,15 @@ typename(struct scope *s, enum typequal *tq, struct expr **toeval)
 {
 	struct qualtype t;
 
+	int savedmode = declattr.modesize;
+
+	declattr.modesize = 0;
 	t = declspecs(s, NULL, NULL, NULL);
 	if (t.type) {
 		t = declarator(s, t, NULL, NULL, NULL, true);
+		if (declattr.modesize)
+			error(&tok.loc, "GNU attribute mode in a type name is not supported");
+		declattr.modesize = savedmode;
 		if (tq)
 			*tq |= t.qual;
 		if (toeval)
@@ -1451,6 +1478,8 @@ decl1(struct scope *s, struct func *f)
 			asmname = NULL;
 		}
 		gnuattr(&a, 0);  /* appertains to identifier */
+		if (declattr.modesize)
+			t = modetype(t, declattr.modesize);
 		kind = sc & SCTYPEDEF ? DECLTYPE : t->kind == TYPEFUNC ? DECLFUNC : DECLOBJECT;
 		if (declattr.transparent && kind != DECLTYPE)
 			error(&tok.loc, "transparent_union is only supported on a typedef of a union");

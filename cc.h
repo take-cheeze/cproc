@@ -553,6 +553,7 @@ struct declattr {
 	bool weak;          /* GNU weak */
 	char *alias;        /* GNU alias("target") */
 	const char *visibility;   /* GNU visibility("...") */
+	int modesize;       /* GNU mode on a declaration (glibc's register_t, mode(word)): the integer's size, or 0 */
 };
 extern struct declattr declattr;
 

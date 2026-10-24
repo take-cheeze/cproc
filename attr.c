@@ -124,6 +124,8 @@ parseattr(struct attr *a, enum attrkind allowed, enum attrprefix prefix)
 				error(&tok.loc, "GNU attribute mode(%s) is not supported", m);
 			if (a)
 				a->modesize = size;
+			if (!(allowed & ATTRMODE))   /* not after an enum body: the declaration's (decl.c modetype) */
+				declattr.modesize = size;
 			expect(TRPAREN, "after mode");
 		} else if (strcmp(name, "weak") == 0) {
 			declattr.weak = true;
@@ -174,8 +176,8 @@ parseattr(struct attr *a, enum attrkind allowed, enum attrprefix prefix)
 				error(&tok.loc, "GNU attribute '%s' is not supported (it changes what the declaration means)", name);
 	}
 	if (kind) {
-		/* section, used and transparent_union are recorded for the declaration (declattr) wherever they appear */
-		if (kind & ~(ATTRSECTION | ATTRUSED | ATTRTRANSPARENT) & ~allowed)
+		/* section, used, transparent_union and mode are recorded for the declaration (declattr) wherever they appear */
+		if (kind & ~(ATTRSECTION | ATTRUSED | ATTRTRANSPARENT | ATTRMODE) & ~allowed)
 			error(&tok.loc, "%sattribute '%s' is not supported here", prefixname, name);
 		if (a)
 			a->kind |= kind;
