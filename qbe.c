@@ -1801,6 +1801,33 @@ funclabel(struct func *f, struct block *b)
 	f->end = b;
 }
 
+/*
+GNU statement expressions: while the body is parsed, its code goes into a chain of blocks of its own (funcdetach, funcreattach),
+so that nothing is emitted where the expression is only parsed. funcsplice links the chain in at the point of evaluation, in
+the branch of ?:, && or || or the condition of a loop that holds the expression, and the code goes on in the chain's last block.
+*/
+void
+funcdetach(struct func *f, struct stmtchain *c)
+{
+	c->saved = f->end;
+	c->entry = c->tail = f->end = mkblock("stmtexpr");
+}
+
+void
+funcreattach(struct func *f, struct stmtchain *c)
+{
+	c->tail = f->end;
+	f->end = c->saved;
+}
+
+void
+funcsplice(struct func *f, struct stmtchain *c)
+{
+	funcjmp(f, c->entry);
+	f->end->next = c->entry;
+	f->end = c->tail;
+}
+
 void
 funcjmp(struct func *f, struct block *l)
 {
@@ -2195,6 +2222,12 @@ funcexpr(struct func *f, struct expr *e)
 		if (t->kind == TYPEFLOAT16)
 			return mkintconst(halfbits(e->u.constant.f));
 		return mkfltconst(t->size == 4 ? VALUE_FLTCONST : VALUE_DBLCONST, e->u.constant.f);
+	case EXPRSTMT:
+		if (e->u.stmt.spliced)
+			fatal("statement expression evaluated twice");
+		e->u.stmt.spliced = true;
+		funcsplice(f, &e->u.stmt.chain);
+		return e->u.stmt.value;
 	case EXPRBITFIELD:
 	case EXPRCOMPOUND:
 		lval = funclval(f, e);

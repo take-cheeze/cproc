@@ -95,7 +95,7 @@ static struct expr *mkunaryexpr(enum tokenkind, struct expr *);
 static struct expr *mkassignexpr(struct expr *, struct expr *);
 
 /* 6.3.2.1 Conversion of arrays and function designators */
-static struct expr *
+struct expr *
 decay(struct expr *e)
 {
 	struct type *t;
@@ -1537,6 +1537,33 @@ unaryexpr(struct scope *s)
 	return e;
 }
 
+/* GNU statement expression ({ ... }): an rvalue with the type and value of the body's last expression statement, void if the body ends otherwise */
+static struct expr *
+stmtexpr(struct scope *s)
+{
+	struct func *f = curfunc;
+	struct expr *e, *last;
+	struct value *v = NULL;
+	struct type *t = &typevoid;
+
+	if (!f)
+		error(&tok.loc, "statement expression outside of a function");
+	e = mkexpr(EXPRSTMT, &typevoid, NULL);
+	funcdetach(f, &e->u.stmt.chain);
+	last = stmtblock(f, s);
+	if (last) {
+		last = decay(last);
+		t = last->type;
+		v = funcexpr(f, last);
+		delexpr(last);
+	}
+	funcreattach(f, &e->u.stmt.chain);
+	e->type = t;
+	e->u.stmt.value = v;
+	e->u.stmt.spliced = false;
+	return e;
+}
+
 static struct expr *
 castexpr(struct scope *s)
 {
@@ -1548,6 +1575,12 @@ castexpr(struct scope *s)
 	ct = NULL;
 	end = &r;
 	while (consume(TLPAREN)) {
+		if (tok.kind == TLBRACE) {
+			e = stmtexpr(s);
+			expect(TRPAREN, "after statement expression");
+			e = postfixexpr(s, e);
+			goto done;
+		}
 		tq = QUALNONE;
 		t = typename(s, &tq, &toeval);
 		if (!t) {
