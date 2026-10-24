@@ -22,6 +22,19 @@ asmsep(void)
 	return false;
 }
 
+/* the name a label goes by in the function: a GNU local label (__label__) of an enclosing block has its own */
+static char *
+labelname(struct scope *s, char *name)
+{
+	struct locallabel *l;
+
+	for (; s; s = s->parent)
+		for (l = s->labels; l; l = l->next)
+			if (strcmp(l->name, name) == 0)
+				return l->unique;
+	return name;
+}
+
 /* 6.8.1 Labeled statements */
 static bool
 label(struct func *f, struct scope *s)
@@ -41,7 +54,22 @@ label(struct func *f, struct scope *s)
 		funclabel(f, b);
 		asancase(f, s->switchcases);
 		i = intconstexpr(s, true);
-		switchcase(s->switchcases, i, b);
+		if (consume(TELLIPSIS)) {
+			/* GNU case range: case LO ... HI. The dispatch compares unsigned, so a signed range across zero is two */
+			unsigned long long j = intconstexpr(s, true);
+			bool sign = s->switchcases->type->u.arith.issigned;
+
+			if (sign ? (long long)i <= (long long)j : i <= j) {
+				if (i <= j) {
+					switchcase(s->switchcases, i, j, b);
+				} else {
+					switchcase(s->switchcases, i, -1, b);
+					switchcase(s->switchcases, 0, j, b);
+				}
+			}
+		} else {
+			switchcase(s->switchcases, i, i, b);
+		}
 		expect(TCOLON, "after case expression");
 		break;
 	case TDEFAULT:
@@ -59,12 +87,30 @@ label(struct func *f, struct scope *s)
 		if (!iscident(tok.kind))
 			return false;
 		name = tokenstr(tok.kind);
+		if (strcmp(name, "__label__") == 0) {
+			/* GNU: __label__ a, b; declares labels local to the block (macros that expand twice use them) */
+			static unsigned id;
+
+			next();
+			do {
+				struct locallabel *l = xmalloc(sizeof *l);
+
+				l->name = expect(TIDENT, "in __label__ declaration");
+				l->unique = xmalloc(strlen(l->name) + 16);
+				sprintf(l->unique, "%s.local%u", l->name, ++id);
+				l->next = s->labels;
+				s->labels = l;
+			} while (consume(TCOMMA));
+			expect(TSEMICOLON, "after __label__ declaration");
+			return true;
+		}
 		if (!peek(TCOLON))
 			return false;
-		g = funcgoto(f, name);
+		g = funcgoto(f, labelname(s, name));
 		g->defined = true;
 		funclabel(f, g->label);
 		asanlabel(f, g);
+		funclabeldefined(f, g);
 		break;
 	}
 	return true;
@@ -79,37 +125,61 @@ labelstmt(struct func *f, struct scope *s)
 }
 
 /*
-The items of a GNU statement expression's braces. Declarations and statements are emitted as in a compound statement; the
-last item, if it is an expression statement, is returned unevaluated: it gives the value of the statement expression.
+The body of a GNU statement expression ({ ... }), parsed into the current (detached) blocks: declarations and
+statements as in a compound statement, except that the last expression statement is not evaluated here -- its tree
+is the expression's value, evaluated where the statement expression is (funcexpr). Returns null when the body does not
+end in an expression statement (the value is void).
 */
 struct expr *
-stmtblock(struct func *f, struct scope *s)
+stmtexpr(struct func *f, struct scope *s)
 {
-	struct expr *last = NULL;
+	struct expr *e, *v = NULL;
 
-	next();
+	expect(TLBRACE, "to begin statement expression");
 	s = mkscope(s);
+	s->stmtexpr = true;
+	s->cleanmark = funccleanmark(f);
 	while (tok.kind != TRBRACE) {
-		if (last) {
-			funcexpr(f, last);
-			delexpr(last);
-			last = NULL;
-		}
-		attr(NULL, 0);
+		v = NULL;
 		if (label(f, s) || decl(s, f))
 			continue;
 		switch (tok.kind) {
 		case TLBRACE: case TSEMICOLON: case TIF: case TSWITCH: case TWHILE: case TDO: case TFOR:
-		case TGOTO: case TCONTINUE: case TBREAK: case TRETURN: case T__ASM__:
+		case TGOTO: case TCONTINUE: case TBREAK: case TRETURN: case T__ASM__: case TLBRACK:
 			stmt(f, s);
 			continue;
+		default:
+			break;
 		}
-		last = expr(s);
+		e = expr(s);
 		expect(TSEMICOLON, "after expression statement");
+		if (tok.kind == TRBRACE) {
+			v = e;
+			break;
+		}
+		funcexpr(f, e);
+		delexpr(e);
 	}
 	s = delscope(s);
-	next();
-	return last;
+	expect(TRBRACE, "to end statement expression");
+	return v;
+}
+
+/* a block scope; under cproc -G its cleanup objects leave with it (qbe.c funccleanpop) */
+static struct scope *
+enterscope(struct func *f, struct scope *s)
+{
+	s = mkscope(s);
+	s->cleanmark = funccleanmark(f);
+	return s;
+}
+
+static struct scope *
+leavescope(struct func *f, struct scope *s)
+{
+	if (gnucleanup)
+		funccleanpop(f, s->cleanmark);
+	return delscope(s);
 }
 
 /* 6.8 Statements and blocks */
@@ -127,18 +197,33 @@ stmt(struct func *f, struct scope *s)
 	attr(NULL, 0);
 	switch (tok.kind) {
 	/* 6.8.2 Compound statement */
-	case TLBRACE:
+	case TLBRACE: {
+		struct funcshape *sh = funcshape(f);
+		bool top = sh->depth++ == 0;   /* the function's body */
+
 		next();
-		s = mkscope(s);
+		s = enterscope(f, s);
 		asanbegin(f);
 		while (tok.kind != TRBRACE) {
+			if (top && ++sh->items == 1)
+				sh->firstreturn = tok.kind == TRETURN;
 			if (!label(f, s) && !decl(s, f))
 				stmt(f, s);
 		}
 		asanend(f);
-		s = delscope(s);
+		s = leavescope(f, s);
 		next();
+		if (top && (sh->items != 1 || !sh->firstreturn))
+			sh->constret = false;
+		if (top && sh->constret) {
+			funcdecl(f)->u.func.constret = true;
+			funcdecl(f)->u.func.retval = sh->retval;
+		}
+		if (top && sh->items == 0 && functype(f)->base == &typevoid)
+			funcdecl(f)->u.func.emptybody = true;
+		--sh->depth;
 		break;
+	}
 
 	/* 6.8.3 Expression statement */
 	case TSEMICOLON:
@@ -154,7 +239,7 @@ stmt(struct func *f, struct scope *s)
 	/* 6.8.4 Selection statement */
 	case TIF:
 		next();
-		s = mkscope(s);
+		s = enterscope(f, s);
 		expect(TLPAREN, "after 'if'");
 		e = expr(s);
 		t = e->type;
@@ -167,27 +252,27 @@ stmt(struct func *f, struct scope *s)
 		expect(TRPAREN, "after expression");
 
 		funclabel(f, b[0]);
-		s = mkscope(s);
+		s = enterscope(f, s);
 		labelstmt(f, s);
-		s = delscope(s);
+		s = leavescope(f, s);
 
 		if (consume(TELSE)) {
 			b[2] = mkblock("if_join");
 			funcjmp(f, b[2]);
 			funclabel(f, b[1]);
-			s = mkscope(s);
+			s = enterscope(f, s);
 			labelstmt(f, s);
-			s = delscope(s);
+			s = leavescope(f, s);
 			funclabel(f, b[2]);
 		} else {
 			funclabel(f, b[1]);
 		}
-		s = delscope(s);
+		s = leavescope(f, s);
 		break;
 	case TSWITCH:
 		next();
 
-		s = mkscope(s);
+		s = enterscope(f, s);
 		expect(TLPAREN, "after 'switch'");
 		e = expr(s);
 		expect(TRPAREN, "after expression");
@@ -206,25 +291,26 @@ stmt(struct func *f, struct scope *s)
 
 		v = funcexpr(f, e);
 		funcjmp(f, b[0]);
-		s = mkscope(s);
+		s = enterscope(f, s);
 		s->breaklabel = b[1];
 		s->switchcases = &swtch;
 		s->asanbreak = asanmark(f);
+		s->cleanbreak = funccleanmark(f);
 		labelstmt(f, s);
 		funcjmp(f, b[1]);
 
 		funclabel(f, b[0]);
 		funcswitch(f, v, &swtch, swtch.defaultlabel ? swtch.defaultlabel : b[1]);
-		s = delscope(s);
+		s = leavescope(f, s);
 
 		funclabel(f, b[1]);
-		s = delscope(s);
+		s = leavescope(f, s);
 		break;
 
 	/* 6.8.5 Iteration statements */
 	case TWHILE:
 		next();
-		s = mkscope(s);
+		s = enterscope(f, s);
 		expect(TLPAREN, "after 'while'");
 		e = expr(s);
 		t = e->type;
@@ -239,15 +325,16 @@ stmt(struct func *f, struct scope *s)
 		funclabel(f, b[0]);
 		funcbranch(f, e, b[1], b[2]);
 		funclabel(f, b[1]);
-		s = mkscope(s);
+		s = enterscope(f, s);
 		s->continuelabel = b[0];
 		s->breaklabel = b[2];
 		s->asanbreak = s->asancontinue = asanmark(f);
+		s->cleanbreak = s->cleancontinue = funccleanmark(f);
 		labelstmt(f, s);
-		s = delscope(s);
+		s = leavescope(f, s);
 		funcjmp(f, b[0]);
 		funclabel(f, b[2]);
-		s = delscope(s);
+		s = leavescope(f, s);
 		break;
 	case TDO:
 		next();
@@ -256,14 +343,15 @@ stmt(struct func *f, struct scope *s)
 		b[1] = mkblock("do_cond");
 		b[2] = mkblock("do_join");
 
-		s = mkscope(s);
-		s = mkscope(s);
+		s = enterscope(f, s);
+		s = enterscope(f, s);
 		s->continuelabel = b[1];
 		s->breaklabel = b[2];
 		s->asanbreak = s->asancontinue = asanmark(f);
+		s->cleanbreak = s->cleancontinue = funccleanmark(f);
 		funclabel(f, b[0]);
 		labelstmt(f, s);
-		s = delscope(s);
+		s = leavescope(f, s);
 
 		expect(TWHILE, "after 'do' statement");
 		expect(TLPAREN, "after 'while'");
@@ -276,13 +364,13 @@ stmt(struct func *f, struct scope *s)
 
 		funcbranch(f, e, b[0], b[2]);
 		funclabel(f, b[2]);
-		s = delscope(s);
+		s = leavescope(f, s);
 		expect(TSEMICOLON, "after 'do' statement");
 		break;
 	case TFOR:
 		next();
 		expect(TLPAREN, "after 'for'");
-		s = mkscope(s);
+		s = enterscope(f, s);
 		asanbegin(f);
 		if (!decl(s, f)) {
 			if (tok.kind != TSEMICOLON) {
@@ -312,12 +400,13 @@ stmt(struct func *f, struct scope *s)
 		expect(TRPAREN, NULL);
 
 		funclabel(f, b[1]);
-		s = mkscope(s);
+		s = enterscope(f, s);
 		s->breaklabel = b[3];
 		s->continuelabel = b[2];
 		s->asanbreak = s->asancontinue = asanmark(f);
+		s->cleanbreak = s->cleancontinue = funccleanmark(f);
 		labelstmt(f, s);
-		s = delscope(s);
+		s = leavescope(f, s);
 
 		funclabel(f, b[2]);
 		if (e) {
@@ -327,16 +416,16 @@ stmt(struct func *f, struct scope *s)
 		funcjmp(f, b[0]);
 		funclabel(f, b[3]);
 		asanend(f);
-		s = delscope(s);
+		s = leavescope(f, s);
 		break;
 
 	/* 6.8.6 Jump statements */
 	case TGOTO:
 		next();
 		name = expect(TIDENT, "after 'goto'");
-		g = funcgoto(f, name);
+		g = funcgoto(f, labelname(s, name));
 		asangoto(f, g);
-		funcjmp(f, g->label);
+		funcjmp(f, funcgototarget(f, g));   /* -G: through the cleanups of the scopes it leaves */
 		expect(TSEMICOLON, "after 'goto' statement");
 		break;
 	case TCONTINUE:
@@ -344,6 +433,8 @@ stmt(struct func *f, struct scope *s)
 		if (!s->continuelabel)
 			error(&tok.loc, "'continue' statement must be in loop");
 		asanleave(f, s->asancontinue);
+		if (gnucleanup)
+			funccleanleave(f, s->cleancontinue);
 		funcjmp(f, s->continuelabel);
 		expect(TSEMICOLON, "after 'continue' statement");
 		break;
@@ -352,6 +443,8 @@ stmt(struct func *f, struct scope *s)
 		if (!s->breaklabel)
 			error(&tok.loc, "'break' statement must be in loop or switch");
 		asanleave(f, s->asanbreak);
+		if (gnucleanup)
+			funccleanleave(f, s->cleanbreak);
 		funcjmp(f, s->breaklabel);
 		expect(TSEMICOLON, "after 'break' statement");
 		break;
@@ -360,11 +453,30 @@ stmt(struct func *f, struct scope *s)
 		t = functype(f);
 		if (t->base != &typevoid) {
 			e = exprassign(expr(s), t->base);
+			if (funcshape(f)->depth == 1 && funcshape(f)->items == 1) {   /* the body's first item: { return C; }? */
+				struct expr *c = eval(e);
+
+				if (c->kind == EXPRCONST && t->base->prop & PROPINT && !(t->base->prop & PROPSOFT)) {
+					funcshape(f)->constret = true;
+					funcshape(f)->retval = c->u.constant.u;
+				}
+				e = c;
+			}
 			v = funcexpr(f, e);
 			delexpr(e);
 		} else {
+			/* GNU: a void function may return a void expression (return put_unaligned_le16(...);) */
+			if (tok.kind != TSEMICOLON) {
+				e = expr(s);
+				if (e->type->kind != TYPEVOID)
+					error(&tok.loc, "return with a value in a function returning void");
+				funcexpr(f, e);
+				delexpr(e);
+			}
 			v = NULL;
 		}
+		if (gnucleanup)   /* the value first, then the cleanups of every scope the return leaves */
+			funccleanleave(f, 0);
 		funcret(f, v);
 		expect(TSEMICOLON, "after 'return' statement");
 		break;
@@ -372,23 +484,25 @@ stmt(struct func *f, struct scope *s)
 	case T__ASM__: {
 		/* GNU extended asm: __asm__ [volatile] ( template [: outputs [: inputs [: clobbers]]] ) ; */
 		struct asmoperand out[16], in[16];
-		char *clob[16], *template;
-		unsigned nout = 0, nin = 0, nclob = 0;
-		bool isvol = false;
+		struct gotolabel *labels[16];
+		char *clob[16], *labnames[16], *template;
+		unsigned nout = 0, nin = 0, nclob = 0, nlab = 0;
+		bool isvol = false, isgoto = false, basic;
 		struct stringlit lit;
 
 		next();
-		while (tok.kind == TVOLATILE || tok.kind == TINLINE) {
+		while (tok.kind == TVOLATILE || tok.kind == TINLINE || tok.kind == TGOTO) {
 			if (tok.kind == TVOLATILE)
 				isvol = true;
+			if (tok.kind == TGOTO)
+				isgoto = true;
 			next();
 		}
-		if (tok.kind == TGOTO)
-			error(&tok.loc, "'asm goto' is not yet supported");
 		expect(TLPAREN, "after 'asm'");
 		tokencheck(&tok, TSTRINGLIT, "for asm template");
 		stringconcat(&lit, true);
 		template = lit.data;
+		basic = tok.kind != TCOLON && tok.kind != TCOLONCOLON;
 		/* outputs, then inputs: each is [ [symbol] ] "constraint" ( operand ) */
 		for (unsigned sect = 0; sect < 2 && asmsep(); ++sect) {
 			struct asmoperand *ops = sect == 0 ? out : in;
@@ -424,12 +538,62 @@ stmt(struct func *f, struct scope *s)
 					break;
 			}
 		}
+		/* asm goto: the labels the template may jump to */
+		if (isgoto && asmsep()) {
+			while (tok.kind >= TIDENT) {
+				if (nlab == 16)
+					error(&tok.loc, "too many asm goto labels");
+				labnames[nlab] = expect(TIDENT, "for asm goto label");
+				labels[nlab] = funcgoto(f, labelname(s, labnames[nlab]));
+				++nlab;
+				if (!consume(TCOMMA))
+					break;
+			}
+		}
 		if (tok.kind == TCOLON || tok.kind == TCOLONCOLON)
-			error(&tok.loc, "'asm goto' is not yet supported");
+			error(&tok.loc, isgoto ? "expected ')' after the asm goto labels" : "asm labels need 'asm goto'");
+		if (basic) {
+			/* basic asm (no operands): the text is the template as it is, with no '%' substitution
+			 * (the kernel's io_delay: asm volatile("outb %al, $0x80")) */
+			size_t n = 0;
+			char *q, *e;
+
+			for (q = template; *q; ++q)
+				n += *q == '%';
+			e = xmalloc(strlen(template) + n + 1);
+			for (q = template, n = 0; *q; ++q) {
+				e[n++] = *q;
+				if (*q == '%')
+					e[n++] = '%';
+			}
+			e[n] = 0;
+			template = e;
+		}
+		/* an input tied to an output by name ("[sum]"(rest)) is tied by number, as "0" */
+		for (unsigned k = 0; k < nin; ++k) {
+			const char *c = in[k].constraint;
+			bool found = false;
+
+			if (*c != '[')
+				continue;
+			for (unsigned o = 0; o < nout && !found; ++o) {
+				size_t len = out[o].symname ? strlen(out[o].symname) : 0;
+
+				if (len && strncmp(c + 1, out[o].symname, len) == 0 && c[1 + len] == ']' && !c[2 + len]) {
+					char *num = xmalloc(12);
+
+					snprintf(num, 12, "%u", o);
+					in[k].constraint = num;
+					found = true;
+				}
+			}
+			if (!found)
+				error(&tok.loc, "asm input constraint '%s' names no output", c);
+		}
 		expect(TRPAREN, "after asm");
 		expect(TSEMICOLON, "after asm statement");
 		if (f)
-			funcasm(f, template, out, nout, in, nin, clob, nclob, isvol);
+			funcasm(f, template, out, nout, in, nin, clob, nclob, isvol || isgoto, labels, labnames, nlab);
 		else
 			error(&tok.loc, "file-scope asm is not yet supported");
 		break;

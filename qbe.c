@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <ctype.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,11 +82,19 @@ struct block {
 	} phi;
 	struct jump jump;
 
+	/* inline asm (funcasm): the thunks of the asm statements in this block, their symbol operands (struct value *), and
+	 * a refusal deferred under cproc -p. emitfunc writes them out only for a block that can be reached: the kernel's
+	 * cmpxchg switches on sizeof(*ptr), and the asm of a case never taken may not even assemble */
+	struct array thunks, asmrefs;
+	char *lazyerror;
+	bool reach;
+
 	struct block *next;
 };
 
 struct switchcase {
-	struct treenode node;
+	struct treenode node;   /* the key is the low end of the values */
+	unsigned long long hi;  /* the high end: hi == key for a single value, more for a GNU case range */
 	struct block *body;
 };
 
@@ -105,11 +114,15 @@ struct func {
 	unsigned asanblocks;   /* -fsanitize=address: the blocks begun so far, for numbering them */
 	struct array asanjmps;   /* -fsanitize=address: the calls of setjmp (struct asanjmp), poisoned in asanfinish */
 	struct array ehobjs;     /* nfcxx's cleanup attribute: the objects (struct ehobj, in declaration order; ehcleanupobj) */
+	struct array cleanups;   /* cproc -G: the cleanup objects live now (struct ehobj), innermost last */
+	struct funcshape shape;  /* stmt.c: whether the body is { return C; } */
+	struct array cleangotos; /* cproc -G: the gotos (struct cleangoto), their cleanups made after the body */
 };
 
 /* a block-scope object with a cleanup attribute: the cleanup function and the object's address */
 struct ehobj {
 	const char *cleanup;
+	struct value *fn;   /* cproc -G: the cleanup function */
 	struct value *addr;
 };
 
@@ -142,13 +155,21 @@ struct asanjmp {
 static const int ptrclass = 'l';
 
 void
-switchcase(struct switchcases *cases, unsigned long long i, struct block *b)
+switchcase(struct switchcases *cases, unsigned long long lo, unsigned long long hi, struct block *b)
 {
 	struct switchcase *c;
 
-	c = treeinsert(&cases->root, i, sizeof(*c));
-	if (!c->node.new)
-		error(&tok.loc, "multiple 'case' labels with same value");
+	/* the values in the tree are disjoint intervals ordered by their low end, so an overlap is found on one path */
+	for (c = cases->root; c;) {
+		if (c->hi < lo)
+			c = c->node.child[1];
+		else if (c->node.key > hi)
+			c = c->node.child[0];
+		else
+			error(&tok.loc, "multiple 'case' labels with same value");
+	}
+	c = treeinsert(&cases->root, lo, sizeof(*c));
+	c->hi = hi;
 	c->body = b;
 }
 
@@ -165,6 +186,9 @@ mkblock(char *name)
 	b->label.u.name = name;
 	b->label.id = ++id;
 	b->insts = (struct array){0};
+	b->thunks = b->asmrefs = (struct array){0};
+	b->lazyerror = NULL;
+	b->reach = false;
 	b->jump.kind = JUMP_NONE;
 	b->phi.res.kind = VALUE_NONE;
 	b->next = NULL;
@@ -193,6 +217,33 @@ mkglobal(struct decl *d)
 		v->id = d->linkage == LINKNONE ? ++id : 0;
 	}
 
+	return v;
+}
+
+struct decl *
+funcdecl(struct func *f)
+{
+	return f->decl;
+}
+
+struct funcshape *
+funcshape(struct func *f)
+{
+	return &f->shape;
+}
+
+/* a local name for the body of an extern gnu_inline function: "$.LNAME.N", a symbol of this object only */
+struct value *
+mkinlinealias(struct decl *d)
+{
+	static unsigned id;
+	struct value *v;
+
+	assert(!d->asmname);
+	v = xmalloc(sizeof(*v));
+	*v = *d->value;
+	v->kind &= ~VALUE_EXTERN;
+	v->id = 1000000000 + ++id;   /* beyond mkglobal's numbers for block-scope statics */
 	return v;
 }
 
@@ -251,6 +302,7 @@ qbetype(struct type *t)
 
 static void emittype(struct type *);
 static void emitname(struct value *);
+static void funcasmout(struct func *);
 static void emitvalue(struct value *);
 
 static void
@@ -1544,7 +1596,7 @@ asanfinish(struct func *f)
 	f->end = end;
 }
 
-static void
+void
 funcalloc(struct func *f, struct decl *d)
 {
 	enum instkind op;
@@ -1631,6 +1683,76 @@ funccopy(struct func *f, struct value *dst, struct value *src, unsigned long lon
 	}
 }
 
+/*
+cproc -V: volatile accesses go through opaque helpers in the inline-asm side file (nfcxx_vload4: movl (%rdi), %eax),
+one call per access. QBE has no volatile; its load optimization forwards and merges plain loads (a polling loop's
+load could be hoisted out of it), and a call is something it never forwards, merges or removes. Scalars of 1, 2, 4
+and 8 bytes; a volatile bit-field or aggregate is still refused for stores. Returns null when the access is not one
+of these (the caller does an ordinary access).
+*/
+bool volatilecalls;
+
+static struct value *
+funcvolatile(struct func *f, struct type *t, struct lvalue lval, struct value *v)
+{
+	static bool done[2][9];
+	static const char *const ld[9] = {[1] = "movzbl (%rdi), %eax", [2] = "movzwl (%rdi), %eax",
+		[4] = "movl (%rdi), %eax", [8] = "movq (%rdi), %rax"};
+	static const char *const st[9] = {[1] = "movb %sil, (%rdi)", [2] = "movw %si, (%rdi)",
+		[4] = "movl %esi, (%rdi)", [8] = "movq %rsi, (%rdi)"};
+	static const int ldop[9] = {[1] = ILOADUB, [2] = ILOADUH, [4] = ILOADW, [8] = ILOADL};
+	static const int stop[9] = {[1] = ISTOREB, [2] = ISTOREH, [4] = ISTOREW, [8] = ISTOREL};
+	struct value *fn, *r;
+	size_t size;
+	bool store = v != NULL, agg;
+	int class;
+
+	if (!volatilecalls || !asmout || lval.bits.before || lval.bits.after)
+		return NULL;
+	if (t->kind == TYPEPOINTER)
+		t = &typeulong;
+	/* an aggregate of 1, 2, 4 or 8 bytes (the kernel's pte_t through WRITE_ONCE and READ_ONCE) is one access of
+	 * that size, as gcc makes it: its value is the address of its bytes */
+	agg = t->kind == TYPESTRUCT || t->kind == TYPEUNION || t->kind == TYPEARRAY;
+	if (!agg && (!(t->prop & PROPINT) || t->prop & PROPSOFT))
+		return NULL;
+	size = t->size;
+	if (size != 1 && size != 2 && size != 4 && size != 8)
+		return NULL;
+	if (!done[store][size]) {
+		fprintf(asmout, "#nfcxx:keep\n\t.text\n\t.p2align 4\nnfcxx_v%s%zu:\n\t%s\n\tret\n", store ? "store" : "load", size,
+			store ? st[size] : ld[size]);
+		done[store][size] = true;
+	}
+	fn = xmalloc(sizeof(*fn));
+	*fn = (struct value){.kind = VALUE_GLOBAL};
+	fn->u.name = xmalloc(24);
+	snprintf(fn->u.name, 24, "nfcxx_v%s%zu", store ? "store" : "load", size);
+	class = size == 8 ? 'l' : 'w';
+	if (store && agg)
+		v = funcinst(f, ldop[size], class, v, NULL);   /* the source's bytes, then one store of them */
+	if (store) {
+		funcinst(f, ICALL, 0, fn, NULL);
+		funcinst(f, IARG, ptrclass, lval.addr, NULL);
+		funcinst(f, IARG, class, v, NULL);
+		return v;
+	}
+	r = funcinst(f, ICALL, class, fn, NULL);
+	funcinst(f, IARG, ptrclass, lval.addr, NULL);
+	if (agg) {   /* one load of the bytes, into a temporary that is the value */
+		struct decl *tmp = mkdecl(NULL, DECLOBJECT, t, QUALNONE, LINKNONE);
+
+		tmp->u.obj.storage = SDAUTO;
+		funcalloc(f, tmp);
+		funcinst(f, stop[size], 0, r, tmp->value);
+		return tmp->value;
+	}
+	/* the helper zero-extends; a signed char or short is sign-extended as loadsb/loadsh would */
+	if (size < 4 && t->u.arith.issigned)
+		r = funcinst(f, size == 1 ? IEXTSB : IEXTSH, 'w', r, NULL);
+	return r;
+}
+
 static struct value *
 funcstore(struct func *f, struct type *t, enum typequal tq, struct lvalue lval, struct value *v)
 {
@@ -1640,8 +1762,11 @@ funcstore(struct func *f, struct type *t, enum typequal tq, struct lvalue lval, 
 	struct qbetype qt;
 	int bits;
 
-	if (tq & QUALVOLATILE)
+	if (tq & QUALVOLATILE) {
+		if (funcvolatile(f, t, lval, v))
+			return v;
 		error(&tok.loc, "volatile store is not yet supported");
+	}
 	if (tq & QUALCONST)
 		error(&tok.loc, "cannot store to 'const' object");
 	tp = t->prop;
@@ -1682,6 +1807,22 @@ funcstore(struct func *f, struct type *t, enum typequal tq, struct lvalue lval, 
 	return r;
 }
 
+static struct value *funcload(struct func *, struct type *, struct lvalue);
+
+/* a load from an lvalue with qualifiers tq: a volatile scalar goes through funcvolatile under cproc -V */
+static struct value *
+funcloadq(struct func *f, struct type *t, enum typequal tq, struct lvalue lval)
+{
+	struct value *v;
+
+	if (tq & QUALVOLATILE && (v = funcvolatile(f, t, lval, NULL)))
+		return funcbits(f, t, v, lval.bits);
+	/* -V: a volatile access it cannot make one call is refused, not left to QBE as a plain load */
+	if (tq & QUALVOLATILE && volatilecalls)
+		error(&tok.loc, "volatile load of this type is not yet supported (-V covers scalars and aggregates of 1, 2, 4 and 8 bytes)");
+	return funcload(f, t, lval);
+}
+
 static struct value *
 funcload(struct func *f, struct type *t, struct lvalue lval)
 {
@@ -1715,6 +1856,8 @@ mkfunc(struct decl *decl, char *name, struct type *t, struct scope *s)
 	f->start = f->end = mkblock("start");
 	f->lastid = 0;
 	f->ehobjs = (struct array){0};
+	f->cleanups = f->cleangotos = (struct array){0};
+	f->shape = (struct funcshape){0};
 	f->asan = (struct array){0};
 	f->asanfile = NULL;
 	f->asanrets = (struct array){0};
@@ -1723,6 +1866,8 @@ mkfunc(struct decl *decl, char *name, struct type *t, struct scope *s)
 	f->asanblocks = 0;
 	f->asanjmps = (struct array){0};
 	mapinit(&f->gotos, 8);
+	if (t->u.func.abi)
+		error(&tok.loc, "a function with the %s calling convention is not supported", t->u.func.abi);
 	emittype(t->base);
 
 	/* allocate space for parameters */
@@ -1732,7 +1877,11 @@ mkfunc(struct decl *decl, char *name, struct type *t, struct scope *s)
 		functemp(f, v);
 		if(!d->name)
 			continue;
-		if (d->type->value) {
+		if (d->type->kind == TYPEUNION && d->type->u.structunion.transparent) {
+			/* passed as its first member (abiparam): stored into the union */
+			funcalloc(f, d);
+			funcstore(f, d->type->u.structunion.members->type, QUALNONE, (struct lvalue){d->value}, v);
+		} else if (d->type->value) {
 			d->value = v;
 		} else {
 			funcalloc(f, d);
@@ -1786,30 +1935,28 @@ funclabel(struct func *f, struct block *b)
 }
 
 /*
-GNU statement expressions: while the body is parsed, its code goes into a chain of blocks of its own (funcdetach, funcreattach),
-so that nothing is emitted where the expression is only parsed. funcsplice links the chain in at the point of evaluation, in
-the branch of ?:, && or || or the condition of a loop that holds the expression, and the code goes on in the chain's last block.
+GNU statement expressions. The statements are parsed into a chain of blocks that is not part of the function yet
+(funcdetach makes a fresh current block and returns the one to come back to; funcreattach ends the chain and returns
+its last block). funcexpr links the chain in where the expression is evaluated, so the statements run only where and
+when the expression does: in the operand of &&, || or ?: that is taken, and not at all under sizeof or typeof, or in the
+operand __builtin_choose_expr does not choose.
 */
-void
-funcdetach(struct func *f, struct stmtchain *c)
+struct block *
+funcdetach(struct func *f, struct block **first)
 {
-	c->saved = f->end;
-	c->entry = c->tail = f->end = mkblock("stmtexpr");
+	struct block *saved = f->end;
+
+	*first = f->end = mkblock("stmtexpr");
+	return saved;
 }
 
-void
-funcreattach(struct func *f, struct stmtchain *c)
+struct block *
+funcreattach(struct func *f, struct block *saved)
 {
-	c->tail = f->end;
-	f->end = c->saved;
-}
+	struct block *last = f->end;
 
-void
-funcsplice(struct func *f, struct stmtchain *c)
-{
-	funcjmp(f, c->entry);
-	f->end->next = c->entry;
-	f->end = c->tail;
+	f->end = saved;
+	return last;
 }
 
 void
@@ -1830,6 +1977,15 @@ funcjnz(struct func *f, struct value *v, struct type *t, struct block *l1, struc
 
 	if (b->jump.kind)
 		return;
+	if (v->kind == VALUE_INTCONST && (!t || t->prop & PROPINT || t->kind == TYPEPOINTER)) {
+		/* a constant condition: the other way is not an edge, so what only it reaches is unreachable (emitfunc) */
+		unsigned long long c = v->u.i;
+
+		if (t && t->size < 8)
+			c &= (1ull << t->size * 8) - 1;
+		funcjmp(f, c ? l1 : l2);
+		return;
+	}
 	if (t) {
 		assert(t->prop & PROPSCALAR);
 		/*
@@ -1902,10 +2058,89 @@ funcgoto(struct func *f, char *name)
 		g->label = mkblock(name);
 		g->defined = false;
 		g->asanopen = g->asanfrom = g->asanall = NULL;
+		g->cleanat = (struct array){0};
 		f->gotos.vals[idx].p = g;
 	}
 
 	return f->gotos.vals[idx].p;
+}
+
+/*
+A read of a GNU global register variable. Only %rsp is supported (the kernel's current_stack_pointer): a local helper in
+the inline-asm side file returns the caller's stack pointer as it was at the call, which is the value of %rsp at that
+point of the caller.
+*/
+static struct value *
+funcregvar(struct func *f, struct decl *d)
+{
+	static bool emitted;
+	static struct value fn = {.kind = VALUE_GLOBAL, .u.name = "nfcxx_read_rsp"};
+
+	if (strcmp(d->regvar, "rsp") != 0)
+		error(&tok.loc, "global register variable '%s' in %%%s: only %%rsp is supported", d->name, d->regvar);
+	if (!asmout)
+		error(&tok.loc, "global register variable '%s' needs the inline-asm side file (-a)", d->name);
+	if (!emitted) {
+		fputs("#nfcxx:keep\n\t.text\n\t.p2align 4\nnfcxx_read_rsp:\n\tleaq 8(%rsp), %rax\n\tret\n", asmout);
+		emitted = true;
+	}
+	return funcinst(f, ICALL, 'l', &fn, NULL);
+}
+
+/*
+__builtin_return_address(0) and __builtin_frame_address(0): a call of a local helper in the inline-asm side file. The
+caller is then no leaf, and QBE gives every function that is not a leaf a frame pointer (push %rbp; mov %rsp, %rbp), so
+the helper finds the caller's frame in %rbp and its return address at 8(%rbp).
+*/
+/* the type a parameter is passed as: a GNU transparent union as its first member */
+static struct type *
+abiparam(struct type *t)
+{
+	if (t->kind == TYPEUNION && t->u.structunion.transparent)
+		return t->u.structunion.members->type;
+	return t;
+}
+
+/*
+A construct of a function body that cproc can only refuse, found while generating code (the parse goes on). Under
+cproc -p it is deferred like an asm refusal (funcasm): kept with the block, and reported only if the block can be
+reached and pruning keeps the function -- the kernel's headers have static inline helpers nothing calls.
+*/
+static void
+funcrefuse(struct func *f, const char *fmt, ...)
+{
+	va_list ap;
+	char body[400], msg[512];
+
+	va_start(ap, fmt);
+	vsnprintf(body, sizeof body, fmt, ap);
+	va_end(ap);
+	if (!prune)
+		error(&tok.loc, "%s", body);
+	snprintf(msg, sizeof msg, "%s:%zu:%zu: error: %s", tok.loc.file, tok.loc.line, tok.loc.col, body);
+	if (!f->end->lazyerror && !f->end->jump.kind) {
+		f->end->lazyerror = xmalloc(strlen(msg) + 1);
+		strcpy(f->end->lazyerror, msg);
+	}
+}
+
+static struct value *
+funcframeinfo(struct func *f, bool ret)
+{
+	static bool emitted[2];
+	static struct value fn[2] = {
+		{.kind = VALUE_GLOBAL, .u.name = "nfcxx_frame_address"},
+		{.kind = VALUE_GLOBAL, .u.name = "nfcxx_return_address"},
+	};
+
+	if (!asmout || strcmp(targ->name, "x86_64-sysv") != 0)
+		error(&tok.loc, "__builtin_%s_address is only supported on x86_64 ELF (the inline-asm side file, -a)", ret ? "return" : "frame");
+	if (!emitted[ret]) {
+		fprintf(asmout, "#nfcxx:keep\n\t.text\n\t.p2align 4\n%s:\n\t%s\n\tret\n", fn[ret].u.name,
+			ret ? "movq 8(%rbp), %rax" : "movq %rbp, %rax");
+		emitted[ret] = true;
+	}
+	return funcinst(f, ICALL, 'l', &fn[ret], NULL);
 }
 
 static struct lvalue
@@ -1923,6 +2158,8 @@ funclval(struct func *f, struct expr *e)
 		d = e->u.ident.decl;
 		if (d->kind != DECLOBJECT && d->kind != DECLFUNC)
 			error(&tok.loc, "identifier '%s' is not an object or function", d->name);
+		if (d->kind == DECLOBJECT && d->regvar && d->u.obj.storage != SDAUTO)
+			error(&tok.loc, "global register variable '%s' cannot be assigned or have its address taken", d->name);
 		if (d == f->namedecl) {
 			fputs("data ", stdout);
 			emitname(d->value);
@@ -1964,6 +2201,18 @@ funcbranch(struct func *f, struct expr *e, struct block *bt, struct block *bf)
 	struct value *v;
 	struct block *b;
 
+	/* a condition that folds to a constant (the kernel's udelay: if ((10) / 20000 >= 1) __bad_udelay();) is a jump:
+	 * the other way is unreachable, and neither cproc's asm thunks nor QBE keep code that only it reaches -- gcc
+	 * never emits that call, whose symbol may not exist */
+	if (!(e->type->prop & PROPSOFT)) {
+		struct expr *c = eval(e);
+
+		if (c->kind == EXPRCONST && c->type->prop & PROPINT) {
+			funcjmp(f, c->u.constant.u ? bt : bf);
+			return mkintconst(c->u.constant.u);
+		}
+		e = c;
+	}
 	/* Maybe we we could do something for EXPRCOND as well. */
 	switch (e->kind) {
 	case EXPRBINARY:
@@ -2163,6 +2412,141 @@ funcvalistaddr(struct func *f, struct expr *e)
 	return funcexpr(f, e);
 }
 
+/*
+GNU __builtin_{add,sub,mul}_overflow(a, b, r) for any mix of integer types up to 64 bits: the exact result is computed
+as a sign and a 128-bit magnitude (as GCC defines it, infinite precision), wrapped into *r, and the flag says whether
+*r cannot hold it. The algorithm is __nfcxx_ovx of scripts/qbe-prep.rb, with its branches as masks; the operands'
+signedness is known here, so it is straight-line code.
+*/
+static struct value *
+ovl(struct func *f, int op, struct value *x, struct value *y)
+{
+	return funcinst(f, op, 'l', x, y);
+}
+
+static struct value *
+ovcmp(struct func *f, int op, struct value *x, struct value *y)   /* 0 or 1, as a long */
+{
+	return funcinst(f, IEXTUW, 'l', funcinst(f, op, 'w', x, y), NULL);
+}
+
+/*
+The bit-counting built-ins, branch-free (QBE has no bit-count instructions): a population count by halves (the SWAR
+sum, gathered by a multiply), and the others reduced to it -- ctz(x) = popcount((x & -x) - 1), clz(x) = width -
+popcount(x with every bit below its top bit set), ffs(x) = popcount(x ^ (x - 1)) when x is not zero, parity the low
+bit of the count. clz and ctz of zero are the width.
+*/
+static struct value *
+funcpopcount(struct func *f, int class, struct value *x)
+{
+	bool l = class == 'l';
+	unsigned long long m1 = 0x5555555555555555ull, m2 = 0x3333333333333333ull, m4 = 0x0f0f0f0f0f0f0f0full, h = 0x0101010101010101ull;
+	struct value *t;
+
+	if (!l)
+		m1 &= 0xffffffff, m2 &= 0xffffffff, m4 &= 0xffffffff, h &= 0xffffffff;
+	t = funcinst(f, IAND, class, funcinst(f, ISHR, class, x, mkintconst(1)), mkintconst(m1));
+	x = funcinst(f, ISUB, class, x, t);
+	t = funcinst(f, IAND, class, funcinst(f, ISHR, class, x, mkintconst(2)), mkintconst(m2));
+	x = funcinst(f, IADD, class, funcinst(f, IAND, class, x, mkintconst(m2)), t);
+	x = funcinst(f, IAND, class, funcinst(f, IADD, class, x, funcinst(f, ISHR, class, x, mkintconst(4))), mkintconst(m4));
+	return funcinst(f, ISHR, class, funcinst(f, IMUL, class, x, mkintconst(h)), mkintconst(l ? 56 : 24));
+}
+
+static struct value *
+funcbitcount(struct func *f, struct expr *e)
+{
+	int kind = e->u.builtin.kind, class = e->base->type->size == 8 ? 'l' : 'w', w = class == 'l' ? 64 : 32, k;
+	struct value *x = funcexpr(f, e->base), *t, *r;
+
+	switch (kind) {
+	case BUILTINCLZ: case BUILTINCLZL:
+		for (k = 1; k < w; k *= 2)
+			x = funcinst(f, IOR, class, x, funcinst(f, ISHR, class, x, mkintconst(k)));
+		r = funcinst(f, ISUB, class, mkintconst(w), funcpopcount(f, class, x));
+		break;
+	case BUILTINCTZ: case BUILTINCTZL:
+		t = funcinst(f, IAND, class, x, funcinst(f, INEG, class, x, NULL));
+		r = funcpopcount(f, class, funcinst(f, ISUB, class, t, mkintconst(1)));
+		break;
+	case BUILTINFFS: case BUILTINFFSL:
+		t = funcinst(f, IXOR, class, x, funcinst(f, ISUB, class, x, mkintconst(1)));
+		r = funcpopcount(f, class, t);
+		t = funcinst(f, class == 'l' ? ICNEL : ICNEW, class, x, mkintconst(0));
+		r = funcinst(f, IMUL, class, r, t);
+		break;
+	default:
+		r = funcpopcount(f, class, x);
+		if (kind == BUILTINPARITY || kind == BUILTINPARITYL)
+			r = funcinst(f, IAND, class, r, mkintconst(1));
+	}
+	return r;   /* a long result is read as its low word, the int */
+}
+
+static struct value *
+funcoverflow(struct func *f, struct expr *e)
+{
+	struct expr *ae = e->base, *be = ae->next, *re = be->next;
+	struct type *rt = re->type->base;
+	bool as = ae->type->u.arith.issigned, bs = be->type->u.arith.issigned, rs = rt->u.arith.issigned;
+	struct value *ua, *ub, *rp, *ma, *mb, *an, *bn, *am, *bm, *lo, *hi, *neg, *out, *zero = mkintconst(0), *v;
+	struct value *flag, *rest;
+	unsigned w = rt->size * 8;
+
+	ua = convert(f, as ? &typelong : &typeulong, ae->type, funcexpr(f, ae));
+	ub = convert(f, bs ? &typelong : &typeulong, be->type, funcexpr(f, be));
+	rp = funcexpr(f, re);
+	/* sign masks (all ones for a negative operand) and magnitudes */
+	ma = as ? ovl(f, ISAR, ua, mkintconst(63)) : zero;
+	mb = bs ? ovl(f, ISAR, ub, mkintconst(63)) : zero;
+	an = ovl(f, IAND, ma, mkintconst(1));
+	bn = ovl(f, IAND, mb, mkintconst(1));
+	am = ovl(f, ISUB, ovl(f, IXOR, ua, ma), ma);
+	bm = ovl(f, ISUB, ovl(f, IXOR, ub, mb), mb);
+	if (e->u.builtin.kind == BUILTINMULOVERFLOW) {
+		struct value *m32 = mkintconst(0xffffffff), *s32 = mkintconst(32);
+		struct value *a0 = ovl(f, IAND, am, m32), *a1 = ovl(f, ISHR, am, s32);
+		struct value *b0 = ovl(f, IAND, bm, m32), *b1 = ovl(f, ISHR, bm, s32);
+		struct value *p00 = ovl(f, IMUL, a0, b0), *p01 = ovl(f, IMUL, a0, b1);
+		struct value *p10 = ovl(f, IMUL, a1, b0), *p11 = ovl(f, IMUL, a1, b1), *mid;
+
+		mid = ovl(f, IADD, ovl(f, IADD, ovl(f, ISHR, p00, s32), ovl(f, IAND, p01, m32)), ovl(f, IAND, p10, m32));
+		lo = ovl(f, IOR, ovl(f, IAND, p00, m32), ovl(f, ISHL, mid, s32));
+		hi = ovl(f, IADD, ovl(f, IADD, p11, ovl(f, ISHR, p01, s32)), ovl(f, IADD, ovl(f, ISHR, p10, s32), ovl(f, ISHR, mid, s32)));
+		neg = ovl(f, IXOR, an, bn);
+	} else {
+		struct value *s, *sum, *carry, *d, *borrow, *mk, *absd, *ms;
+
+		if (e->u.builtin.kind == BUILTINSUBOVERFLOW)
+			bn = ovl(f, IXOR, bn, mkintconst(1));   /* a - b is a + (-b) */
+		s = ovl(f, IXOR, an, bn);                    /* the signs differ: a magnitude difference */
+		sum = ovl(f, IADD, am, bm);
+		carry = ovcmp(f, ICULTL, sum, am);
+		d = ovl(f, ISUB, am, bm);
+		borrow = ovcmp(f, ICULTL, am, bm);
+		mk = ovl(f, ISUB, zero, borrow);
+		absd = ovl(f, ISUB, ovl(f, IXOR, d, mk), mk);
+		ms = ovl(f, ISUB, zero, s);
+		lo = ovl(f, IOR, ovl(f, IAND, absd, ms), ovl(f, IAND, sum, ovl(f, IXOR, ms, mkintconst(-1))));
+		hi = ovl(f, IAND, carry, ovl(f, IXOR, s, mkintconst(1)));
+		neg = ovl(f, IXOR, an, ovl(f, IAND, s, borrow));   /* the larger magnitude's sign when they differ */
+	}
+	neg = ovl(f, IAND, neg, ovcmp(f, ICNEL, ovl(f, IOR, hi, lo), zero));   /* zero is not negative */
+	v = ovl(f, ISUB, zero, neg);
+	out = ovl(f, ISUB, ovl(f, IXOR, lo, v), v);
+	funcstore(f, rt, re->type->qual, (struct lvalue){.addr = rp}, convert(f, rt, &typeulong, out));
+	/* overflow: a high half, or a magnitude out of the result type's range */
+	if (rs) {
+		rest = ovcmp(f, ICUGTL, lo, ovl(f, IADD, mkintconst((1ull << (w - 1)) - 1), neg));
+	} else {
+		rest = neg;
+		if (w < 64)
+			rest = ovl(f, IOR, rest, ovcmp(f, ICNEL, ovl(f, ISHR, lo, mkintconst(w)), zero));
+	}
+	flag = ovl(f, IOR, ovcmp(f, ICNEL, hi, zero), rest);
+	return funcinst(f, ICNEL, 'w', flag, zero);
+}
+
 struct value *
 funcexpr(struct func *f, struct expr *e)
 {
@@ -2181,10 +2565,20 @@ funcexpr(struct func *f, struct expr *e)
 
 	calcvla(f, e->type);
 	switch (e->kind) {
+	case EXPRSTMT:
+		if (e->u.stmt.done)
+			fatal("internal error: statement expression evaluated twice");
+		e->u.stmt.done = true;
+		funcjmp(f, e->u.stmt.first);
+		f->end->next = e->u.stmt.first;
+		f->end = e->u.stmt.last;
+		return e->base ? funcexpr(f, e->base) : NULL;
 	case EXPRIDENT:
 		d = e->u.ident.decl;
+		if (d->kind == DECLOBJECT && d->regvar && d->u.obj.storage != SDAUTO)
+			return funcregvar(f, d);
 		switch (d->kind) {
-		case DECLOBJECT: return funcload(f, e->type, (struct lvalue){d->value});
+		case DECLOBJECT: return funcloadq(f, e->type, e->qual | d->qual, (struct lvalue){d->value});
 		case DECLCONST:  return d->value;
 		default:
 			fatal("unimplemented declaration kind %d", d->kind);
@@ -2206,19 +2600,13 @@ funcexpr(struct func *f, struct expr *e)
 		if (t->kind == TYPEFLOAT16)
 			return mkintconst(halfbits(e->u.constant.f));
 		return mkfltconst(t->size == 4 ? VALUE_FLTCONST : VALUE_DBLCONST, e->u.constant.f);
-	case EXPRSTMT:
-		if (e->u.stmt.spliced)
-			fatal("statement expression evaluated twice");
-		e->u.stmt.spliced = true;
-		funcsplice(f, &e->u.stmt.chain);
-		return e->u.stmt.value;
 	case EXPRBITFIELD:
 	case EXPRCOMPOUND:
 		lval = funclval(f, e);
-		return funcload(f, e->type, lval);
+		return funcloadq(f, e->type, e->qual, lval);
 	case EXPRINCDEC:
 		lval = funclval(f, e->base);
-		l = funcload(f, e->base->type, lval);
+		l = funcloadq(f, e->base->type, e->base->qual, lval);
 		t = e->type;
 		if (t->prop & PROPSOFT) {
 			/* the old value is copied out first: the store overwrites the object that l addresses */
@@ -2239,10 +2627,11 @@ funcexpr(struct func *f, struct expr *e)
 			return e->u.incdec.post ? l : v;
 		}
 		if (t->kind == TYPEPOINTER) {
-			if (t->base->kind == TYPEARRAY && t->base->size == 0) {
+			if (t->base->kind == TYPEARRAY && t->base->size == 0 && t->base->prop & PROPVM) {
 				r = t->base->u.array.size;
 			} else {
-				r = mkintconst(t->base->size);
+				/* GNU C: a void or function pointer steps by 1 */
+				r = mkintconst(t->base->kind == TYPEVOID || t->base->kind == TYPEFUNC ? 1 : t->base->size);
 			}
 		} else if (t->prop & PROPINT) {
 			r = mkintconst(1);
@@ -2263,6 +2652,8 @@ funcexpr(struct func *f, struct expr *e)
 			callee = callee->base;  /* a function designator, decayed to a pointer */
 		if (callee->kind == EXPRIDENT && callee->u.ident.decl->kind == DECLFUNC && (e->type->kind == TYPEFLOAT128 || anyf128arg(e)))
 			addf128call(callee->u.ident.decl);
+		if (e->base->type->base->u.func.abi)
+			funcrefuse(f, "call of a function with the %s calling convention is not supported", e->base->type->base->u.func.abi);
 		argvals = xreallocarray(NULL, e->u.call.nargs, sizeof(argvals[0]));
 		for (arg = e->u.call.args, i = 0; arg; arg = arg->next, ++i) {
 			emittype(arg->type);
@@ -2277,7 +2668,10 @@ funcexpr(struct func *f, struct expr *e)
 			v = softtemp(f);
 			funcinst(f, ICALL, 0, funcexpr(f, e->base), NULL);
 		} else {
-			v = funcinst(f, ICALL, abiclass(t), funcexpr(f, e->base), t->value);
+			/* a direct call of an extern gnu_inline function goes to its body (decl.c, mkinlinealias) */
+			struct value *fv = callee->kind == EXPRIDENT && callee->u.ident.decl->kind == DECLFUNC &&
+				callee->u.ident.decl->u.func.inlinealias ? callee->u.ident.decl->u.func.inlinealias : funcexpr(f, e->base);
+			v = funcinst(f, ICALL, abiclass(t), fv, t->value);
 		}
 		functype = e->base->type->base;
 		for (arg = e->u.call.args, i = 0; arg; arg = arg->next, ++i) {
@@ -2310,7 +2704,7 @@ funcexpr(struct func *f, struct expr *e)
 			return lval.addr;
 		case TMUL:
 			r = funcexpr(f, e->base);
-			return funcload(f, e->type, (struct lvalue){r});
+			return funcloadq(f, e->type, e->qual, (struct lvalue){r});
 		case TSUB:
 			r = funcexpr(f, e->base);
 			if (e->type->prop & PROPSOFT)
@@ -2472,6 +2866,35 @@ funcexpr(struct func *f, struct expr *e)
 		return funcexpr(f, e);
 	case EXPRBUILTIN:
 		switch (e->u.builtin.kind) {
+		case BUILTINADDOVERFLOW:
+		case BUILTINSUBOVERFLOW:
+		case BUILTINMULOVERFLOW:
+			return funcoverflow(f, e);
+		case BUILTINBSWAP16:
+		case BUILTINBSWAP32:
+		case BUILTINBSWAP64: {
+			/* QBE has no byte swap: the bytes moved one by one with shifts and masks */
+			int bytes = e->type->size, k, class = bytes == 8 ? 'l' : 'w';
+			struct value *x = funcexpr(f, e->base), *acc = NULL, *b;
+
+			for (k = 0; k < bytes; ++k) {
+				b = k ? funcinst(f, ISHR, class, x, mkintconst(8 * k)) : x;
+				b = funcinst(f, IAND, class, b, mkintconst(0xff));
+				if (bytes - 1 - k)
+					b = funcinst(f, ISHL, class, b, mkintconst(8 * (bytes - 1 - k)));
+				acc = acc ? funcinst(f, IOR, class, acc, b) : b;
+			}
+			return acc;
+		}
+		case BUILTINCLZ: case BUILTINCLZL:
+		case BUILTINCTZ: case BUILTINCTZL:
+		case BUILTINFFS: case BUILTINFFSL:
+		case BUILTINPARITY: case BUILTINPARITYL:
+		case BUILTINPOPCOUNT: case BUILTINPOPCOUNTL:
+			return funcbitcount(f, e);
+		case BUILTINRETURNADDRESS:
+		case BUILTINFRAMEADDRESS:
+			return funcframeinfo(f, e->u.builtin.kind == BUILTINRETURNADDRESS);
 		case BUILTINVASTART:
 			l = funcvalistaddr(f, e->base);
 			funcinst(f, IVASTART, 0, l, NULL);
@@ -2601,6 +3024,107 @@ ehcleanupobj(struct func *f, struct decl *d)
 	o->addr = d->value;
 }
 
+/*
+cproc -G: GNU C's cleanup attribute (the Linux kernel's guard() and scoped_guard()): f(&object) runs when the object
+leaves its scope -- at the end of the block, and at a return, break, continue or goto that leaves it -- the last
+declared first, as gcc does without -fexceptions (no unwind tables, no landing pads). The function keeps the
+objects live at each point (cleanups); a goto jumps to a block of its own whose cleanups are made after the body,
+when the label's live objects are known (funcgotoflush). Without -G, nfcxx's EDG-made C keeps its own meaning:
+the cleanups run only when a throw unwinds the function (ehcleanupobj).
+*/
+bool gnucleanup;
+
+struct cleangoto {
+	struct block *trampoline;
+	struct gotolabel *label;
+	struct array live;   /* struct ehobj: the cleanup objects live at the goto */
+};
+
+size_t
+funccleanmark(struct func *f)
+{
+	return f->cleanups.len / sizeof(struct ehobj);
+}
+
+static void
+cleancalls(struct func *f, struct ehobj *o, size_t from, size_t to)
+{
+	while (to-- > from) {
+		funcinst(f, ICALL, 0, o[to].fn, NULL);
+		funcinst(f, IARG, ptrclass, o[to].addr, NULL);
+	}
+}
+
+void
+funccleanleave(struct func *f, size_t mark)
+{
+	if (!f->end->jump.kind)
+		cleancalls(f, f->cleanups.val, mark, funccleanmark(f));
+}
+
+void
+funccleanpop(struct func *f, size_t mark)
+{
+	funccleanleave(f, mark);
+	f->cleanups.len = mark * sizeof(struct ehobj);
+}
+
+struct block *
+funcgototarget(struct func *f, struct gotolabel *g)
+{
+	struct cleangoto *c;
+
+	if (!gnucleanup)
+		return g->label;
+	c = arrayadd(&f->cleangotos, sizeof(*c));
+	c->trampoline = mkblock("goto_cleanup");
+	c->label = g;
+	c->live = (struct array){0};
+	if (f->cleanups.len)
+		arrayaddbuf(&c->live, f->cleanups.val, f->cleanups.len);
+	return c->trampoline;
+}
+
+void
+funclabeldefined(struct func *f, struct gotolabel *g)
+{
+	if (!gnucleanup)
+		return;
+	g->cleanat.len = 0;
+	if (f->cleanups.len)
+		arrayaddbuf(&g->cleanat, f->cleanups.val, f->cleanups.len);
+}
+
+void
+funcgotoflush(struct func *f)
+{
+	struct cleangoto *c;
+	struct block *cont;
+	size_t n, k, nl;
+
+	if (!f->cleangotos.len)
+		return;
+	/* the body's last block keeps falling through to the end of the function, past the gotos' blocks */
+	cont = mkblock("goto_end");
+	funcjmp(f, cont);
+	arrayforeach(&f->cleangotos, c) {
+		struct ehobj *live = c->live.val, *at = c->label->cleanat.val;
+
+		if (!c->label->defined)
+			continue;
+		n = c->live.len / sizeof(struct ehobj);
+		nl = c->label->cleanat.len / sizeof(struct ehobj);
+		for (k = 0; k < n && k < nl && live[k].addr == at[k].addr; ++k)
+			;
+		if (k < nl)
+			error(&tok.loc, "a jump into the scope of an object with a cleanup attribute is not supported");
+		funclabel(f, c->trampoline);
+		cleancalls(f, live, k, n);
+		funcjmp(f, c->label->label);
+	}
+	funclabel(f, cont);
+}
+
 void
 funcinit(struct func *func, struct decl *d, struct init *init, bool hasinit)
 {
@@ -2609,9 +3133,17 @@ funcinit(struct func *func, struct decl *d, struct init *init, bool hasinit)
 	unsigned long long offset = 0, max = 0;
 	size_t i, w;
 
-	funcalloc(func, d);
-	if (d->u.obj.cleanup)
+	if (!d->value)   /* allocated before its initializer was parsed (decl.c) */
+		funcalloc(func, d);
+	if (d->u.obj.cleanup && gnucleanup) {
+		struct ehobj *o = arrayadd(&func->cleanups, sizeof(*o));
+
+		o->cleanup = d->u.obj.cleanup;
+		o->fn = d->u.obj.cleanupfn->value;
+		o->addr = d->value;
+	} else if (d->u.obj.cleanup) {
 		ehcleanupobj(func, d);
+	}
 	if (!hasinit)
 		return;
 	for (; init; init = init->next) {
@@ -2660,7 +3192,7 @@ casesearch(struct func *f, int class, struct value *v, struct switchcase *c, str
 		funcjmp(f, defaultlabel);
 		return;
 	}
-	if (min == max) {
+	if (c->node.key <= min && c->hi >= max) {   /* every value still possible is this case's */
 		funcjmp(f, c->body);
 		return;
 	}
@@ -2669,7 +3201,12 @@ casesearch(struct func *f, int class, struct value *v, struct switchcase *c, str
 	label[2] = mkblock("switch_gt");
 
 	key = mkintconst(c->node.key);
-	res = funcinst(f, class == 'w' ? ICEQW : ICEQL, 'w', v, key);
+	if (c->hi == c->node.key) {
+		res = funcinst(f, class == 'w' ? ICEQW : ICEQL, 'w', v, key);
+	} else {   /* lo <= v <= hi, as v - lo <= hi - lo unsigned */
+		res = funcinst(f, ISUB, class, v, key);
+		res = funcinst(f, class == 'w' ? ICULEW : ICULEL, 'w', res, mkintconst(c->hi - c->node.key));
+	}
 	funcjnz(f, res, NULL, c->body, label[0]);
 	funclabel(f, label[0]);
 	res = funcinst(f, class == 'w' ? ICULTW : ICULTL, 'w', v, key);
@@ -2677,13 +3214,36 @@ casesearch(struct func *f, int class, struct value *v, struct switchcase *c, str
 	funclabel(f, label[1]);
 	casesearch(f, class, v, c->node.child[0], defaultlabel, min, c->node.key - 1);
 	funclabel(f, label[2]);
-	casesearch(f, class, v, c->node.child[1], defaultlabel, c->node.key + 1, max);
+	casesearch(f, class, v, c->node.child[1], defaultlabel, c->hi + 1, max);
+}
+
+/* the case of a constant controlling value, by the test casesearch makes (v - lo <= hi - lo, in the class's width) */
+static struct switchcase *
+casefind(struct switchcase *c, unsigned long long v, unsigned long long mask)
+{
+	struct switchcase *r;
+
+	if (!c)
+		return NULL;
+	if ((v - c->node.key & mask) <= (c->hi - c->node.key & mask))
+		return c;
+	if ((r = casefind(c->node.child[0], v, mask)))
+		return r;
+	return casefind(c->node.child[1], v, mask);
 }
 
 void
 funcswitch(struct func *f, struct value *v, struct switchcases *c, struct block *defaultlabel)
 {
-	casesearch(f, qbetype(c->type).base, v, c->root, defaultlabel, 0, -1);
+	int class = qbetype(c->type).base;
+
+	if (v->kind == VALUE_INTCONST) {   /* switch (sizeof(*ptr)): straight to the case, the others unreachable */
+		struct switchcase *k = casefind(c->root, v->u.i, class == 'w' ? 0xffffffffull : -1ull);
+
+		funcjmp(f, k ? k->body : defaultlabel);
+		return;
+	}
+	casesearch(f, class, v, c->root, defaultlabel, 0, -1);
 }
 
 /*
@@ -2695,6 +3255,7 @@ inline asm. x86_64 only, a deliberately small constraint subset; everything else
 */
 FILE *asmout;
 static unsigned asmthunkid;
+static void emitname(struct value *);
 
 /* x86_64 general registers, by size: [reg][0]=8, [1]=4, [2]=2, [3]=1 byte */
 enum { RAX, RCX, RDX, RBX, RSI, RDI, RBP, RSP, R8, R9, R10, R11, R12, R13, R14, R15 };
@@ -2708,6 +3269,30 @@ static const char *const regname[16][4] = {
 };
 /* caller-saved GP registers offered to a plain "r" operand (rdi is used only transiently for the slot pointer) */
 static const int rpool[] = {RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11};
+
+/*
+The register of an operand the constraint leaves to the compiler: a caller-saved one from the pool, else -- every one
+is taken, as by the kernel's call_on_stack(), whose asm clobbers them all for the call it makes -- a callee-saved one,
+which the thunk preserves; one is left for the thunk's slot pointer.
+*/
+static int
+asmpoolreg(const bool *used, unsigned *pool)
+{
+	static const int callee[] = {R12, R13, R14, R15, RBX};
+	unsigned k, nfree = 0;
+
+	while (*pool < countof(rpool) && used[rpool[*pool]])
+		++*pool;
+	if (*pool < countof(rpool))
+		return rpool[(*pool)++];
+	for (k = 0; k < countof(callee); ++k)
+		nfree += !used[callee[k]];
+	if (nfree < 2)
+		error(&tok.loc, "too many register asm operands");
+	for (k = 0; used[callee[k]]; ++k)
+		;
+	return callee[k];
+}
 static int
 regsizecol(int sz)
 {
@@ -2747,15 +3332,29 @@ clobberreg(const char *name)
 struct asmrec {
 	int reg;      /* register index, or -1 for an immediate */
 	int size;     /* operand size in bytes (1,2,4,8) */
+	int feedsize; /* a tied input wider than its output: the bytes the thunk loads into the register (0: size) */
 	long slot;    /* byte offset of this operand's slot, or -1 (immediate, or tied: shares another's) */
 	bool feed;    /* the thunk loads this operand from its slot on entry */
 	bool prestore;/* the caller stores a value into this operand's slot before the call ("+" outputs and inputs) */
 	bool back;    /* the thunk stores this operand to its slot on exit, and the caller reads it back */
+	bool pseudo;  /* the %rsp register variable (ASM_CALL_CONSTRAINT): named in the template, never moved */
+	bool mem;     /* a memory operand: the slot and the register carry the object's address; %N is (reg) */
+	const char *flag;  /* a flag output "=@ccCOND": the condition, set from the flags right after the template */
+	char *immsym; /* an immediate that is a symbol's address (plus imm): "i"(&x), "i"(f) */
 	long imm;     /* immediate value, when reg == -1 */
 	struct expr *expr;
 	struct lvalue lval;   /* an output's destination (outputs only) */
 	char *symname;
 };
+
+/* the register variable an asm operand names (register T x asm("REG")), or null */
+static struct decl *
+asmregvar(struct expr *e)
+{
+	if (e->kind == EXPRIDENT && e->u.ident.decl->kind == DECLOBJECT && e->u.ident.decl->regvar)
+		return e->u.ident.decl;
+	return NULL;
+}
 
 /* operand size from a type: scalars up to 8 bytes; anything else is refused */
 static int
@@ -2782,6 +3381,86 @@ asmconstraintbody(const char *c, bool *isout, bool *inout)
 	return c;
 }
 
+/* the assembler name of a global value, as emitname spells it in the IL (without the sigil or the quotes) */
+static char *
+asmglobalname(struct value *v)
+{
+	size_t n = strlen(v->u.name) + 32;
+	char *s = xmalloc(n);
+
+	if (v->id)
+		snprintf(s, n, ".L%s.%u", v->u.name, v->id);
+	else
+		snprintf(s, n, "%s", v->u.name);
+	return s;
+}
+
+static bool
+asmimmfits(const char *alt, long long v)
+{
+	const char *c;
+
+	for (c = alt; *c; ++c) {
+		switch (*c) {
+		case 'i': case 'n': case 'g': return true;
+		case 'I': if (v >= 0 && v <= 31) return true; break;
+		case 'J': if (v >= 0 && v <= 63) return true; break;
+		case 'K': if (v >= -128 && v <= 127) return true; break;
+		case 'L': if (v == 0xff || v == 0xffff || v == 0xffffffffLL) return true; break;
+		case 'M': if (v >= 0 && v <= 3) return true; break;
+		case 'N': if (v >= 0 && v <= 255) return true; break;
+		case 'e': if (v >= -0x80000000LL && v <= 0x7fffffffLL) return true; break;
+		case 'Z': if (v >= 0 && v <= 0xffffffffLL) return true; break;
+		}
+	}
+	return false;
+}
+
+/*
+Whether an asm input is an immediate the constraint letters accept, filling in rec: an integer constant within the
+letters' ranges, or the address of a function or static object ("i" and "s": the kernel's "i"(&symbol), "i"(func)).
+A symbol named only here is kept alive under cproc -p by an IL comment in the function (asmrefs) that references it.
+*/
+static struct block *asmblock;   /* the block of the asm statement being lowered (funcasm) */
+
+static bool
+asmimm(struct expr *e, const char *alt, struct asmrec *rec)
+{
+	struct expr *c = eval(e);
+	struct decl *d;
+	long off = 0;
+
+	if (c->kind == EXPRCONST && c->type->prop & PROPINT) {
+		if (!asmimmfits(alt, c->u.constant.i))
+			return false;
+		rec->imm = c->u.constant.i;
+		return true;
+	}
+	if (!strpbrk(alt, "isgp"))
+		return false;
+	while (c->kind == EXPRCAST)
+		c = c->base;
+	/* a symbol plus a byte offset (eval folds &s.member and &a[2] to &s + C): the kernel's "p"(&pcpu_hot.current_task) */
+	if (c->kind == EXPRBINARY && c->op == TADD && c->type->kind == TYPEPOINTER && c->u.binary.r->kind == EXPRCONST) {
+		off = c->u.binary.r->u.constant.i;
+		for (c = c->u.binary.l; c->kind == EXPRCAST; c = c->base)
+			;
+	}
+	if (c->kind == EXPRUNARY && c->op == TBAND)
+		c = c->base;
+	if (c->decayed)
+		c = c->base;
+	if (c->kind != EXPRIDENT)
+		return false;
+	d = c->u.ident.decl;
+	if (!(d->kind == DECLFUNC || d->kind == DECLOBJECT && d->u.obj.storage != SDAUTO && !d->regvar) || !d->value)
+		return false;
+	rec->immsym = asmglobalname(d->value);
+	rec->imm = off;
+	arrayaddptr(&asmblock->asmrefs, d->value);   /* kept alive by the function, not by the file (cproc -p) */
+	return true;
+}
+
 /* substitute one operand reference into the thunk, given its already-parsed modifier and index */
 static void
 asmsubst(struct asmrec *rec, unsigned total, int mod, unsigned idx)
@@ -2791,9 +3470,30 @@ asmsubst(struct asmrec *rec, unsigned total, int mod, unsigned idx)
 	if (idx >= total)
 		error(&tok.loc, "asm operand index out of range");
 	r = &rec[idx];
+	if (r->immsym) {   /* a symbol's address; %a addresses it, rip-relative as gcc writes it */
+		switch (mod) {
+		case 'c': case 'P': case 'p': case 'a': break;
+		case 0:   fputc('$', asmout); break;
+		default:  error(&tok.loc, "unsupported asm operand modifier '%%%c' on a symbol", mod);
+		}
+		fprintf(asmout, "%s", r->immsym);
+		if (r->imm)
+			fprintf(asmout, "%+ld", r->imm);
+		if (mod == 'a')
+			fputs("(%rip)", asmout);
+		return;
+	}
+	if (r->mem) {   /* memory: the object's address is in the register; P changes only a symbol */
+		switch (mod) {
+		case 0: case 'a': case 'b': case 'w': case 'k': case 'q': case 'P':
+			fprintf(asmout, "(%%%s)", regname[r->reg][0]);
+			return;
+		}
+		error(&tok.loc, "unsupported asm operand modifier '%%%c' on a memory operand", mod);
+	}
 	if (r->reg < 0) {   /* immediate */
 		switch (mod) {
-		case 'c': fprintf(asmout, "%ld", r->imm); break;
+		case 'c': case 'P': case 'p': fprintf(asmout, "%ld", r->imm); break;   /* bare, as gcc prints them */
 		case 'n': fprintf(asmout, "$%ld", -r->imm); break;
 		default:  fprintf(asmout, "$%ld", r->imm); break;
 		}
@@ -2804,14 +3504,24 @@ asmsubst(struct asmrec *rec, unsigned total, int mod, unsigned idx)
 	case 'w': fprintf(asmout, "%%%s", regname[r->reg][2]); break;
 	case 'k': fprintf(asmout, "%%%s", regname[r->reg][1]); break;
 	case 'q': fprintf(asmout, "%%%s", regname[r->reg][0]); break;
+	case 'a': fprintf(asmout, "(%%%s)", regname[r->reg][0]); break;   /* the address in the register */
 	case 0:   fprintf(asmout, "%%%s", regname[r->reg][regsizecol(r->size)]); break;
 	default:  error(&tok.loc, "unsupported asm operand modifier '%%%c'", mod);
 	}
 }
 
-/* write the thunk body: template with %N / %[name] / %%/%= expanded */
+/* the label an asm goto template jumps to for its label j: a stub in the thunk (funcasm1) */
 static void
-asmtemplate(const char *t, struct asmrec *rec, unsigned total, char **names, unsigned expid)
+asmlabel(unsigned expid, unsigned j, unsigned nlab)
+{
+	if (j >= nlab)
+		error(&tok.loc, "asm goto label index out of range");
+	fprintf(asmout, ".Lnfcxx_goto_%u_%u", expid, j);
+}
+
+/* write the thunk body: template with %N / %[name] / %lN / %l[label] / %%/%= expanded */
+static void
+asmtemplate(const char *t, struct asmrec *rec, unsigned total, char **names, unsigned expid, char **labnames, unsigned nlab)
 {
 	const char *p;
 	unsigned i;
@@ -2841,6 +3551,14 @@ asmtemplate(const char *t, struct asmrec *rec, unsigned total, char **names, uns
 			buf[n] = 0;
 			if (*p != ']')
 				error(&tok.loc, "unterminated asm operand name");
+			if (mod == 'l') {   /* asm goto: %l[label] */
+				for (i = 0; i < nlab && strcmp(labnames[i], buf) != 0; ++i)
+					;
+				if (i == nlab)
+					error(&tok.loc, "unknown asm goto label '%%l[%s]'", buf);
+				asmlabel(expid, i, nlab);
+				continue;
+			}
 			for (i = 0; i < total; ++i)
 				if (names[i] && strcmp(names[i], buf) == 0)
 					break;
@@ -2855,17 +3573,22 @@ asmtemplate(const char *t, struct asmrec *rec, unsigned total, char **names, uns
 		while (isdigit((unsigned char)*p))
 			i = i * 10 + (*p++ - '0');
 		--p;
+		if (mod == 'l') {   /* asm goto: %lN counts the labels after the operands */
+			asmlabel(expid, i < total ? nlab : i - total, nlab);
+			continue;
+		}
 		asmsubst(rec, total, mod, i);
 	}
 }
 
-void
-funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, struct asmoperand *in, unsigned nin, char **clob, unsigned nclob, bool isvolatile)
+static void
+funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, struct asmoperand *in, unsigned nin, char **clob, unsigned nclob, bool isvolatile, struct gotolabel **labels, char **labnames, unsigned nlab)
 {
 	struct asmrec rec[32];
 	char *names[32];
 	bool used[16] = {0}, save[16] = {0};
 	unsigned total = nout + nin, i, j, pool = 0, expid;
+	long idxslot = -1;   /* asm goto: the slot cell the thunk writes the taken label to (0: none, j + 1: label j) */
 	long slotsize = 0;
 	int holder = -1, nsave, pad;
 	struct value *base, *addr, *v, *fn;
@@ -2884,8 +3607,11 @@ funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, s
 		struct asmoperand *op = i < nout ? &out[i] : &in[i - nout];
 		bool isout, inout;
 		int fr = fixedreg((unsigned char)*asmconstraintbody(op->constraint, &isout, &inout));
+		struct decl *rv = asmregvar(op->expr);
 		if (fr >= 0)
 			used[fr] = true;
+		if (rv && (fr = clobberreg(rv->regvar)) >= 0 && fr != RSP)
+			used[fr] = true;   /* a register variable's register is not offered to other operands */
 	}
 	for (i = 0; i < nclob; ++i) {
 		int r;
@@ -2912,6 +3638,10 @@ funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, s
 		rec[i].reg = -1;
 		rec[i].slot = -1;
 		rec[i].feed = rec[i].prestore = rec[i].back = false;
+		rec[i].pseudo = rec[i].mem = false;
+		rec[i].feedsize = 0;
+		rec[i].flag = NULL;
+		rec[i].immsym = NULL;
 		rec[i].imm = 0;
 		if (i < nout) {
 			if (!isout)
@@ -2922,6 +3652,27 @@ funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, s
 			error(&tok.loc, "asm input operand has an output constraint");
 		}
 
+		if (strncmp(body, "@cc", 3) == 0) {
+			/* x86 flag output (__GCC_ASM_FLAG_OUTPUTS__): a register the thunk fills with set<cond> */
+			static const char *const conds[] = {"a", "ae", "b", "be", "c", "e", "g", "ge", "l", "le", "na", "nae",
+				"nb", "nbe", "nc", "ne", "ng", "nge", "nl", "nle", "no", "np", "ns", "nz", "o", "p", "pe", "po", "s", "z"};
+			size_t k;
+
+			for (k = 0; k < countof(conds) && strcmp(body + 3, conds[k]); ++k)
+				;
+			if (i >= nout || k == countof(conds))
+				error(&tok.loc, "bad asm flag output constraint '%s'", op->constraint);
+			if (!(op->expr->type->prop & PROPINT))
+				error(&tok.loc, "asm flag output must have integer type");
+			rec[i].flag = body + 3;
+			rec[i].feed = rec[i].prestore = false;
+			rec[i].reg = asmpoolreg(used, &pool);
+			used[rec[i].reg] = true;
+			rec[i].size = asmopsize(op->expr->type);
+			rec[i].slot = slotsize;
+			slotsize += 8;
+			continue;
+		}
 		if (isdigit((unsigned char)*body)) {   /* a tied operand: shares a matching output */
 			unsigned m = 0;
 			while (isdigit((unsigned char)*body))
@@ -2931,41 +3682,94 @@ funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, s
 			rec[i].reg = rec[m].reg;
 			rec[i].size = asmopsize(op->expr->type);
 			rec[m].feed = true;   /* the thunk loads the tied value the input writes into the output's slot */
+			/* all of it: the kernel's put_user ties its user pointer to an int output, "=c"(ret) : "0"(ptr) */
+			if (rec[i].size > rec[m].size && rec[i].size > rec[m].feedsize)
+				rec[m].feedsize = rec[i].size;
 			continue;
 		}
-		if (*body == 'i' || *body == 'n' || *body == 'N') {   /* immediate */
-			struct expr *e;
-			if (i < nout)
-				error(&tok.loc, "immediate constraint on an asm output");
-			e = eval(op->expr);
-			if (e->kind != EXPRCONST || e->type->prop & PROPFLOAT)
-				error(&tok.loc, "asm immediate operand is not an integer constant");
-			rec[i].imm = e->u.constant.i;
-			rec[i].size = 8;
-			continue;   /* no register, no slot */
+		{
+			/* GNU constraint letters, first alternative only (operands' alternatives are separated by ','): a constant
+			 * goes to an immediate when an immediate letter allows it, as gcc chooses; then a register when any
+			 * register letter is present; then memory */
+			char alt[32];
+			size_t n = 0;
+			bool hasreg = false, hasmem = false, hasimm = false, anyreg = false;
+			const char *c;
+
+			for (c = body; *c && *c != ',' && n < sizeof alt - 1; ++c)
+				alt[n++] = *c;
+			alt[n] = 0;
+			fr = -1;
+			for (c = alt; *c; ++c) {
+				switch (*c) {
+				case 'r': case 'q': case 'Q': case 'R': case 'l': anyreg = hasreg = true; break;
+				case 'g': anyreg = hasreg = hasmem = hasimm = true; break;
+				/* an address: a symbol (plus an offset) as an immediate, otherwise the pointer in a register (%a) */
+				case 'p': anyreg = hasreg = hasimm = true; break;
+				case 'a': case 'b': case 'c': case 'd': case 'S': case 'D':
+					hasreg = true;
+					if (fr < 0)
+						fr = fixedreg((unsigned char)*c);
+					break;
+				case 'm': case 'o': case 'V': hasmem = true; break;
+				case 'i': case 'n': case 's': case 'I': case 'J': case 'K': case 'L': case 'M': case 'N': case 'e':
+				case 'Z': case 'E': case 'F': hasimm = true; break;
+				case '*': case '#': case '!': case '?': case '^': break;   /* register preference hints */
+				default:
+					error(&tok.loc, "unsupported asm constraint '%s'", op->constraint);
+				}
+			}
+			if (hasimm && i >= nout && asmimm(op->expr, alt, &rec[i])) {
+				rec[i].size = 8;
+				continue;   /* no register, no slot */
+			}
+			if (asmregvar(op->expr) && hasreg) {
+				/* a register variable takes its own register (GNU: "an operand in a register variable is in that register") */
+				fr = clobberreg(asmregvar(op->expr)->regvar);
+				if (fr < 0)
+					error(&tok.loc, "unknown register '%s' for register variable", asmregvar(op->expr)->regvar);
+				if (fr == RSP) {
+					/* the stack pointer (the kernel's ASM_CALL_CONSTRAINT "+r"(current_stack_pointer)): the template may
+					 * name it, but the thunk neither loads nor stores it -- the asm runs on the thunk's own stack */
+					rec[i].reg = RSP;
+					rec[i].size = 8;
+					rec[i].pseudo = true;
+					rec[i].feed = rec[i].prestore = rec[i].back = false;
+					continue;
+				}
+			} else if (hasreg) {
+				if (anyreg)
+					fr = -1;   /* a generic register class wins over a fixed letter in the same alternative */
+			} else if (hasmem) {
+				/* memory: the slot carries the object's address, which the thunk loads into a register; %N is (reg),
+				 * so the asm reads and writes the object itself and nothing is copied back */
+				rec[i].mem = true;
+				rec[i].back = false;
+				rec[i].feed = rec[i].prestore = true;
+			} else if (hasimm) {
+				error(&tok.loc, "asm immediate operand is not an integer constant or a symbol address");
+			} else {
+				error(&tok.loc, "unsupported asm constraint '%s'", op->constraint);
+			}
 		}
-		if (*body == 'm' || *body == 'o' || *body == 'V' || *body == 'g')
-			error(&tok.loc, "asm memory operands are not yet supported");
-		fr = fixedreg((unsigned char)*body);
 		if (fr >= 0) {
 			rec[i].reg = fr;
-		} else if (*body == 'r' || *body == 'q') {
-			while (pool < countof(rpool) && used[rpool[pool]])
-				++pool;
-			if (pool == countof(rpool))
-				error(&tok.loc, "too many register asm operands");
-			rec[i].reg = rpool[pool++];
-			used[rec[i].reg] = true;
 		} else {
-			error(&tok.loc, "unsupported asm constraint '%s'", op->constraint);
+			rec[i].reg = asmpoolreg(used, &pool);
+			used[rec[i].reg] = true;
 		}
-		if (body[1] && !isdigit((unsigned char)body[1]))
-			error(&tok.loc, "multiple-alternative asm constraints are not supported");
-		rec[i].size = asmopsize(op->expr->type);
+		rec[i].size = rec[i].mem ? 8 : asmopsize(op->expr->type);
 		rec[i].slot = slotsize;
 		slotsize += 8;
 		if (isin)
 			rec[i].feed = rec[i].prestore = true;
+	}
+
+	if (nlab) {
+		if (asanon)
+			error(&tok.loc, "asm goto is not supported with -fsanitize=address");
+		idxslot = slotsize;
+		slotsize += 8;
 	}
 
 	/* choose a callee-saved register to hold the slot pointer; preserve it and any clobbered callee-saved register */
@@ -2984,9 +3788,12 @@ funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, s
 		if (r >= 0 && (r == RBX || r == R12 || r == R13 || r == R14 || r == R15))
 			save[r] = true;
 	}
-	for (i = 0; i < total; ++i)   /* a fixed callee-saved operand register (only "b"=rbx) is written, so preserve it */
-		if (rec[i].reg == RBX)
-			save[RBX] = true;
+	for (i = 0; i < total; ++i) {   /* a callee-saved operand register ("b", or asmpoolreg's) is written: preserve it */
+		int r = rec[i].reg;
+
+		if (r == RBX || r == R12 || r == R13 || r == R14 || r == R15)
+			save[r] = true;
+	}
 	save[holder] = false;   /* the holder is pushed and popped separately */
 
 	expid = asmthunkid++;
@@ -3005,12 +3812,17 @@ funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, s
 		f->end = end;
 	}
 	for (i = 0; i < nout; ++i)   /* evaluate output destinations now; "+" feeds its current value in */
-		rec[i].lval = funclval(f, rec[i].expr);
+		if (!rec[i].pseudo)
+			rec[i].lval = funclval(f, rec[i].expr);
 	for (i = 0; i < nout; ++i) {
 		if (!rec[i].prestore)
 			continue;
 		t = rec[i].expr->type;
 		addr = rec[i].slot ? funcinst(f, IADD, ptrclass, base, mkintconst(rec[i].slot)) : base;
+		if (rec[i].mem) {   /* "=m"/"+m": the slot carries the destination's address */
+			funcinst(f, ISTOREL, 0, rec[i].lval.addr, addr);
+			continue;
+		}
 		v = funcload(f, t, rec[i].lval);
 		funcstore(f, t, 0, (struct lvalue){.addr = addr}, v);
 	}
@@ -3018,8 +3830,8 @@ funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, s
 		long slot;
 		bool o, io;
 		const char *b;
-		if (rec[i].reg < 0)
-			continue;   /* immediate: substituted into the thunk, no slot */
+		if (rec[i].reg < 0 || rec[i].pseudo)
+			continue;   /* immediate (substituted into the thunk) or %rsp: no slot */
 		if (rec[i].slot >= 0) {
 			slot = rec[i].slot;   /* a plain register input */
 		} else {   /* a tied input: store into the matching output's slot */
@@ -3030,24 +3842,56 @@ funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, s
 			slot = rec[m].slot;
 		}
 		t = rec[i].expr->type;
-		v = funcexpr(f, rec[i].expr);
 		addr = slot ? funcinst(f, IADD, ptrclass, base, mkintconst(slot)) : base;
+		if (rec[i].mem) {
+			/* "m": the object's address; an array is the array (not its decayed pointer); a value that is not an
+			 * object is put in a temporary first, as gcc does */
+			struct expr *me = rec[i].expr->decayed ? rec[i].expr->base : rec[i].expr;
+			if (me->lvalue || me->kind == EXPRUNARY && me->op == TMUL) {
+				v = funclval(f, me).addr;
+			} else {
+				struct decl *tmpd = mkdecl(NULL, DECLOBJECT, me->type, QUALNONE, LINKNONE);
+				tmpd->u.obj.storage = SDAUTO;
+				funcalloc(f, tmpd);
+				funcstore(f, me->type, 0, (struct lvalue){.addr = tmpd->value}, funcexpr(f, me));
+				v = tmpd->value;
+			}
+			funcinst(f, ISTOREL, 0, v, addr);
+			continue;
+		}
+		v = funcexpr(f, rec[i].expr);
 		funcstore(f, t, 0, (struct lvalue){.addr = addr}, v);
 	}
 	funcinst(f, ICALL, 0, fn, NULL);
 	funcinst(f, IARG, ptrclass, slotsize ? base : mkintconst(0), NULL);
 	for (i = 0; i < nout; ++i) {
+		if (rec[i].pseudo || rec[i].mem)
+			continue;
 		t = rec[i].expr->type;
 		addr = rec[i].slot ? funcinst(f, IADD, ptrclass, base, mkintconst(rec[i].slot)) : base;
 		v = funcload(f, t, (struct lvalue){.addr = addr});
 		funcstore(f, t, 0, rec[i].lval, v);
+	}
+	if (nlab) {   /* asm goto: on to the label the thunk took, the outputs stored on every way out */
+		struct value *taken;
+
+		addr = idxslot ? funcinst(f, IADD, ptrclass, base, mkintconst(idxslot)) : base;
+		taken = funcinst(f, ILOADW, 'w', addr, NULL);
+		for (j = 0; j < nlab; ++j) {
+			struct block *next = mkblock("asm_goto_next");
+
+			funcjnz(f, funcinst(f, ICEQW, 'w', taken, mkintconst(j + 1)), NULL, funcgototarget(f, labels[j]), next);
+			funclabel(f, next);
+		}
 	}
 
 	/* ---- thunk: load inputs, run the template, store outputs ---- */
 	nsave = 0;
 	for (i = 0; i < 16; ++i)
 		nsave += save[i];
-	pad = (1 + nsave) % 2 ? 8 : 0;   /* keep %rsp 16-aligned for any call inside the template */
+	/* keep %rsp 16-aligned for a call inside the template: 8 mod 16 on entry, so an even number of pushes (the holder
+	 * and the saves) needs 8 more */
+	pad = (1 + nsave) % 2 ? 0 : 8;
 	fprintf(asmout, "\t.text\n\t.p2align 4\nnfcxx_asm_thunk.%u:\n", expid);
 	fprintf(asmout, "\tpushq %%%s\n", regname[holder][0]);
 	for (i = 0; i < 16; ++i)
@@ -3058,12 +3902,18 @@ funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, s
 	fprintf(asmout, "\tmovq %%rdi, %%%s\n", regname[holder][0]);
 	for (i = 0; i < total; ++i)   /* load fed operands from the slot */
 		if (rec[i].slot >= 0 && rec[i].feed) {
-			int col = regsizecol(rec[i].size);
+			int col = regsizecol(rec[i].feedsize > rec[i].size ? rec[i].feedsize : rec[i].size);
 			fprintf(asmout, "\tmov%c %ld(%%%s), %%%s\n", "qlwb"[col], rec[i].slot, regname[holder][0], regname[rec[i].reg][col]);
 		}
 	fputs("\t", asmout);
-	asmtemplate(template, rec, total, names, expid);
+	asmtemplate(template, rec, total, names, expid, labnames, nlab);
 	fputc('\n', asmout);
+	if (nlab)   /* asm goto: the template fell through (mov does not change the flags) */
+		fprintf(asmout, "\tmovl $0, %ld(%%%s)\n.Lnfcxx_gend_%u:\n", idxslot, regname[holder][0], expid);
+	for (i = 0; i < total; ++i)   /* flag outputs, before anything can change the flags (set and movzbl do not) */
+		if (rec[i].flag)
+			fprintf(asmout, "\tset%s %%%s\n\tmovzbl %%%s, %%%s\n", rec[i].flag, regname[rec[i].reg][3],
+				regname[rec[i].reg][3], regname[rec[i].reg][1]);
 	for (i = 0; i < total; ++i)   /* store written-back operands to the slot */
 		if (rec[i].slot >= 0 && rec[i].back) {
 			int col = regsizecol(rec[i].size);
@@ -3075,9 +3925,231 @@ funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, s
 		if (save[i])
 			fprintf(asmout, "\tpopq %%%s\n", regname[i][0]);
 	fprintf(asmout, "\tpopq %%%s\n\tret\n", regname[holder][0]);
+	for (j = 0; j < nlab; ++j)   /* asm goto: each label's stub records it and leaves the way a fall-through does */
+		fprintf(asmout, ".Lnfcxx_goto_%u_%u:\n\tmovl $%u, %ld(%%%s)\n\tjmp .Lnfcxx_gend_%u\n", expid, j, j + 1, idxslot,
+			regname[holder][0], expid);
+}
+
+/* the IL name of a global value as emitname spells it, without the sigil: what cproc -p's pruning calls the item */
+static void
+valuename(struct value *v, char *buf, size_t n)
+{
+	const char *q = v->kind & VALUE_QUOTE ? "\"" : "";
+
+	if (v->id)
+		snprintf(buf, n, ".L%s%s%s.%u", q, v->u.name, q, v->id);
+	else
+		snprintf(buf, n, "%s%s%s", q, v->u.name, q);
+}
+
+/*
+An asm statement. The thunk is written to a temporary file and kept with its block once it is complete; emitfunc
+writes the thunks of the blocks that can be reached to the side file, after a "#nfcxx:owner NAME" line naming the
+function, so cproc -p can drop the thunks of the functions it drops. Under -p a refusal is deferred: error() jumps
+back here, the block records it (lazyerror), and it is reported only if the block can be reached (emitfunc writes it
+into the function's IL) and pruning keeps the function -- the kernel's always_inline helpers ask for "i"(1 << (nr & 7)),
+satisfiable only after inlining, in functions that are dead without it.
+*/
+void
+funcasm(struct func *f, char *template, struct asmoperand *out, unsigned nout, struct asmoperand *in, unsigned nin, char **clob, unsigned nclob, bool isvolatile, struct gotolabel **labels, char **labnames, unsigned nlab)
+{
+	jmp_buf jb, *savedjmp = errorjmp;
+	FILE *real = asmout, *th = NULL;
+	struct block *b = f->end;
+	char buf[4096];
+	size_t n;
+
+	if (b->jump.kind)   /* after a jump, return or break: never run (funcinst drops the call too) */
+		return;
+	if (real && !(th = tmpfile()))
+		fatal("tmpfile:");
+	asmout = th;
+	asmblock = b;
+	if (prune) {
+		if (setjmp(jb)) {
+			errorjmp = savedjmp;
+			asmout = real;
+			if (th)
+				fclose(th);
+			if (!b->lazyerror) {
+				b->lazyerror = xmalloc(strlen(errorbuf) + 1);
+				strcpy(b->lazyerror, errorbuf);
+			}
+			return;
+		}
+		errorjmp = &jb;
+	}
+	funcasm1(f, template, out, nout, in, nin, clob, nclob, isvolatile, labels, labnames, nlab);
+	errorjmp = savedjmp;
+	asmout = real;
+	if (th) {
+		rewind(th);
+		while ((n = fread(buf, 1, sizeof buf, th)) > 0)
+			arrayaddbuf(&b->thunks, buf, n);
+		fclose(th);
+	}
+}
+
+/*
+A file-scope asm. Its text joins the side file as a "#nfcxx:keep" chunk (kept by cproc -p's pruning, main.c) after
+.text, the section an assembly file starts in, where gcc puts it; the kernel's uses switch sections themselves
+(.section ... .previous, .pushsection ... .popsection).
+*/
+void
+emitasm(const char *text)
+{
+	if (!asmout)
+		error(&tok.loc, "inline assembly is only supported on x86_64 ELF (cproc -a)");
+	fprintf(asmout, "#nfcxx:keep\n\t.text\n%s\n", text);
+}
+
+/* the assembler's name of a global value, as QBE writes it on ELF */
+static void
+asmsymname(struct value *v, FILE *f)
+{
+	if (v->kind & VALUE_QUOTE)
+		fprintf(f, "\"%s\"", v->u.name);
+	else if (v->id)
+		fprintf(f, ".L%s.%u", v->u.name, v->id);
+	else
+		fputs(v->u.name, f);
+}
+
+/*
+GNU weak and visibility on a global: directives in the inline-asm side file, after the code that defines or uses the
+symbol. Under cproc -p the chunk ("#nfcxx:symattr NAME", main.c asmprune) stays only when a live item defines or
+names the symbol: an unused weak declaration would otherwise be a weak undefined symbol gcc's object does not have.
+A symbol the unit only declares can still be named by a live item only from code QBE drops (the block of an
+if (0 && ...)), and the directive alone would make it an undefined symbol: its directives are marked
+"#nfcxx:ifused NAME", and qbe-cc keeps them only when the final assembly names the symbol elsewhere.
+*/
+void
+emitsymattr(struct decl *d)
+{
+	bool undef;
+
+	if (!asmout)
+		error(&tok.loc, "the weak and visibility attributes need the inline-asm side file (x86_64 ELF, -a)");
+	if (!d->value)
+		return;
+	undef = !d->defined && !d->tentative && !d->alias;
+	fputs("#nfcxx:symattr ", asmout);
+	asmsymname(d->value, asmout);
+	fputs("\n", asmout);
+	if (d->weak) {
+		if (undef) {
+			fputs("#nfcxx:ifused ", asmout);
+			asmsymname(d->value, asmout);
+			fputc('\n', asmout);
+		}
+		fputs("\t.weak ", asmout);
+		asmsymname(d->value, asmout);
+		fputc('\n', asmout);
+	}
+	if (d->visibility && strcmp(d->visibility, "default")) {
+		if (undef) {
+			fputs("#nfcxx:ifused ", asmout);
+			asmsymname(d->value, asmout);
+			fputc('\n', asmout);
+		}
+		fprintf(asmout, "\t.%s ", d->visibility);
+		asmsymname(d->value, asmout);
+		fputc('\n', asmout);
+	}
+}
+
+/*
+A GNU alias, T name(...) __attribute__((alias("target"))): the declaration defines name as target, a symbol of this
+unit. The side file gets .set with the binding and type gcc gives it, and a top-level "# nfcxx:ref $target" line in
+the IL keeps the target under cproc -p.
+*/
+void
+emitalias(struct decl *d)
+{
+	struct decl *t = scopegetdecl(&filescope, d->alias, false);
+	struct value tv = {.kind = VALUE_GLOBAL, .u.name = d->alias};
+
+	if (!asmout)
+		error(&tok.loc, "the alias attribute needs the inline-asm side file (x86_64 ELF, -a)");
+	if (!d->value)
+		d->value = mkglobal(d);
+	fputs("#nfcxx:keep\n", asmout);
+	if (d->linkage == LINKEXTERN) {
+		fputs(d->weak ? "\t.weak " : "\t.globl ", asmout);
+		asmsymname(d->value, asmout);
+		fputc('\n', asmout);
+	}
+	fputs("\t.set ", asmout);
+	asmsymname(d->value, asmout);
+	fputs(", ", asmout);
+	asmsymname(t && t->value ? t->value : &tv, asmout);
+	fputs("\n\t.type ", asmout);
+	asmsymname(d->value, asmout);
+	fprintf(asmout, ", @%s\n", d->kind == DECLFUNC ? "function" : "object");
+	fputs("# nfcxx:ref ", stdout);
+	emitname(t && t->value ? t->value : &tv);
+	putchar('\n');
 }
 
 /* emit */
+
+/*
+The inline asm of the blocks that can be reached from the start (block->reach): each thunk to the side file after a
+"#nfcxx:owner NAME" line, the symbols the thunks name as "# nfcxx:ref" lines in the function's IL, and the first
+deferred refusal as "# nfcxx:error" (reported by cproc -p if the function is kept, main.c ilprune). Called inside the
+function's braces. QBE drops the unreachable blocks, and with them the calls of the thunks left out.
+*/
+static void
+funcasmout(struct func *f)
+{
+	struct array stack = {0};
+	struct block *b;
+	struct value **r;
+	char name[256];
+	bool erred = false;
+	size_t i;
+
+	f->start->reach = true;
+	arrayaddptr(&stack, f->start);
+	while (stack.len) {
+		stack.len -= sizeof(b);
+		b = *(struct block **)((char *)stack.val + stack.len);
+		for (i = 0; i < 2; ++i) {
+			struct block *s;
+
+			switch (b->jump.kind) {
+			case JUMP_NONE: s = i == 0 ? b->next : NULL; break;   /* falls through to the next block */
+			case JUMP_JMP:  s = i == 0 ? b->jump.blk[0] : NULL; break;
+			case JUMP_JNZ:  s = b->jump.blk[i]; break;
+			default:        s = NULL;
+			}
+			if (s && !s->reach) {
+				s->reach = true;
+				arrayaddptr(&stack, s);
+			}
+		}
+	}
+	free(stack.val);
+	valuename(f->decl->value, name, sizeof name);
+	for (b = f->start; b; b = b->next) {
+		if (!b->reach)
+			continue;
+		if (b->lazyerror && !erred) {
+			printf("# nfcxx:error %s\n", b->lazyerror);
+			erred = true;
+			f->decl->u.func.refused = true;   /* a call with constant arguments may get a clone (decl.c funcclone) */
+		}
+		arrayforeach(&b->asmrefs, r) {
+			fputs("# nfcxx:ref ", stdout);
+			emitname(*r);
+			putchar('\n');
+		}
+		if (b->thunks.len && asmout) {
+			fprintf(asmout, "#nfcxx:owner %s\n", name);
+			fwrite(b->thunks.val, 1, b->thunks.len, asmout);
+		}
+	}
+}
 
 static void
 emitname(struct value *v)
@@ -3346,6 +4418,12 @@ emitfunc(struct func *f, bool global)
 		asanfree(f);
 	if (asanon && f->asanlo)
 		asandynret(f);
+	/* GNU used and section (cproc -p keeps a "# nfcxx:keep" item even when nothing references it; a section alone
+	 * does not keep it) */
+	if (f->decl->used && prune)
+		puts("# nfcxx:keep");
+	if (f->decl->section)
+		printf("section \"%s\" \"ax\"\n", f->decl->section);
 	if (global)
 		puts("export");
 	fputs("function ", stdout);
@@ -3358,7 +4436,7 @@ emitfunc(struct func *f, bool global)
 	for (p = f->type->u.func.params, v = f->paramtemps; p; p = p->next, ++v) {
 		if (p != f->type->u.func.params)
 			fputs(", ", stdout);
-		emitclass(abiclass(p->type), p->type->value);
+		emitclass(abiclass(abiparam(p->type)), abiparam(p->type)->value);
 		putchar(' ');
 		emitname(v);
 	}
@@ -3368,9 +4446,13 @@ emitfunc(struct func *f, bool global)
 		fputs("...", stdout);
 	}
 	puts(") {");
+	funcasmout(f);
 	for (b = f->start; b; b = b->next) {
 		emitname(&b->label);
 		putchar('\n');
+		/* cproc -p: what only an unreachable block names is not referenced (main.c ilref) */
+		if (prune && !b->reach)
+			puts("# nfcxx:dead");
 		if (b->phi.res.kind) {
 			putchar('\t');
 			emitvalue(&b->phi.res);
@@ -3496,9 +4578,21 @@ emitdata(struct decl *d, struct init *init)
 	int align;
 
 	align = d->u.obj.align;
-	size = d->type->size;
+	size = d->type->size + d->u.obj.famsize;
 	for (cur = init; cur; cur = cur->next)
 		cur->expr = eval(cur->expr);
+	/* GNU section: read-only ("a") when the object is const, as gcc chooses; used keeps it under cproc -p (a section
+	 * alone does not: gcc drops an unreferenced static object in .init.data too) */
+	if (d->used && prune)
+		puts("# nfcxx:keep");
+	if (d->section) {
+		struct type *et = d->type;
+		bool ro = d->qual & QUALCONST;
+
+		for (; et->kind == TYPEARRAY; et = et->base)
+			ro |= et->qual & QUALCONST;
+		printf("section \"%s\" \"%s\"\n", d->section, ro ? "a" : "aw");
+	}
 	if (d->u.obj.storage == SDTHREAD)
 		fputs("thread ", stdout);
 	if (d->linkage == LINKEXTERN)
@@ -3567,7 +4661,7 @@ emitdata(struct decl *d, struct init *init)
 		printf("b %u, ", (unsigned)bits);
 		++offset;
 	}
-	assert(offset <= d->type->size);
+	assert(offset <= size);
 	if (asanon && size && d->u.obj.storage != SDTHREAD) {
 		pad = ((size + 7) & ~7ULL) - size + ASANRZ;
 		g = arrayadd(&asanglobals, sizeof(*g));

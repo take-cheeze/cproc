@@ -8,8 +8,7 @@ export
 function w $g() {
 @start.1
 @body.2
-	%.1 =w call $__nfcxx_f16_from_f64(d d_0.10000000000000001)
-	%.2 =w loaduh extern $a
-	%.3 =w call $__nfcxx_f16_eq(w %.1, w %.2)
-	ret %.3
+	%.1 =w loaduh extern $a
+	%.2 =w call $__nfcxx_f16_eq(w 11878, w %.1)
+	ret %.2
 }

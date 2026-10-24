@@ -11,8 +11,7 @@ function w $main() {
 	%.7 =w and %.6, 18446744073709551600
 	%.8 =w or %.5, %.7
 	storew %.8, %.1
-	%.9 =w neg 1
-	%.10 =w cnew %.4, %.9
-	ret %.10
+	%.9 =w cnew %.4, 18446744073709551615
+	ret %.9
 }
 export data $s = align 4 { z 4 }

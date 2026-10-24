@@ -8,6 +8,8 @@
 #include "utf.h"
 #include "cc.h"
 
+static struct expr *parenexpr(struct scope *);
+
 static struct expr *
 mkexpr(enum exprkind k, struct type *t, struct expr *b)
 {
@@ -95,7 +97,7 @@ static struct expr *mkunaryexpr(enum tokenkind, struct expr *);
 static struct expr *mkassignexpr(struct expr *, struct expr *);
 
 /* 6.3.2.1 Conversion of arrays and function designators */
-struct expr *
+static struct expr *
 decay(struct expr *e)
 {
 	struct type *t;
@@ -185,6 +187,41 @@ exprconvert(struct expr *e, struct type *t)
 	return mkexpr(EXPRCAST, t, e);
 }
 
+/* whether evaluating e can have an effect beyond its value (a call, a store, a volatile access, a statement) */
+static bool
+nosideeffects(struct expr *e)
+{
+	struct expr *a;
+
+	if (e->qual & QUALVOLATILE)
+		return false;
+	switch (e->kind) {
+	case EXPRIDENT:
+	case EXPRCONST:
+	case EXPRSTRING:
+	case EXPRSIZEOF:
+		return !e->base || nosideeffects(e->base);
+	case EXPRUNARY:
+	case EXPRCAST:
+	case EXPRBITFIELD:
+		if (e->kind == EXPRUNARY && e->op == TMUL && e->base->type->kind == TYPEPOINTER &&
+		    e->base->type->base->qual & QUALVOLATILE)
+			return false;
+		return nosideeffects(e->base);
+	case EXPRBINARY:
+		return nosideeffects(e->u.binary.l) && nosideeffects(e->u.binary.r);
+	case EXPRCOND:
+		return nosideeffects(e->base) && nosideeffects(e->u.cond.t) && nosideeffects(e->u.cond.f);
+	case EXPRCOMMA:
+		for (a = e->base; a; a = a->next)
+			if (!nosideeffects(a))
+				return false;
+		return true;
+	default:
+		return false;
+	}
+}
+
 static bool
 nullpointer(struct expr *e)
 {
@@ -214,11 +251,12 @@ pointeecompatible(struct type *t, struct type *et)
 	struct type a, b;
 
 	/*
-	char pointees that differ only in signedness (unsigned char * and const char *) are accepted, as gcc
-	accepts them with -Wpointer-sign, a warning in C that is on by default in gcc's C modes. The
-	qualifiers are checked by the caller.
+	integer pointees that differ only in signedness (unsigned char * and const char *, the kernel's unsigned int *
+	for int *) are accepted, as gcc accepts them with -Wpointer-sign, a warning in C that is on by default in gcc's
+	C modes (the kernel turns it off). The qualifiers are checked by the caller.
 	*/
-	if (t->kind == TYPECHAR && et->kind == TYPECHAR)
+	if (t->kind == et->kind && t->prop & PROPINT && et->prop & PROPINT && t->kind != TYPEENUM && t->kind != TYPEBOOL &&
+	    t->size == et->size)
 		return true;
 	if (t->kind != TYPEARRAY || et->kind != TYPEARRAY)
 		return typecompatible(t, et);
@@ -268,6 +306,34 @@ exprassign(struct expr *e, struct type *t)
 	return exprconvert(e, t);
 }
 
+/*
+An argument for a parameter of a GNU transparent_union type: an argument of a member's type converts to that member and
+is passed as the first member is (gcc's convention for such a parameter, qbe.c abiparam); the union itself passes its
+first member.
+*/
+static struct expr *
+transparentarg(struct expr *e, struct type *t)
+{
+	struct member *m, *first = t->u.structunion.members;
+	struct type *et = e->type;
+
+	if (typecompatible(t, et)) {
+		if (!e->lvalue)
+			error(&tok.loc, "a transparent union argument that is not an lvalue is not supported");
+		return mkunaryexpr(TMUL, exprconvert(mkunaryexpr(TBAND, e), mkpointertype(first->type, QUALNONE)));
+	}
+	for (m = t->u.structunion.members; m; m = m->next) {
+		struct type *mt = m->type;
+
+		if (mt->kind == TYPEPOINTER ? nullpointer(e) || et->kind == TYPEPOINTER &&
+		    (mt->base == &typevoid || et->base == &typevoid || pointeecompatible(mt->base, et->base)) &&
+		    !(pointeequal(et) & ~pointeequal(mt)) : typecompatible(mt, et))
+			return exprconvert(exprassign(e, mt), first->type);
+	}
+	error(&tok.loc, "argument type matches no member of the transparent union");
+	return NULL;
+}
+
 struct expr *
 exprpromote(struct expr *e)
 {
@@ -293,7 +359,7 @@ static struct expr *
 mksizeofexpr(struct type *t) {
 	struct expr *e;
 
-	if (t->kind == TYPEARRAY && t->size == 0) {
+	if (t->kind == TYPEARRAY && t->size == 0 && t->prop & PROPVM) {   /* a GNU int a[0] has the constant size 0 */
 		e = mkexpr(EXPRSIZEOF, &typeulong, NULL);
 		e->u.szof.type = t;
 	} else {
@@ -301,6 +367,17 @@ mksizeofexpr(struct type *t) {
 	}
 
 	return e;
+}
+
+/* the element size of pointer arithmetic: GNU C counts void and function types as size 1 */
+static struct expr *
+ptrscale(struct location *loc, struct type *base, const char *op)
+{
+	if (base->kind == TYPEVOID || base->kind == TYPEFUNC)
+		return mkconstexpr(&typeulong, 1);
+	if (base->incomplete)
+		error(loc, "pointer operand to '%s' must be to complete object type", op);
+	return mksizeofexpr(base);
 }
 
 static struct expr *
@@ -344,10 +421,10 @@ mkbinaryexpr(struct location *loc, enum tokenkind op, struct expr *l, struct exp
 			error(loc, "invalid operands to '%s' operator", tokenstr(op));
 		if (l->type->base->kind == TYPEVOID)
 			e = l, l = r, r = e;
-		if (r->type->base->kind == TYPEVOID && l->type->base->kind != TYPEFUNC)
+		/* GNU: pointers to distinct types, or void * and a function pointer (the kernel's handler == SIG_IGN),
+		 * compare as addresses (gcc warns, without -pedantic only for distinct object pointer types) */
+		if (r->type->base->kind == TYPEVOID || !typecompatible(l->type->base, r->type->base))
 			r = exprconvert(r, l->type);
-		else if (!typecompatible(l->type->base, r->type->base))
-			error(loc, "pointer operands to '%s' operator are to incompatible types", tokenstr(op));
 		break;
 	case TLESS:
 	case TGREATER:
@@ -367,6 +444,19 @@ mkbinaryexpr(struct location *loc, enum tokenkind op, struct expr *l, struct exp
 	case TXOR:
 	case TBAND:
 		t = commonreal(&l, &r);
+		/*
+		x & 0 is 0 when evaluating x has no effect, as gcc folds it: the kernel's configuration masks (S_DAX,
+		ARCH_PAGE_TABLE_SYNC_MASK) are 0 when a feature is off, and the code they guard calls functions that
+		configuration does not define. Under -p only, the kernel mode, as the calls above.
+		*/
+		if (prune && op == TBAND && t->prop & PROPINT) {
+			e = eval(r);
+			if (e->kind == EXPRCONST && e->u.constant.u == 0 && nosideeffects(l))
+				return mkconstexpr(t, 0);
+			e = eval(l);
+			if (e->kind == EXPRCONST && e->u.constant.u == 0 && nosideeffects(r))
+				return mkconstexpr(t, 0);
+		}
 		break;
 	case TADD:
 		if (lp & PROPARITH && rp & PROPARITH) {
@@ -378,9 +468,7 @@ mkbinaryexpr(struct location *loc, enum tokenkind op, struct expr *l, struct exp
 		if (l->type->kind != TYPEPOINTER || !(rp & PROPINT))
 			error(loc, "invalid operands to '+' operator");
 		t = l->type;
-		if (t->base->incomplete || t->base->kind == TYPEFUNC)
-			error(loc, "pointer operand to '+' must be to complete object type");
-		r = mkbinaryexpr(loc, TMUL, exprconvert(r, &typeulong), mksizeofexpr(t->base));
+		r = mkbinaryexpr(loc, TMUL, exprconvert(r, &typeulong), ptrscale(loc, t->base, "+"));
 		break;
 	case TSUB:
 		if (lp & PROPARITH && rp & PROPARITH) {
@@ -389,18 +477,16 @@ mkbinaryexpr(struct location *loc, enum tokenkind op, struct expr *l, struct exp
 		}
 		if (l->type->kind != TYPEPOINTER || !(rp & PROPINT) && r->type->kind != TYPEPOINTER)
 			error(loc, "invalid operands to '-' operator");
-		if (l->type->base->incomplete || l->type->base->kind == TYPEFUNC)
-			error(loc, "pointer operand to '-' must be to complete object type");
 		if (rp & PROPINT) {
 			t = l->type;
-			r = mkbinaryexpr(loc, TMUL, exprconvert(r, &typeulong), mksizeofexpr(t->base));
+			r = mkbinaryexpr(loc, TMUL, exprconvert(r, &typeulong), ptrscale(loc, t->base, "-"));
 		} else {
 			if (!typecompatible(l->type->base, r->type->base))
 				error(&tok.loc, "pointer operands to '-' are to incompatible types");
 			op = TDIV;
 			t = &typelong;
 			e = mkbinaryexpr(loc, TSUB, exprconvert(l, &typelong), exprconvert(r, &typelong));
-			r = mksizeofexpr(l->type->base);
+			r = ptrscale(loc, l->type->base, "-");
 			l = e;
 		}
 		break;
@@ -544,6 +630,7 @@ decodechar(const char *src, uint_least32_t *chr, bool *hexoct, const char *desc,
 		case 'r':  c = '\r'; ++s; break;
 		case 't':  c = '\t'; ++s; break;
 		case 'v':  c = '\v'; ++s; break;
+		case 'e':  c = 0x1b; ++s; break;   /* GNU: escape (the kernel's string_helpers) */
 		case 'x':
 			++s;
 			c = 0;
@@ -653,7 +740,7 @@ stringconcat(struct stringlit *str, bool forceutf8)
 	case '8': t = &typeuchar; break;
 	case 'u': t = &typeushort; break;
 	case 'U': t = &typeuint; break;
-	case 'L': t = targ->typewchar; break;
+	case 'L': t = (shortwchar ? &typeushort : targ->typewchar); break;
 	default: assert(0);
 	}
 	switch (t->size) {
@@ -764,7 +851,7 @@ primaryexpr(struct scope *s)
 		src = tok.lit;
 		ordinary = false;
 		switch (*src) {
-		case 'L': ++src; t = targ->typewchar; break;
+		case 'L': ++src; t = (shortwchar ? &typeushort : targ->typewchar); break;
 		case 'u': ++src; t = *src == '8' ? ++src, &typeuchar : &typeushort; break;
 		case 'U': ++src; t = &typeuint; break;
 		default: t = &typeuchar, ordinary = true;
@@ -846,7 +933,7 @@ primaryexpr(struct scope *s)
 		break;
 	case TLPAREN:
 		next();
-		e = expr(s);
+		e = parenexpr(s);
 		expect(TRPAREN, "after expression");
 		break;
 	case T_GENERIC:
@@ -874,12 +961,14 @@ primaryexpr(struct scope *s)
 }
 
 /* TODO: merge with init.c:designator() */
+/* the member designators of __builtin_offsetof; GNU allows an index that is not constant (the kernel's
+ * container_of(node, struct latch_tree_node, node[idx])), whose scaled sum goes to *runtime (null if there is none) */
 static void
-designator(struct scope *s, struct type *t, unsigned long long *offset)
+designator(struct scope *s, struct type *t, unsigned long long *offset, struct expr **runtime)
 {
 	char *name;
 	struct member *m;
-	unsigned long long i;
+	struct expr *i, *c;
 
 	for (;;) {
 		switch (tok.kind) {
@@ -887,10 +976,18 @@ designator(struct scope *s, struct type *t, unsigned long long *offset)
 			if (t->kind != TYPEARRAY)
 				error(&tok.loc, "index designator is only valid for array types");
 			next();
-			i = intconstexpr(s, false);
+			i = expr(s);
+			if (!(i->type->prop & PROPINT))
+				error(&tok.loc, "index designator is not an integer");
 			expect(TRBRACK, "for index designator");
 			t = t->base;
-			*offset += i * t->size;
+			c = eval(i);
+			if (c->kind == EXPRCONST) {
+				*offset += c->u.constant.u * t->size;
+			} else {
+				i = mkbinaryexpr(&tok.loc, TMUL, exprconvert(i, &typeulong), mkconstexpr(&typeulong, t->size));
+				*runtime = *runtime ? mkbinaryexpr(&tok.loc, TADD, *runtime, i) : i;
+			}
 			break;
 		case TPERIOD:
 			if (t->kind != TYPESTRUCT && t->kind != TYPEUNION)
@@ -1193,8 +1290,173 @@ builtinfunc(struct scope *s, enum builtinkind kind)
 		e = mkexpr(EXPRBUILTIN, &typeint, e);
 		e->u.builtin.kind = BUILTINSIGNBIT;
 		break;
+	case BUILTINADDOVERFLOW:
+	case BUILTINSUBOVERFLOW:
+	case BUILTINMULOVERFLOW: {
+		/* GNU __builtin_{add,sub,mul}_overflow(a, b, r): the exact a OP b wrapped into *r, and whether *r could not
+		 * hold it (qbe.c funcoverflow). Integer operands and result up to 64 bits; the result not bool or enum. */
+		struct expr *a, *b, *r;
+		struct type *rt;
+
+		a = assignexpr(s);
+		expect(TCOMMA, "after first operand");
+		b = assignexpr(s);
+		expect(TCOMMA, "after second operand");
+		r = assignexpr(s);
+		if (!(a->type->prop & PROPINT) || !(b->type->prop & PROPINT) || a->type->size > 8 || b->type->size > 8)
+			error(&tok.loc, "operands of an overflow built-in must have integer type of at most 64 bits");
+		rt = r->type->kind == TYPEPOINTER ? r->type->base : NULL;
+		if (!rt || !(rt->prop & PROPINT) || rt->kind == TYPEBOOL || rt->kind == TYPEENUM || rt->size > 8)
+			error(&tok.loc, "the third argument of an overflow built-in must point to an integer type other than bool or an enum");
+		if (r->type->qual & QUALCONST)
+			error(&tok.loc, "the third argument of an overflow built-in points to a const object");
+		e = mkexpr(EXPRBUILTIN, &typebool, a);
+		a->next = b;
+		b->next = r;
+		r->next = NULL;
+		e->u.builtin.kind = kind;
+		break;
+	}
+	case BUILTINBSWAP16:
+	case BUILTINBSWAP32:
+	case BUILTINBSWAP64: {
+		/* the bytes of an unsigned 16-, 32- or 64-bit value reversed; folded when the operand is constant */
+		int bytes = kind == BUILTINBSWAP16 ? 2 : kind == BUILTINBSWAP32 ? 4 : 8;
+		struct type *bt = bytes == 2 ? &typeushort : bytes == 4 ? &typeuint : &typeulong;
+		struct expr *c;
+
+		e = exprconvert(assignexpr(s), bt);
+		c = eval(e);
+		if (c->kind == EXPRCONST) {
+			unsigned long long u = c->u.constant.u, r = 0;
+			int k;
+
+			for (k = 0; k < bytes; ++k)
+				r |= (u >> 8 * k & 0xff) << 8 * (bytes - 1 - k);
+			e = mkconstexpr(bt, r);
+		} else {
+			e = mkexpr(EXPRBUILTIN, bt, e);
+			e->u.builtin.kind = kind;
+		}
+		break;
+	}
+	case BUILTINCLZ: case BUILTINCLZL:
+	case BUILTINCTZ: case BUILTINCTZL:
+	case BUILTINFFS: case BUILTINFFSL:
+	case BUILTINPARITY: case BUILTINPARITYL:
+	case BUILTINPOPCOUNT: case BUILTINPOPCOUNTL: {
+		/* an int result counting the bits of an unsigned int or unsigned long (ffs: of an int or long, bit for bit);
+		 * folded when the operand is constant. clz and ctz of zero, undefined in GNU C, are the width here, as
+		 * x86's lzcnt and tzcnt give */
+		bool wide = kind == BUILTINCLZL || kind == BUILTINCTZL || kind == BUILTINFFSL || kind == BUILTINPARITYL || kind == BUILTINPOPCOUNTL;
+		struct type *bt = kind == BUILTINFFS ? &typeint : kind == BUILTINFFSL ? &typelong : wide ? &typeulong : &typeuint;
+		struct expr *c;
+
+		e = exprconvert(assignexpr(s), bt);
+		c = eval(e);
+		if (c->kind == EXPRCONST) {
+			unsigned long long u = c->u.constant.u;
+			int w = wide ? 64 : 32, r = 0, k;
+
+			if (!wide)
+				u &= 0xffffffffull;
+			switch (kind) {
+			case BUILTINCLZ: case BUILTINCLZL:
+				for (k = w - 1; k >= 0 && !(u >> k & 1); --k)
+					++r;
+				break;
+			case BUILTINCTZ: case BUILTINCTZL:
+				for (k = 0; k < w && !(u >> k & 1); ++k)
+					++r;
+				break;
+			case BUILTINFFS: case BUILTINFFSL:
+				for (k = 0; k < w && !(u >> k & 1); ++k)
+					;
+				r = k < w ? k + 1 : 0;
+				break;
+			default:
+				for (; u; u &= u - 1)
+					++r;
+				if (kind == BUILTINPARITY || kind == BUILTINPARITYL)
+					r &= 1;
+			}
+			e = mkconstexpr(&typeint, r);
+		} else {
+			e = mkexpr(EXPRBUILTIN, &typeint, e);
+			e->u.builtin.kind = kind;
+		}
+		break;
+	}
+	case BUILTINCHOOSEEXPR: {
+		/* GNU: the result is the second or third operand itself (its type, and an lvalue if it is one), chosen by an
+		 * integer constant; the other is parsed but not evaluated */
+		struct expr *c, *other;
+
+		c = eval(condexpr(s));
+		if (c->kind != EXPRCONST || !(c->type->prop & PROPINT))
+			error(&tok.loc, "first argument to __builtin_choose_expr must be an integer constant expression");
+		expect(TCOMMA, "after condition");
+		e = assignexpr(s);
+		expect(TCOMMA, "after expression");
+		other = assignexpr(s);
+		if (!c->u.constant.u) {
+			struct expr *x = e;
+			e = other;
+			other = x;
+		}
+		(void)other;   /* trees are freed with the translation unit's arena; nothing of it is emitted */
+		break;
+	}
 	case BUILTINCONSTANTP:
 		e = mkconstexpr(&typeint, eval(condexpr(s))->kind == EXPRCONST);
+		break;
+	case BUILTINOBJECTSIZE: {
+		/* GNU: the size of the object a pointer points to when the compiler can tell, which cproc never claims to:
+		 * the answer for an unknown size, (size_t)-1 for types 0 and 1, 0 for types 2 and 3 (what gcc gives when it
+		 * cannot tell, at -O0 for most). The pointer is not evaluated, as in gcc. */
+		struct expr *p;
+		unsigned long long type;
+
+		p = assignexpr(s);
+		if (p->type->kind != TYPEPOINTER)
+			error(&tok.loc, "the first argument of __builtin_object_size must be a pointer");
+		delexpr(p);
+		expect(TCOMMA, "after pointer");
+		type = intconstexpr(s, false);
+		if (type > 3)
+			error(&tok.loc, "the second argument of __builtin_object_size must be 0, 1, 2 or 3");
+		e = mkconstexpr(&typeulong, type < 2 ? -1ull : 0);
+		break;
+	}
+	case BUILTINISDIGIT:
+		/* the C locale's isdigit, as gcc folds it: (unsigned)c - '0' <= 9 */
+		e = exprconvert(exprconvert(assignexpr(s), &typeint), &typeuint);
+		e = mkbinaryexpr(&tok.loc, TSUB, e, mkconstexpr(&typeuint, '0'));
+		e = exprconvert(mkbinaryexpr(&tok.loc, TLEQ, e, mkconstexpr(&typeuint, 9)), &typeint);
+		break;
+	case BUILTINPREFETCH:
+		/* a hint: the address is evaluated (for its side effects), the read/write and locality constants checked */
+		e = assignexpr(s);
+		if (e->type->kind != TYPEPOINTER)
+			error(&tok.loc, "the argument of __builtin_prefetch must be a pointer");
+		while (consume(TCOMMA))
+			intconstexpr(s, false);
+		e = exprconvert(e, &typevoid);
+		break;
+	case BUILTINRETURNADDRESS:
+	case BUILTINFRAMEADDRESS:
+		/* GNU: the current function's return address or frame address; only level 0 (the kernel's _RET_IP_) */
+		if (intconstexpr(s, false) != 0)
+			error(&tok.loc, "%s of a level other than 0 is not supported", kind == BUILTINRETURNADDRESS ? "__builtin_return_address" : "__builtin_frame_address");
+		e = mkexpr(EXPRBUILTIN, mkpointertype(&typevoid, QUALNONE), NULL);
+		e->u.builtin.kind = kind;
+		break;
+	case BUILTINEXTRACTRETURNADDR:
+		/* GNU: the address a return address stands for, which on x86-64 is the return address itself (on
+		 * aarch64 pointer authentication can make it differ) */
+		if (strcmp(targ->name, "x86_64-sysv") != 0)
+			error(&tok.loc, "__builtin_extract_return_addr is only supported on x86-64");
+		e = exprconvert(assignexpr(s), mkpointertype(&typevoid, QUALNONE));
 		break;
 	case BUILTINEXPECT:
 		/* just a no-op for now */
@@ -1226,8 +1488,11 @@ builtinfunc(struct scope *s, enum builtinkind kind)
 		m = typemember(t, name, &offset);
 		if (!m)
 			error(&tok.loc, "struct/union has no member named '%s'", name);
-		designator(s, m->type, &offset);
+		toeval = NULL;
+		designator(s, m->type, &offset, &toeval);
 		e = mkconstexpr(&typeulong, offset);
+		if (toeval)
+			e = mkbinaryexpr(&tok.loc, TADD, e, toeval);
 		break;
 	case BUILTINTYPESCOMPATIBLEP:
 		t = typename(s, NULL, NULL);
@@ -1316,6 +1581,10 @@ mkincdecexpr(enum tokenkind op, struct expr *base, bool post)
 		error(&tok.loc, "operand of '%s' operator must be an lvalue", tokenstr(op));
 	if (base->qual & QUALCONST)
 		error(&tok.loc, "operand of '%s' operator is const qualified", tokenstr(op));
+	/* a pointer steps by its element size: 1 for void and function types (GNU), none for another incomplete type */
+	if (base->type->kind == TYPEPOINTER && base->type->base->incomplete && base->type->base->kind != TYPEVOID &&
+	    !(base->type->base->kind == TYPEARRAY && base->type->base->prop & PROPVM))
+		error(&tok.loc, "operand of '%s' operator is a pointer to an incomplete type", tokenstr(op));
 	e = mkexpr(EXPRINCDEC, base->type, base);
 	e->op = op;
 	e->u.incdec.post = post;
@@ -1379,6 +1648,8 @@ postfixexpr(struct scope *s, struct expr *r)
 				*end = assignexpr(s);
 				if ((t->u.func.isvararg || t->u.func.unprototyped) && !p)
 					*end = exprpromote(*end);
+				else if (p->type->kind == TYPEUNION && p->type->u.structunion.transparent)
+					*end = transparentarg(*end, p->type);
 				else
 					*end = exprassign(*end, p->type);
 				end = &(*end)->next;
@@ -1388,6 +1659,43 @@ postfixexpr(struct scope *s, struct expr *r)
 			}
 			if (p && !t->u.func.isvararg && !t->u.func.unprototyped)
 				error(&tok.loc, "not enough arguments for function call");
+			/* a call of a function whose body is { return C; } is C when its arguments have no side effects: gcc
+			 * inlines it and folds what depends on it (the kernel's pmd_trans_huge() is 0 without transparent huge
+			 * pages, and the call it guards names a function this configuration does not have) */
+			/* likewise a call of a function whose body is {} is nothing (the kernel's __apply_fineibt() without CFI,
+			 * whose arguments name sections this configuration does not have; noinline does not stop gcc, which
+			 * finds the function const and drops the call, as for apply_retpolines()). Not folded: a weak function
+			 * (the link may take another unit's definition) and a noipa one (qbe-prep.rb's __nfcxx_keep(&x), whose
+			 * call is what keeps a volatile local in memory). Under -p only, the kernel mode: elsewhere the call
+			 * stays a call, and an expression with it no constant expression (a VLA bound stays a VLA's). */
+			if (prune && r->kind == EXPRUNARY && r->op == TBAND && r->base->kind == EXPRIDENT &&
+			    r->base->u.ident.decl->kind == DECLFUNC && r->base->u.ident.decl->defined &&
+			    !r->base->u.ident.decl->weak && !r->base->u.ident.decl->noipa &&
+			    (r->base->u.ident.decl->u.func.constret || r->base->u.ident.decl->u.func.emptybody)) {
+				struct expr *a;
+				bool pure = true;
+
+				for (a = e->u.call.args; a; a = a->next)
+					pure &= nosideeffects(a);
+				if (pure) {
+					if (r->base->u.ident.decl->u.func.constret)
+						e = mkconstexpr(t->base, r->base->u.ident.decl->u.func.retval);
+					else
+						e = mkexpr(EXPRCAST, &typevoid, mkconstexpr(&typeint, 0));
+					next();
+					break;
+				}
+			}
+			/* a call of an always_inline function with constant arguments may go to a clone (decl.c funcclone) */
+			if (r->kind == EXPRUNARY && r->op == TBAND && r->base->kind == EXPRIDENT &&
+			    r->base->u.ident.decl->kind == DECLFUNC && r->base->u.ident.decl->u.func.body) {
+				struct decl *c = funcclone(r->base->u.ident.decl, e->u.call.args);
+
+				if (c)
+					r->base->u.ident.decl = c;
+				else if (r->base->u.ident.decl->u.func.refused && curfunc)
+					funcdecl(curfunc)->u.func.refused = true;   /* the caller's constant calls may get clones then */
+			}
 			e = decay(e);
 			next();
 			break;
@@ -1502,7 +1810,7 @@ unaryexpr(struct scope *s)
 					parseinit(s, t);
 				e = NULL;
 			} else {
-				e = expr(s);
+				e = parenexpr(s);
 				expect(TRPAREN, "after expression");
 				if (op == TSIZEOF)
 					e = postfixexpr(s, e);
@@ -1520,11 +1828,14 @@ unaryexpr(struct scope *s)
 				error(&tok.loc, "%s operator applied to bitfield expression", tokenstr(op));
 			t = e->type;
 		}
+		if (t->kind == TYPEVOID || t->kind == TYPEFUNC) {
+			/* GNU C: sizeof and __alignof__ of void and of a function type are 1 */
+			e = mkconstexpr(&typeulong, 1);
+			break;
+		}
 		if (t->incomplete)
 			error(&tok.loc, "%s operator applied to incomplete type", tokenstr(op));
-		if (t->kind == TYPEFUNC)
-			error(&tok.loc, "%s operator applied to function type", tokenstr(op));
-		if (t->kind == TYPEARRAY && t->size == 0 && op == TSIZEOF) {
+		if (t->kind == TYPEARRAY && t->size == 0 && t->prop & PROPVM && op == TSIZEOF) {   /* a GNU int a[0] is 0 */
 			e = mkexpr(EXPRSIZEOF, &typeulong, e);
 			e->u.szof.type = t;
 		} else {
@@ -1532,7 +1843,12 @@ unaryexpr(struct scope *s)
 			XXX: __alignof__ is not the same as alignof on 32-bit archs
 			this needs to be considered if we gain support for those archs
 			*/
-			e = mkconstexpr(&typeulong, op == TSIZEOF ? t->size : t->align);
+			unsigned long long a = t->align;
+
+			/* GNU: the alignment of an object is the object's (aligned on its declaration), as gcc's DECL_ALIGN */
+			if (e && e->kind == EXPRIDENT && e->u.ident.decl->kind == DECLOBJECT)
+				a = e->u.ident.decl->u.obj.align;
+			e = mkconstexpr(&typeulong, op == TSIZEOF ? t->size : a);
 		}
 		break;
 	default:
@@ -1542,30 +1858,23 @@ unaryexpr(struct scope *s)
 	return e;
 }
 
-/* GNU statement expression ({ ... }): an rvalue with the type and value of the body's last expression statement, void if the body ends otherwise */
+/* the expression after a '(' already consumed: a GNU statement expression when a '{' follows */
 static struct expr *
-stmtexpr(struct scope *s)
+parenexpr(struct scope *s)
 {
-	struct func *f = curfunc;
-	struct expr *e, *last;
-	struct value *v = NULL;
-	struct type *t = &typevoid;
+	struct block *saved, *first;
+	struct expr *e, *v;
 
-	if (!f)
+	if (tok.kind != TLBRACE)
+		return expr(s);
+	if (!curfunc)
 		error(&tok.loc, "statement expression outside of a function");
-	e = mkexpr(EXPRSTMT, &typevoid, NULL);
-	funcdetach(f, &e->u.stmt.chain);
-	last = stmtblock(f, s);
-	if (last) {
-		last = decay(last);
-		t = last->type;
-		v = funcexpr(f, last);
-		delexpr(last);
-	}
-	funcreattach(f, &e->u.stmt.chain);
-	e->type = t;
-	e->u.stmt.value = v;
-	e->u.stmt.spliced = false;
+	saved = funcdetach(curfunc, &first);
+	v = stmtexpr(curfunc, s);
+	e = mkexpr(EXPRSTMT, v ? v->type : &typevoid, v);
+	e->u.stmt.first = first;
+	e->u.stmt.last = funcreattach(curfunc, saved);
+	e->u.stmt.done = false;
 	return e;
 }
 
@@ -1580,16 +1889,10 @@ castexpr(struct scope *s)
 	ct = NULL;
 	end = &r;
 	while (consume(TLPAREN)) {
-		if (tok.kind == TLBRACE) {
-			e = stmtexpr(s);
-			expect(TRPAREN, "after statement expression");
-			e = postfixexpr(s, e);
-			goto done;
-		}
 		tq = QUALNONE;
 		t = typename(s, &tq, &toeval);
 		if (!t) {
-			e = expr(s);
+			e = parenexpr(s);
 			expect(TRPAREN, "after expression to match '('");
 			e = postfixexpr(s, e);
 			goto done;
@@ -1604,7 +1907,41 @@ castexpr(struct scope *s)
 			d->u.obj.storage = s == &filescope ? SDSTATIC : SDAUTO;
 			e->u.compound.decl = d;
 			e->u.compound.init = parseinit(s, t);
+			if (initfamsize)
+				error(&tok.loc, "a compound literal that initializes a flexible array member is not supported");
 			e = postfixexpr(s, decay(e));
+			goto done;
+		}
+		if ((t->kind == TYPEUNION || t->kind == TYPESTRUCT) && !t->incomplete && !toeval) {
+			/* GNU cast to a union (the kernel's (union ibs_fetch_ctl)config): a union value holding the operand in
+			 * the member of its type, as the compound literal (union u){.member = operand} would; a cast of a
+			 * struct or union to its own type is its value (the kernel's (sockptr_t)dst) */
+			struct member *m;
+			struct expr *op = castexpr(s);
+
+			if (typecompatible(t, op->type)) {
+				e = op;
+				if (e->lvalue) {   /* a cast is not an lvalue: the value of a copy */
+					e = mkexpr(EXPRCOMMA, op->type, op);
+					e->base->next = NULL;
+				}
+				goto done;
+			}
+			if (t->kind == TYPESTRUCT)
+				error(&tok.loc, "cast type must be scalar");
+			for (m = t->u.structunion.members; m; m = m->next)
+				if (m->name && typecompatible(m->type, op->type))
+					break;
+			if (!m)
+				error(&tok.loc, "cast to union type from a type that is not one of its members' types");
+			if (m->bits.before || m->bits.after)
+				error(&tok.loc, "cast to union type through a bit-field member is not supported");
+			e = mkexpr(EXPRCOMPOUND, t, NULL);
+			e->qual = tq;
+			d = mkdecl(NULL, DECLOBJECT, t, tq, LINKNONE);
+			d->u.obj.storage = s == &filescope ? SDSTATIC : SDAUTO;
+			e->u.compound.decl = d;
+			e->u.compound.init = mkinit(0, m->type->size, (struct bitfield){0}, exprconvert(op, m->type));
 			goto done;
 		}
 		if (t != &typevoid && !(t->prop & PROPSCALAR))

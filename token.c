@@ -184,11 +184,23 @@ diagloc(const struct location *loc)
 	fprintf(stderr, "%s:%zu:%zu: ", loc->file, loc->line, loc->col);
 }
 
+jmp_buf *errorjmp;
+char errorbuf[512];
+
 void
 error(const struct location *loc, const char *fmt, ...)
 {
 	va_list ap;
 
+	if (errorjmp) {
+		int n = snprintf(errorbuf, sizeof errorbuf, "%s:%zu:%zu: error: ", loc->file, loc->line, loc->col);
+
+		va_start(ap, fmt);
+		if (n >= 0 && (size_t)n < sizeof errorbuf)
+			vsnprintf(errorbuf + n, sizeof errorbuf - n, fmt, ap);
+		va_end(ap);
+		longjmp(*errorjmp, 1);
+	}
 	diagloc(loc);
 	fputs("error: ", stderr);
 	va_start(ap, fmt);

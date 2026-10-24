@@ -300,6 +300,97 @@ undef(void)
 	scan(&tok);
 }
 
+/* GNU #pragma GCC visibility push(V): the visibility of the declarations with external linkage that follow, until the
+ * matching pop (the kernel's arch/x86/boot/compressed, -include hidden.h); decl.c declapplyattr reads it */
+const char *pragmavisibility;
+static const char *visstack[16];
+static int visdepth;
+/* #pragma pack: the most alignment of the members of the structs defined while it holds (0: no limit) */
+int pragmapack;
+static int packstack[16], packdepth;
+
+/*
+A #pragma. EDG-made C keeps cproc's reading (every pragma ignored). Under -G, GNU C written by hand, an ignored pragma
+could change what the program means -- #pragma pack a layout, #pragma weak a binding -- so only the ones that are
+diagnostics or hints are ignored, GCC visibility is honoured, and any other is refused.
+*/
+static void
+pragma(void)
+{
+	char words[16][32] = {{0}};
+	int n = 0;
+
+	next();   /* past "pragma" */
+	for (; tok.kind != TNEWLINE && tok.kind != TEOF; next()) {
+		const char *w = tok.lit ? tok.lit : tokenstr(tok.kind);
+
+		if (tok.kind == TLPAREN || tok.kind == TRPAREN || tok.kind == TCOMMA || !w)
+			continue;
+		if (n < 16)
+			snprintf(words[n++], sizeof words[0], "%s", w);
+	}
+	if (!gnucleanup)
+		return;
+	if (strcmp(words[0], "GCC") == 0 && strcmp(words[1], "visibility") == 0) {
+		if (strcmp(words[2], "push") == 0) {
+			if (visdepth == 16)
+				error(&tok.loc, "#pragma GCC visibility nested too deeply");
+			if (strcmp(words[3], "default") && strcmp(words[3], "hidden") && strcmp(words[3], "protected") &&
+			    strcmp(words[3], "internal"))
+				error(&tok.loc, "unknown visibility '%s' in #pragma GCC visibility", words[3]);
+			visstack[visdepth++] = pragmavisibility;
+			pragmavisibility = NULL;
+			if (strcmp(words[3], "default")) {
+				char *v = xmalloc(strlen(words[3]) + 1);
+
+				strcpy(v, words[3]);
+				pragmavisibility = v;
+			}
+		} else if (strcmp(words[2], "pop") == 0) {
+			if (!visdepth)
+				error(&tok.loc, "#pragma GCC visibility pop without a push");
+			pragmavisibility = visstack[--visdepth];
+		} else {
+			error(&tok.loc, "unsupported #pragma GCC visibility %s", words[2]);
+		}
+		return;
+	}
+	if (strcmp(words[0], "pack") == 0) {
+		/* pack(N), pack(), pack(push[, N]), pack(pop): the most alignment a struct member defined after it gets
+		 * (decl.c addmember); the kernel's ACPI tables are laid out under pack(1) */
+		int i = 1;
+
+		if (strcmp(words[i], "push") == 0) {
+			if (packdepth == 16)
+				error(&tok.loc, "#pragma pack nested too deeply");
+			packstack[packdepth++] = pragmapack;
+			++i;
+		} else if (strcmp(words[i], "pop") == 0) {
+			if (!packdepth)
+				error(&tok.loc, "#pragma pack(pop) without a push");
+			pragmapack = packstack[--packdepth];
+			return;
+		}
+		if (!*words[i]) {
+			if (i == 1)
+				pragmapack = 0;   /* pack(): the default */
+			return;
+		}
+		pragmapack = atoi(words[i]);
+		if (pragmapack != 1 && pragmapack != 2 && pragmapack != 4 && pragmapack != 8 && pragmapack != 16)
+			error(&tok.loc, "#pragma pack(%s): the alignment must be 1, 2, 4, 8 or 16", words[i]);
+		return;
+	}
+	if (strcmp(words[0], "once") == 0 || strcmp(words[0], "STDC") == 0 ||
+	    strcmp(words[0], "GCC") == 0 && (strcmp(words[1], "diagnostic") == 0 || strcmp(words[1], "system_header") == 0 ||
+	     strcmp(words[1], "poison") == 0 || strcmp(words[1], "unroll") == 0 || strcmp(words[1], "ivdep") == 0 ||
+	     strcmp(words[1], "push_options") == 0 || strcmp(words[1], "pop_options") == 0 || strcmp(words[1], "optimize") == 0 ||
+	     strcmp(words[1], "warning") == 0 || strcmp(words[1], "error") == 0) ||
+	    strcmp(words[0], "clang") == 0 || strcmp(words[0], "message") == 0)
+		return;
+	error(&tok.loc, "unsupported #pragma %s%s%s (it could change what the program means)", words[0], *words[1] ? " " : "", words[1]);
+}
+
 static void
 directive(void)
 {
@@ -380,8 +471,7 @@ directive(void)
 			exit(1);
 		break;
 	case TPRAGMA:
-		while (tok.kind != TNEWLINE && tok.kind != TEOF)
-			next();
+		pragma();
 		break;
 	default:
 		error(&tok.loc, "invalid preprocessor directive #%s", tokenstr(tok.kind));
@@ -406,6 +496,14 @@ nextinto(struct token *t)
 		}
 	}
 }
+
+/* recording and replay of tokens (tokrecord, tokreplay) */
+static struct array *tokrec;
+static struct tokreplay replay;
+#define replaying replay.on
+#define replaytok replay.tok
+#define replayn replay.n
+#define replaypos replay.pos
 
 static struct token *
 rawnext(void)
@@ -562,6 +660,13 @@ next(void)
 {
 	struct token *t;
 
+	if (replaying) {
+		if (replaypos < replayn)
+			tok = replaytok[replaypos++];
+		else
+			tok.kind = TEOF;
+		return;
+	}
 	do t = rawnext();
 	while (expand(t) || t->kind == TNEWLINE && !(ppflags & PPNEWLINE) || t->kind == ALIAS__EXTENSION__);
 	tok = *t;
@@ -581,8 +686,34 @@ next(void)
 	case ALIAS__TYPEOF:
 	case ALIAS__TYPEOF__:     tok.kind = TTYPEOF;        break;
 	case ALIAS__VOLATILE__:   tok.kind = TVOLATILE;      break;
+	case ALIAS__RESTRICT:
+	case ALIAS__RESTRICT__:   tok.kind = TRESTRICT;      break;
+	case ALIAS__ATTRIBUTE:    tok.kind = T__ATTRIBUTE__; break;
+	case ALIAS__ALIGNOF:      tok.kind = T__ALIGNOF__;   break;
 	case ALIAS__ASM:          tok.kind = T__ASM__;       break;
+	case ALIAS_ASM:           if (gnukeywords) tok.kind = T__ASM__;  break;
 	}
+	if (tokrec)
+		arrayaddbuf(tokrec, &tok, sizeof(tok));
+}
+
+void
+tokrecord(struct array *a)
+{
+	tokrec = a;
+}
+
+void
+tokreplay(struct tokreplay *old, struct token *t, size_t n)
+{
+	*old = replay;
+	replay = (struct tokreplay){.tok = t, .n = n, .pos = 0, .on = true};
+}
+
+void
+tokreplayend(const struct tokreplay *old)
+{
+	replay = *old;
 }
 
 bool
@@ -597,6 +728,13 @@ peek(enum tokenkind kind)
 		next();
 		return true;
 	}
+	if (replaying) {   /* put it back in the replay */
+		--replaypos;
+		tok = old;
+		return false;
+	}
+	if (tokrec)   /* it is returned again, and recorded then */
+		tokrec->len -= sizeof(tok);
 	pending = tok;
 	tok = old;
 	ctxpush(&pending, 1, NULL, pending.space);

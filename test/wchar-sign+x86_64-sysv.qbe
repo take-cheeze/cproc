@@ -3,7 +3,5 @@ export
 function w $main() {
 @start.1
 @body.2
-	%.1 =w neg 1
-	%.2 =w csgtw %.1, 0
-	ret %.2
+	ret 0
 }

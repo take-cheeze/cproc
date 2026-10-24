@@ -151,5 +151,10 @@ TOKEN(ALIAS__THREAD,       "__thread")
 TOKEN(ALIAS__TYPEOF,       "__typeof")
 TOKEN(ALIAS__TYPEOF__,     "__typeof__")
 TOKEN(ALIAS__VOLATILE__,   "__volatile__")  /* XXX: what needs this? */
+TOKEN(ALIAS__RESTRICT,     "__restrict")    /* GNU spellings (glibc's headers under gcc's predefines) */
+TOKEN(ALIAS__RESTRICT__,   "__restrict__")
+TOKEN(ALIAS__ATTRIBUTE,    "__attribute")   /* GNU spelling (the kernel's noinstr) */
+TOKEN(ALIAS__ALIGNOF,      "__alignof")
 TOKEN(ALIAS__ASM,          "__asm")
 TOKEN(ALIAS__EXTENSION__,  "__extension__")  /* a pedantry marker: dropped by the scanner */
+TOKEN(ALIAS_ASM,           "asm")    /* GNU C keyword under -g, else an identifier */

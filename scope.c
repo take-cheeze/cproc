@@ -5,6 +5,7 @@
 #include "cc.h"
 
 struct scope filescope;
+struct scope *attrscope = &filescope;
 
 /* a builtin that calls the library function symbol: a function of type ret(ptypes...), filed under the builtin's name */
 static void
@@ -43,7 +44,35 @@ scopeinit(void)
 {
 	static struct decl builtins[] = {
 		{.name = "__builtin_alloca",      .kind = DECLBUILTIN, .u.builtin = BUILTINALLOCA},
+		{.name = "__builtin_add_overflow", .kind = DECLBUILTIN, .u.builtin = BUILTINADDOVERFLOW},
+		{.name = "__builtin_sub_overflow", .kind = DECLBUILTIN, .u.builtin = BUILTINSUBOVERFLOW},
+		{.name = "__builtin_mul_overflow", .kind = DECLBUILTIN, .u.builtin = BUILTINMULOVERFLOW},
+		{.name = "__builtin_bswap16",     .kind = DECLBUILTIN, .u.builtin = BUILTINBSWAP16},
+		{.name = "__builtin_bswap32",     .kind = DECLBUILTIN, .u.builtin = BUILTINBSWAP32},
+		{.name = "__builtin_bswap64",     .kind = DECLBUILTIN, .u.builtin = BUILTINBSWAP64},
+		{.name = "__builtin_clz", .kind = DECLBUILTIN, .u.builtin = BUILTINCLZ},
+		{.name = "__builtin_clzl", .kind = DECLBUILTIN, .u.builtin = BUILTINCLZL},
+		{.name = "__builtin_clzll", .kind = DECLBUILTIN, .u.builtin = BUILTINCLZL},
+		{.name = "__builtin_ctz", .kind = DECLBUILTIN, .u.builtin = BUILTINCTZ},
+		{.name = "__builtin_ctzl", .kind = DECLBUILTIN, .u.builtin = BUILTINCTZL},
+		{.name = "__builtin_ctzll", .kind = DECLBUILTIN, .u.builtin = BUILTINCTZL},
+		{.name = "__builtin_ffs", .kind = DECLBUILTIN, .u.builtin = BUILTINFFS},
+		{.name = "__builtin_ffsl", .kind = DECLBUILTIN, .u.builtin = BUILTINFFSL},
+		{.name = "__builtin_ffsll", .kind = DECLBUILTIN, .u.builtin = BUILTINFFSL},
+		{.name = "__builtin_parity", .kind = DECLBUILTIN, .u.builtin = BUILTINPARITY},
+		{.name = "__builtin_parityl", .kind = DECLBUILTIN, .u.builtin = BUILTINPARITYL},
+		{.name = "__builtin_parityll", .kind = DECLBUILTIN, .u.builtin = BUILTINPARITYL},
+		{.name = "__builtin_popcount", .kind = DECLBUILTIN, .u.builtin = BUILTINPOPCOUNT},
+		{.name = "__builtin_popcountl", .kind = DECLBUILTIN, .u.builtin = BUILTINPOPCOUNTL},
+		{.name = "__builtin_popcountll", .kind = DECLBUILTIN, .u.builtin = BUILTINPOPCOUNTL},
+		{.name = "__builtin_choose_expr", .kind = DECLBUILTIN, .u.builtin = BUILTINCHOOSEEXPR},
 		{.name = "__builtin_constant_p",  .kind = DECLBUILTIN, .u.builtin = BUILTINCONSTANTP},
+		{.name = "__builtin_object_size", .kind = DECLBUILTIN, .u.builtin = BUILTINOBJECTSIZE},
+		{.name = "__builtin_return_address", .kind = DECLBUILTIN, .u.builtin = BUILTINRETURNADDRESS},
+		{.name = "__builtin_extract_return_addr", .kind = DECLBUILTIN, .u.builtin = BUILTINEXTRACTRETURNADDR},
+		{.name = "__builtin_isdigit", .kind = DECLBUILTIN, .u.builtin = BUILTINISDIGIT},
+		{.name = "__builtin_prefetch", .kind = DECLBUILTIN, .u.builtin = BUILTINPREFETCH},
+		{.name = "__builtin_frame_address", .kind = DECLBUILTIN, .u.builtin = BUILTINFRAMEADDRESS},
 		{.name = "__builtin_expect",      .kind = DECLBUILTIN, .u.builtin = BUILTINEXPECT},
 		{.name = "__builtin_fabsf",      .kind = DECLBUILTIN, .u.builtin = BUILTINFABSF},
 		{.name = "__builtin_inff",        .kind = DECLBUILTIN, .u.builtin = BUILTININFF},
@@ -127,6 +156,23 @@ scopeinit(void)
 		(struct type *[]){mkpointertype(&typevoid, QUALNONE), mkpointertype(&typevoid, QUALCONST), &typeulong});
 	scopeputalias("__builtin_char_memchr", "memchr", mkpointertype(&typevoid, QUALNONE), 3,
 		(struct type *[]){mkpointertype(&typevoid, QUALCONST), &typeint, &typeulong});
+	/* the rest of the GCC builtins the Linux kernel's headers call (zstd's bitstream.h: __builtin_memset; fortify) */
+	scopeputalias("__builtin_memset", "memset", mkpointertype(&typevoid, QUALNONE), 3,
+		(struct type *[]){mkpointertype(&typevoid, QUALNONE), &typeint, &typeulong});
+	scopeputalias("__builtin_memcpy", "memcpy", mkpointertype(&typevoid, QUALNONE), 3,
+		(struct type *[]){mkpointertype(&typevoid, QUALNONE), mkpointertype(&typevoid, QUALCONST), &typeulong});
+	scopeputalias("__builtin_strcpy", "strcpy", mkpointertype(&typechar, QUALNONE), 2,
+		(struct type *[]){mkpointertype(&typechar, QUALNONE), mkpointertype(&typechar, QUALCONST)});
+	scopeputalias("__builtin_strncpy", "strncpy", mkpointertype(&typechar, QUALNONE), 3,
+		(struct type *[]){mkpointertype(&typechar, QUALNONE), mkpointertype(&typechar, QUALCONST), &typeulong});
+	scopeputalias("__builtin_strcat", "strcat", mkpointertype(&typechar, QUALNONE), 2,
+		(struct type *[]){mkpointertype(&typechar, QUALNONE), mkpointertype(&typechar, QUALCONST)});
+	scopeputalias("__builtin_strncat", "strncat", mkpointertype(&typechar, QUALNONE), 3,
+		(struct type *[]){mkpointertype(&typechar, QUALNONE), mkpointertype(&typechar, QUALCONST), &typeulong});
+	scopeputalias("__builtin_strcmp", "strcmp", &typeint, 2,
+		(struct type *[]){mkpointertype(&typechar, QUALCONST), mkpointertype(&typechar, QUALCONST)});
+	scopeputalias("__builtin_strncmp", "strncmp", &typeint, 3,
+		(struct type *[]){mkpointertype(&typechar, QUALCONST), mkpointertype(&typechar, QUALCONST), &typeulong});
 }
 
 struct scope *
@@ -143,6 +189,11 @@ mkscope(struct scope *parent)
 	s->asanbreak = parent->asanbreak;
 	s->asancontinue = parent->asancontinue;
 	s->parent = parent;
+	s->labels = NULL;
+	s->cleanmark = 0;
+	s->cleanbreak = parent->cleanbreak;
+	s->cleancontinue = parent->cleancontinue;
+	s->stmtexpr = false;
 
 	return s;
 }

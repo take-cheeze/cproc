@@ -6,7 +6,7 @@ function $f(w %.1, w %.3) {
 	%.4 =l alloc4 4
 	storew %.3, %.4
 @body.2
-	jnz 0, @if_true.3, @if_false.4
+	jmp @if_false.4
 @if_true.3
 @if_false.4
 @L1.5

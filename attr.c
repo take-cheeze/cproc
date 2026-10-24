@@ -4,6 +4,9 @@
 #include "util.h"
 #include "cc.h"
 
+struct declattr declattr;
+const char *attrabi;
+
 enum attrprefix {
 	PREFIXNONE = 1,  /* standard attribute */
 	PREFIXGNU,
@@ -34,7 +37,8 @@ parseattr(struct attr *a, enum attrkind allowed, enum attrprefix prefix)
 	enum attrkind kind;
 	int paren;
 
-	if (tok.kind < TIDENT)
+	/* an attribute name is an identifier or a keyword (GNU const, the kernel's __attribute_const__) */
+	if (tok.kind < TALIGNAS)
 		return false;
 	name = strip(tokenstr(tok.kind), namebuf, sizeof namebuf);
 	next();
@@ -60,7 +64,7 @@ parseattr(struct attr *a, enum attrkind allowed, enum attrprefix prefix)
 			if (consume(TLPAREN)) {
 				unsigned long long i;
 
-				i = intconstexpr(&filescope, false);
+				i = intconstexpr(attrscope, false);
 				if (!i || i & i - 1 || i > INT_MAX)
 					error(&tok.loc, "invalid alignment %llu", i);
 				if (a)
@@ -84,17 +88,94 @@ parseattr(struct attr *a, enum attrkind allowed, enum attrprefix prefix)
 				a->cleanup = cleanup;
 			expect(TRPAREN, "after cleanup function");
 		} else if (strcmp(name, "section") == 0) {
+			struct stringlit lit;
+
 			kind = ATTRSECTION;
 			expect(TLPAREN, "after 'section'");
-			section = expect(TSTRINGLIT, "for section name");
+			tokencheck(&tok, TSTRINGLIT, "for section name");
+			stringconcat(&lit, true);   /* ".initcall" "6" ".init": adjacent literals, as the kernel writes them */
+			section = lit.data;
 			if (a)
 				a->section = section;
+			declattr.section = section;
 			expect(TRPAREN, "after section name");
+		} else if (strcmp(name, "ms_abi") == 0 || strcmp(name, "sysv_abi") == 0 || strcmp(name, "regparm") == 0 ||
+		           strcmp(name, "stdcall") == 0 || strcmp(name, "fastcall") == 0 || strcmp(name, "thiscall") == 0) {
+			/* another calling convention (the kernel's __efiapi): the function type is marked, its arguments skipped */
+			attrabi = strcmp(name, "ms_abi") == 0 ? "ms_abi" : strcmp(name, "sysv_abi") == 0 ? "sysv_abi" : "regparm";
+		} else if (strcmp(name, "mode") == 0) {
+			/* an integer mode: QI (byte) 1, HI 2, SI 4, DI (word, pointer) 8 bytes; others are refused */
+			char mbuf[32];
+			const char *m;
+			int size = 0;
+
+			kind = ATTRMODE;
+			expect(TLPAREN, "after 'mode'");
+			m = strip(expect(TIDENT, "for mode"), mbuf, sizeof mbuf);
+			if (strcmp(m, "QI") == 0 || strcmp(m, "byte") == 0)
+				size = 1;
+			else if (strcmp(m, "HI") == 0)
+				size = 2;
+			else if (strcmp(m, "SI") == 0)
+				size = 4;
+			else if (strcmp(m, "DI") == 0 || strcmp(m, "word") == 0 || strcmp(m, "pointer") == 0)
+				size = 8;
+			else
+				error(&tok.loc, "GNU attribute mode(%s) is not supported", m);
+			if (a)
+				a->modesize = size;
+			expect(TRPAREN, "after mode");
+		} else if (strcmp(name, "weak") == 0) {
+			declattr.weak = true;
+		} else if (strcmp(name, "alias") == 0 || strcmp(name, "visibility") == 0) {
+			/* GNU alias("target") and visibility("hidden"): kept for the declaration (declattr) */
+			struct stringlit lit;
+			bool isalias = name[0] == 'a';
+
+			expect(TLPAREN, isalias ? "after 'alias'" : "after 'visibility'");
+			tokencheck(&tok, TSTRINGLIT, isalias ? "for alias target" : "for visibility");
+			stringconcat(&lit, true);
+			if (isalias) {
+				declattr.alias = lit.data;
+			} else {
+				if (strcmp(lit.data, "default") && strcmp(lit.data, "hidden") && strcmp(lit.data, "protected") &&
+				    strcmp(lit.data, "internal"))
+					error(&tok.loc, "unknown visibility '%s'", (char *)lit.data);
+				declattr.visibility = lit.data;
+			}
+			expect(TRPAREN, isalias ? "after alias target" : "after visibility");
+		} else if (strcmp(name, "always_inline") == 0) {
+			declattr.alwaysinline = true;
+		} else if (strcmp(name, "noipa") == 0) {
+			declattr.noipa = true;
+		} else if (strcmp(name, "gnu_inline") == 0) {
+			declattr.gnuinline = true;
+		} else if (strcmp(name, "transparent_union") == 0) {
+			kind = ATTRTRANSPARENT;
+			declattr.transparent = true;
+		} else if (strcmp(name, "used") == 0) {
+			kind = ATTRUSED;
+			declattr.used = true;
 		}
 		break;
 	}
+	/* a GNU attribute that changes what a declaration means -- its type (vector_size), its code (naked,
+	 * interrupt, no_caller_saved_registers, target), its binding (weakref, ifunc) -- is refused, never ignored as
+	 * the hints and diagnostics (noinline, cold, format, nonnull, ...) are */
+	if (prefix == PREFIXGNU && !kind) {
+		static const char *const meaning[] = {
+			"vector_size", "naked", "interrupt", "no_caller_saved_registers", "weakref", "ifunc",
+			"target_clones", "symver", "tls_model", "scalar_storage_order", "nocf_check", "fentry_name",
+		};
+		size_t i;
+
+		for (i = 0; i < sizeof meaning / sizeof meaning[0]; ++i)
+			if (strcmp(name, meaning[i]) == 0)
+				error(&tok.loc, "GNU attribute '%s' is not supported (it changes what the declaration means)", name);
+	}
 	if (kind) {
-		if (!(kind & allowed))
+		/* section, used and transparent_union are recorded for the declaration (declattr) wherever they appear */
+		if (kind & ~(ATTRSECTION | ATTRUSED | ATTRTRANSPARENT) & ~allowed)
 			error(&tok.loc, "%sattribute '%s' is not supported here", prefixname, name);
 		if (a)
 			a->kind |= kind;

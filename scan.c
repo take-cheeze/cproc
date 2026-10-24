@@ -193,7 +193,7 @@ escape(struct scanner *s)
 			if (isodigit(s->chr))
 				nextchar(s);
 		}
-	} else if (strchr("'\"?\\abfnrtv", s->chr)) {
+	} else if (strchr("'\"?\\abefnrtv", s->chr)) {
 		nextchar(s);
 	} else {
 		error(&s->loc, "invalid escape sequence");

@@ -5,7 +5,7 @@ function w $main() {
 	%.1 =w loadw extern $i
 	jnz %.1, @if_true.3, @logic_or.5
 @logic_or.5
-	jnz 0, @if_true.3, @if_false.4
+	jmp @if_false.4
 @if_true.3
 	ret 1
 @if_false.4
@@ -13,7 +13,7 @@ function w $main() {
 	%.3 =w cnes %.2, s_0
 	jnz %.3, @if_true.6, @logic_or.8
 @logic_or.8
-	jnz 0, @if_true.6, @if_false.7
+	jmp @if_false.7
 @if_true.6
 	ret 1
 @if_false.7
@@ -21,7 +21,7 @@ function w $main() {
 	%.5 =w cnel %.4, 0
 	jnz %.5, @if_true.9, @logic_or.11
 @logic_or.11
-	jnz 0, @if_true.9, @if_false.10
+	jmp @if_false.10
 @if_true.9
 	ret 1
 @if_false.10

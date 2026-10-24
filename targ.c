@@ -51,6 +51,10 @@ static const struct target alltargs[] = {
 	},
 };
 
+/* -u (gcc's -funsigned-char): plain char is unsigned whatever the target's default; the Linux kernel builds with it */
+bool unsignedchar;
+bool shortwchar, autozero, prune, gnukeywords;
+
 void
 targinit(const char *name)
 {
@@ -67,7 +71,7 @@ targinit(const char *name)
 	}
 	if (!targ)
 		fatal("unknown target '%s'", name);
-	typechar.u.arith.issigned = targ->signedchar;
+	typechar.u.arith.issigned = targ->signedchar && !unsignedchar;
 	qual = QUALNONE;
 	typeadjvalist = typeadjust(targ->typevalist, &qual);
 }

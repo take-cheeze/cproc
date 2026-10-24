@@ -585,8 +585,10 @@ eval(struct expr *expr)
 				break;
 			if (l->kind == EXPRCONST) {
 				binary(expr, expr->op, l, r);
-			} else if (l->kind == EXPRBINARY && l->type->kind == TYPEPOINTER && l->op == TADD && l->u.binary.r->kind == EXPRCONST) {
-				/* (P + C1) ± C2  ->  P + (C1 ± C2) */
+			} else if (l->kind == EXPRBINARY && l->op == TADD && l->u.binary.r->kind == EXPRCONST &&
+			           (l->type->kind == TYPEPOINTER || l->type->prop & PROPINT && l->type->size == typelong.size)) {
+				/* (P + C1) ± C2  ->  P + (C1 ± C2), also for P an address cast to a 64-bit integer, which wraps as
+				 * the pointer does (the kernel's TOP_OF_INIT_STACK, (unsigned long)&init_stack + C1 - C2) */
 				binary(expr->u.binary.r, expr->op, l->u.binary.r, r);
 				expr->op = TADD;
 				expr->u.binary.l = l->u.binary.l;
