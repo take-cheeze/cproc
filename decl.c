@@ -1380,7 +1380,7 @@ defineobj(struct decl *d, struct init *init, bool hasinit, struct func *f)
 	if (d->u.obj.storage == SDAUTO)
 		funcinit(f, d, init, hasinit || autozero);   /* -z: zero an automatic object that has no initializer */
 	else
-		emitdata(d, init);
+		emitdata(d, init, f);
 	d->defined = true;
 }
 
@@ -1730,7 +1730,7 @@ stringdecl(struct expr *expr)
 	if (mapput(&strings, &key, &i)) {
 		d = mkdecl("string", DECLOBJECT, expr->type, QUALNONE, LINKNONE);
 		d->value = mkglobal(d);
-		emitdata(d, mkinit(0, expr->type->size, (struct bitfield){0}, expr));
+		emitdata(d, mkinit(0, expr->type->size, (struct bitfield){0}, expr), NULL);
 		strings.vals[i].p = d;
 	} else {
 		d = strings.vals[i].p;

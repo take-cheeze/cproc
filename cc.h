@@ -704,4 +704,4 @@ void emitsymattr(struct decl *);   /* a file-scope asm's text, to the side file 
 void funcinit(struct func *, struct decl *, struct init *, bool);
 
 void emitfunc(struct func *, bool);
-void emitdata(struct decl *, struct init *);
+void emitdata(struct decl *, struct init *, struct func *);

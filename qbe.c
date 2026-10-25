@@ -312,6 +312,7 @@ qbetype(struct type *t)
 
 static void emittype(struct type *);
 static void emitname(struct value *);
+static void emitbarename(struct value *);
 static void funcasmout(struct func *);
 static void emitvalue(struct value *);
 
@@ -4226,7 +4227,14 @@ emitname(struct value *v)
 	if (kind >= countof(sigil) || !sigil[kind])
 		fatal("invalid value");
 	putchar(sigil[kind]);
-	if (kind == VALUE_GLOBAL && v->id)
+	emitbarename(v);
+}
+
+/* a name as emitname writes it, without the sigil */
+static void
+emitbarename(struct value *v)
+{
+	if ((v->kind & 0xf) == VALUE_GLOBAL && v->id)
 		fputs(".L", stdout);
 	if (v->kind & VALUE_QUOTE)
 		putchar('"');
@@ -4667,7 +4675,7 @@ struct asanglobal {
 static struct array asanglobals;
 
 void
-emitdata(struct decl *d, struct init *init)
+emitdata(struct decl *d, struct init *init, struct func *owner)
 {
 	struct init *cur;
 	struct type *t;
@@ -4681,9 +4689,16 @@ emitdata(struct decl *d, struct init *init)
 	for (cur = init; cur; cur = cur->next)
 		cur->expr = eval(cur->expr);
 	/* GNU section: read-only ("a") when the object is const, as gcc chooses; used keeps it under cproc -p (a section
-	 * alone does not: gcc drops an unreferenced static object in .init.data too) */
-	if (d->used && prune)
+	 * alone does not: gcc drops an unreferenced static object in .init.data too). A used static in a function (owner)
+	 * lives with that function: gcc emits nothing of an inline function it drops (the kernel's static_call_cond has an
+	 * __ADDRESSABLE(key) in kvm_host.h's unused helpers, and the key is not defined) */
+	if (d->used && prune && owner) {
+		fputs("# nfcxx:keepwith ", stdout);
+		emitbarename(owner->decl->value);
+		putchar('\n');
+	} else if (d->used && prune) {
 		puts("# nfcxx:keep");
+	}
 	if (d->section) {
 		struct type *et = d->type;
 		bool ro = d->qual & QUALCONST;
