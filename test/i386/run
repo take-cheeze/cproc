@@ -31,7 +31,7 @@ for t; do
 		   $CCQBE -t i386 -o $tmp.ssa $tmp.i &&
 		   $QBE -t $tgt -o $tmp.s $tmp.ssa &&
 		   $CC32 $rp -w $cflags -o $tmp.exe $tmp.s $gcc $dir/rt.c &&
-		   $CC32 $rp -w -O1 $cflags -o $tmp.ref "$t" $gcc $dir/rt.c; then
+		   $CC32 $rp -w -O1 $cflags -I$dir -o $tmp.ref "$t" $gcc $dir/rt.c; then
 			$tmp.exe >$tmp.out 2>&1; echo "exit $?" >>$tmp.out
 			$tmp.ref >$tmp.refout 2>&1; echo "exit $?" >>$tmp.refout
 			diff -u $tmp.refout $tmp.out && ok=1
