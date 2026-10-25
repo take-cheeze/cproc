@@ -1,0 +1,44 @@
+export data $sizes = align 4 { w 4, w 4, w 28, w 4, w 12, w 8, w 4, w 4, w 4, }
+export data $modes = align 4 { w 4, w 8, }
+export data $ptr = align 4 { w $sizes + 4, }
+export
+function w $diff(w %.1, w %.3) {
+@start.1
+	%.2 =w alloc4 4
+	storew %.1, %.2
+	%.4 =w alloc4 4
+	storew %.3, %.4
+@body.2
+	%.5 =w loadw %.2
+	%.6 =w loadw %.4
+	%.7 =w sub %.5, %.6
+	%.8 =w div %.7, 1
+	ret %.8
+}
+type :s.2 = { b, w 2, w 2, w, w, }
+type :t.1 = { h, :s.2 2, }
+export
+function :t.1 $get(w %.1) {
+@start.3
+	%.2 =w alloc4 4
+	storew %.1, %.2
+@body.4
+	%.3 =w loadw %.2
+	ret %.3
+}
+export
+function :s.2 $arg(w %.1, ...) {
+@start.5
+	%.2 =w alloc4 4
+	storew %.1, %.2
+	%.3 =w alloc4 4
+	%.4 =w alloc4 28
+@body.6
+	vastart %.3
+	%.5 =w loadw %.3
+	%.6 =w add %.5, 28
+	storew %.6, %.3
+	blit %.5, %.4, 28
+	%.7 =w loadw %.3
+	ret %.4
+}

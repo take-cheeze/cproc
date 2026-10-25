@@ -93,6 +93,10 @@ bootstrap: stage2 stage3
 check: all
 	@CCQBE=./cproc-qbe ./runtests
 
+.PHONY: check-i386
+check-i386: all
+	@CCQBE=./cproc-qbe test/i386/run
+
 .PHONY: check-stage2
 check-stage2: all
 	@CCQBE=stage2/cproc-qbe ./runtests

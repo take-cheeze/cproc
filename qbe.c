@@ -152,7 +152,8 @@ struct asanjmp {
 	struct array *open;
 };
 
-static const int ptrclass = 'l';
+/* the QBE class of a pointer (and of size_t): w on an ILP32 target (i386) */
+#define ptrclass (targ->ilp32 ? 'w' : 'l')
 
 void
 switchcase(struct switchcases *cases, unsigned long long lo, unsigned long long hi, struct block *b)
@@ -281,6 +282,7 @@ qbetype(struct type *t)
 		sh = {'w', 'h', ILOADSH, ISTOREH},
 		w = {'w', 'w', ILOADW, ISTOREW},
 		l = {'l', 'l', ILOADL, ISTOREL},
+		p32 = {'w', 'w', ILOADW, ISTOREW},
 		s = {'s', 's', ILOADS, ISTORES},
 		d = {'d', 'd', ILOADD, ISTORED},
 		v = {0};
@@ -288,7 +290,7 @@ qbetype(struct type *t)
 	if (t == &typevoid)
 		return v;
 	if (!(t->prop & PROPSCALAR) || t->prop & PROPSOFT)
-		return l;
+		return targ->ilp32 ? p32 : l;   /* the address of the object */
 	switch (t->size) {
 	case 1: return t->u.arith.issigned ? sb : ub;
 	case 2: return t->u.arith.issigned ? sh : uh;
@@ -1017,7 +1019,7 @@ calcvla(struct func *f, struct type *t)
 		assert(t->u.array.length);
 		length = convert(f, &typeulong, t->u.array.length->type, funcexpr(f, t->u.array.length));
 		basesize = t->base->size ? mkintconst(t->base->size) : t->base->u.array.size;
-		t->u.array.size = funcinst(f, IMUL, 'l', length, basesize);
+		t->u.array.size = funcinst(f, IMUL, ptrclass, length, basesize);
 	}
 }
 
@@ -1684,7 +1686,13 @@ funccopy(struct func *f, struct value *dst, struct value *src, unsigned long lon
 	case 1: load = ILOADUB, store = ISTOREB; break;
 	case 2: load = ILOADUH, store = ISTOREH; break;
 	case 4: load = ILOADW, store = ISTOREW; break;
-	default: load = ILOADL, store = ISTOREL, align = 8, class = 'l'; break;
+	default:
+		if (targ->ilp32) {   /* no 64-bit integers: by words */
+			load = ILOADW, store = ISTOREW, align = 4;
+			break;
+		}
+		load = ILOADL, store = ISTOREL, align = 8, class = 'l';
+		break;
 	}
 	inc = mkintconst(align);
 	off = 0;
@@ -1725,6 +1733,8 @@ funcvolatile(struct func *f, struct type *t, struct lvalue lval, struct value *v
 
 	if (!volatilecalls || !asmout || lval.bits.before || lval.bits.after)
 		return NULL;
+	if (strcmp(targ->name, "x86_64-sysv") != 0)
+		error(&tok.loc, "volatile access helpers (-V) are only supported on x86_64");
 	if (t->kind == TYPEPOINTER)
 		t = &typeulong;
 	/* an aggregate of 1, 2, 4 or 8 bytes (the kernel's pte_t through WRITE_ONCE and READ_ONCE) is one access of
@@ -2092,8 +2102,8 @@ funcregvar(struct func *f, struct decl *d)
 	static bool emitted;
 	static struct value fn = {.kind = VALUE_GLOBAL, .u.name = "nfcxx_read_rsp"};
 
-	if (strcmp(d->regvar, "rsp") != 0)
-		error(&tok.loc, "global register variable '%s' in %%%s: only %%rsp is supported", d->name, d->regvar);
+	if (strcmp(d->regvar, "rsp") != 0 || strcmp(targ->name, "x86_64-sysv") != 0)
+		error(&tok.loc, "global register variable '%s' in %%%s: only %%rsp on x86_64 is supported", d->name, d->regvar);
 	if (!asmout)
 		error(&tok.loc, "global register variable '%s' needs the inline-asm side file (-a)", d->name);
 	if (!emitted) {
@@ -2317,6 +2327,14 @@ funcvaargagg(struct func *f, struct expr *e)
 		funcinst(f, ISTOREL, 0, funcinst(f, IADD, 'l', tmp, mkintconst(size)), ap);
 		return tmp;
 	}
+	if (targ->ilp32) {
+		/* i386: every argument is in the stack slots that the va_list pointer walks, rounded up to 4 bytes */
+		size = ALIGNUP(e->type->size, 4);
+		ap = funcvalistaddr(f, e->base);
+		tmp = funcinst(f, ILOADW, 'w', ap, NULL);
+		funcinst(f, ISTOREW, 0, funcinst(f, IADD, 'w', tmp, mkintconst(size)), ap);
+		return tmp;
+	}
 	if (e->type->kind == TYPELDOUBLE) {
 		/* a long double is class X87 (memory): the next 16-byte aligned slot of the overflow area */
 		ap = funcexpr(f, e->base);
@@ -2509,6 +2527,8 @@ funcoverflow(struct func *f, struct expr *e)
 	struct value *flag, *rest;
 	unsigned w = rt->size * 8;
 
+	if (targ->ilp32)   /* the exact result is computed in 64-bit integers, which QBE does not have on i386 yet */
+		error(&tok.loc, "__builtin_*_overflow is not supported on %s yet", targ->name);
 	ua = convert(f, as ? &typelong : &typeulong, ae->type, funcexpr(f, ae));
 	ub = convert(f, bs ? &typelong : &typeulong, be->type, funcexpr(f, be));
 	rp = funcexpr(f, re);
@@ -3016,6 +3036,8 @@ zero(struct func *func, struct value *addr, int align, unsigned long long offset
 	 * offset that matters here, so clamping the alignment is enough (long double arrays and structs reach this) */
 	if (align > 8)
 		align = 8;
+	if (align > 4 && targ->ilp32)   /* no 64-bit integers: by words */
+		align = 4;
 	while (offset < end) {
 		if ((align - (offset & align - 1)) & a) {
 			tmp = offset ? funcinst(func, IADD, ptrclass, addr, mkintconst(offset)) : addr;
@@ -4323,9 +4345,14 @@ emittype(struct type *t)
 			}
 			qoff += m->type->size;
 		}
-		emitclass(qbetype(sub).data, sub->value);
-		if (m->type->size > sub->size)
-			printf(" %llu", m->type->size / sub->size);
+		if (targ->ilp32 && sub->size == 8 && sub->prop & PROPSCALAR && !(sub->prop & PROPSOFT)) {
+			/* ILP32: an 8-byte scalar (long long, double) is aligned on 4 in a struct; QBE's l and d are on 8 */
+			printf("w %llu", m->type->size / 4);
+		} else {
+			emitclass(qbetype(sub).data, sub->value);
+			if (m->type->size > sub->size)
+				printf(" %llu", m->type->size / sub->size);
+		}
 		if (t->kind == TYPESTRUCT) {
 			fputs(", ", stdout);
 			/* skip subsequent members contained within the same storage unit */

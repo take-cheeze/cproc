@@ -91,8 +91,8 @@ mkpointertype(struct type *base, enum typequal qual)
 	t = mktype(TYPEPOINTER, PROPSCALAR);
 	t->base = base;
 	t->qual = qual;
-	t->size = 8;
-	t->align = 8;
+	t->size = targ->ilp32 ? 4 : 8;
+	t->align = t->size;
 	if (base)
 		t->prop |= base->prop & PROPVM;
 

@@ -447,6 +447,8 @@ main(int argc, char *argv[])
 	} ARGEND
 
 	targinit(target);
+	if (targ->ilp32 && asanon)
+		fatal("-fsanitize=address is not supported on %s", targ->name);
 
 	if (asmfile && !(asmout = fopen(asmfile, "w")))
 		fatal("open %s:", asmfile);

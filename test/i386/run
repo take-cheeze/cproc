@@ -1,0 +1,48 @@
+#!/bin/sh
+# Differential tests of the i386 target: each test/i386/*.c is compiled by
+# cproc-qbe -t i386 and QBE (-t i386, then -t i386_regparm3), and by gcc -m32
+# (with -mregparm=3 for the second), and run; the outputs must be the same.
+# The programs print through the freestanding runtime rt.c (no 32-bit libc
+# needed); a 64-bit Linux kernel runs the static i386 binaries natively.
+# QBE is $QBE (default: qbe in PATH).
+
+: ${CCQBE:=./cproc-qbe} ${QBE:=qbe} ${CC32:=gcc -m32}
+dir=test/i386
+tmp=${TMPDIR:-/tmp}/cproc-i386.$$
+cflags="-ffreestanding -fno-builtin -nostdlib -static -fno-pic -no-pie -fno-stack-protector -fno-asynchronous-unwind-tables"
+trap 'rm -f $tmp.*' EXIT
+
+if ! $CC32 -c -x c -o /dev/null /dev/null 2>/dev/null; then
+	echo "no $CC32: i386 tests skipped"
+	exit 0
+fi
+[ $# = 0 ] && set -- $dir/*.c
+n=0 fail=0
+for t; do
+	case $t in */rt.c|*.gcc.c) continue ;; esac
+	# t.gcc.c: a part compiled by gcc in both builds (calls between the two compilers)
+	gcc=${t%.c}.gcc.c
+	[ -f $gcc ] || gcc=
+	for tgt in i386 i386_regparm3; do
+		case $tgt in i386_regparm3) rp=-mregparm=3 ;; *) rp= ;; esac
+		n=$((n + 1))
+		ok=
+		if $CC32 -E -P -ffreestanding -I$dir -o $tmp.i "$t" &&
+		   $CCQBE -t i386 -o $tmp.ssa $tmp.i &&
+		   $QBE -t $tgt -o $tmp.s $tmp.ssa &&
+		   $CC32 $rp -w $cflags -o $tmp.exe $tmp.s $gcc $dir/rt.c &&
+		   $CC32 $rp -w -O1 $cflags -o $tmp.ref "$t" $gcc $dir/rt.c; then
+			$tmp.exe >$tmp.out 2>&1; echo "exit $?" >>$tmp.out
+			$tmp.ref >$tmp.refout 2>&1; echo "exit $?" >>$tmp.refout
+			diff -u $tmp.refout $tmp.out && ok=1
+		fi
+		if [ "$ok" ]; then
+			echo "[PASS] $t ($tgt)"
+		else
+			echo "[FAIL] $t ($tgt)"
+			fail=$((fail + 1))
+		fi
+	done
+done
+printf "\n%d/%d i386 tests passed\n" $((n - fail)) $n
+[ $fail = 0 ]

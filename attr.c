@@ -118,8 +118,10 @@ parseattr(struct attr *a, enum attrkind allowed, enum attrprefix prefix)
 				size = 2;
 			else if (strcmp(m, "SI") == 0)
 				size = 4;
-			else if (strcmp(m, "DI") == 0 || strcmp(m, "word") == 0 || strcmp(m, "pointer") == 0)
+			else if (strcmp(m, "DI") == 0)
 				size = 8;
+			else if (strcmp(m, "word") == 0 || strcmp(m, "pointer") == 0)
+				size = targ->ilp32 ? 4 : 8;
 			else
 				error(&tok.loc, "GNU attribute mode(%s) is not supported", m);
 			if (a)

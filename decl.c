@@ -87,6 +87,8 @@ modetype(struct type *t, int size)
 
 	if (!(t->prop & PROPINT) || t->kind == TYPEBOOL)
 		error(&tok.loc, "GNU attribute mode on a type that is not an integer is not supported");
+	if (size == 8 && typelong.size != 8)   /* ILP32: DI is long long */
+		return t->u.arith.issigned ? &typellong : &typeullong;
 	return bysize[size][t->u.arith.issigned];
 }
 
@@ -371,6 +373,8 @@ tagspec(struct scope *s)
 
 				sign = min > 0;
 				et = bysize[trail.modesize][sign];
+				if (trail.modesize == 8 && typelong.size != 8)   /* ILP32: DI is long long */
+					et = sign ? &typellong : &typeullong;
 				if (!typehasint(et, max, false) || sign && !typehasint(et, -min, true))
 					error(&tok.loc, "an enumerator value does not fit the enum's mode");
 				t->base = et;
@@ -646,6 +650,9 @@ done:
 	default:
 		error(&tok.loc, "invalid combination of type specifiers");
 	}
+	/* i386: gcc's long double is a 12-byte x87 value and there is no __int128; cproc's are 16-byte soft types */
+	if (targ->ilp32 && t && (t == &typeldouble || t == &typefloat128 || t->kind == TYPEINT128))
+		error(&tok.loc, "%s is not supported on %s", t->kind == TYPEINT128 ? "__int128" : t == &typeldouble ? "long double" : "__float128", targ->name);
 	if (tq & QUALRESTRICT) {
 		/* C23 6.7.4.1p2 */
 		other = t;
@@ -1111,7 +1118,7 @@ bitunittype(struct type *t, unsigned long long size)
 	case 1: return s ? &typeschar : &typeuchar;
 	case 2: return s ? &typeshort : &typeushort;
 	case 4: return s ? &typeint : &typeuint;
-	case 8: return s ? &typelong : &typeulong;
+	case 8: return typelong.size == 8 ? (s ? &typelong : &typeulong) : (s ? &typellong : &typeullong);
 	}
 	return NULL;
 }

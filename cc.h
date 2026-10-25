@@ -498,6 +498,7 @@ struct target {
 	struct type *typevalist;
 	struct type *typewchar;
 	int signedchar;
+	int ilp32;   /* 32-bit long and pointers (i386): QBE's pointers are of class w */
 };
 
 extern const struct target *targ;

@@ -41,6 +41,21 @@ static const struct target alltargs[] = {
 		.typewchar = &typeuint,
 	},
 	{
+		/* i386 (System V, Linux; the kernel's -m16 real-mode code is this too): ILP32, va_list a char *, wchar_t a
+		 * long, and long long and double aligned on 4 in structs; the calling convention (cdecl or gcc's
+		 * -mregparm=3) is QBE's target (i386 or i386_regparm3). QBE has no 64-bit integers nor floating point on
+		 * i386 yet: it refuses the code that uses them (cproc refuses long double and __int128 itself). */
+		.name = "i386",
+		.typevalist = &(struct type){
+			.kind = TYPEPOINTER, .prop = PROPSCALAR,
+			.align = 4, .size = 4,
+			.base = &typechar,
+		},
+		.typewchar = &typelong,
+		.signedchar = 1,
+		.ilp32 = 1,
+	},
+	{
 		.name = "riscv64",
 		.typevalist = &(struct type){
 			.kind = TYPEPOINTER, .prop = PROPSCALAR,
@@ -72,6 +87,14 @@ targinit(const char *name)
 	if (!targ)
 		fatal("unknown target '%s'", name);
 	typechar.u.arith.issigned = targ->signedchar && !unsignedchar;
+	if (targ->ilp32) {
+		typelong.size = typelong.align = 4;
+		typeulong.size = typeulong.align = 4;
+		typelong.u.arith.width = typeulong.u.arith.width = 32;
+		typellong.align = typeullong.align = 4;
+		typedouble.align = 4;
+		typenullptr.size = typenullptr.align = 4;
+	}
 	qual = QUALNONE;
 	typeadjvalist = typeadjust(targ->typevalist, &qual);
 }
