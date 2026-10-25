@@ -2527,10 +2527,9 @@ funcoverflow(struct func *f, struct expr *e)
 	struct value *flag, *rest;
 	unsigned w = rt->size * 8;
 
-	if (targ->ilp32)   /* the exact result is computed in 64-bit integers, which QBE does not have on i386 yet */
-		error(&tok.loc, "__builtin_*_overflow is not supported on %s yet", targ->name);
-	ua = convert(f, as ? &typelong : &typeulong, ae->type, funcexpr(f, ae));
-	ub = convert(f, bs ? &typelong : &typeulong, be->type, funcexpr(f, be));
+	/* in 64-bit integers: long long (long is 4 bytes on ILP32) */
+	ua = convert(f, as ? &typellong : &typeullong, ae->type, funcexpr(f, ae));
+	ub = convert(f, bs ? &typellong : &typeullong, be->type, funcexpr(f, be));
 	rp = funcexpr(f, re);
 	/* sign masks (all ones for a negative operand) and magnitudes */
 	ma = as ? ovl(f, ISAR, ua, mkintconst(63)) : zero;
@@ -2570,7 +2569,7 @@ funcoverflow(struct func *f, struct expr *e)
 	neg = ovl(f, IAND, neg, ovcmp(f, ICNEL, ovl(f, IOR, hi, lo), zero));   /* zero is not negative */
 	v = ovl(f, ISUB, zero, neg);
 	out = ovl(f, ISUB, ovl(f, IXOR, lo, v), v);
-	funcstore(f, rt, re->type->qual, (struct lvalue){.addr = rp}, convert(f, rt, &typeulong, out));
+	funcstore(f, rt, re->type->qual, (struct lvalue){.addr = rp}, convert(f, rt, &typeullong, out));
 	/* overflow: a high half, or a magnitude out of the result type's range */
 	if (rs) {
 		rest = ovcmp(f, ICUGTL, lo, ovl(f, IADD, mkintconst((1ull << (w - 1)) - 1), neg));

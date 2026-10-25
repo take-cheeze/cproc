@@ -43,8 +43,8 @@ static const struct target alltargs[] = {
 	{
 		/* i386 (System V, Linux; the kernel's -m16 real-mode code is this too): ILP32, va_list a char *, wchar_t a
 		 * long, and long long and double aligned on 4 in structs; the calling convention (cdecl or gcc's
-		 * -mregparm=3) is QBE's target (i386 or i386_regparm3). QBE has no 64-bit integers nor floating point on
-		 * i386 yet: it refuses the code that uses them (cproc refuses long double and __int128 itself). */
+		 * -mregparm=3) is QBE's target (i386 or i386_regparm3). QBE has no floating point on i386 yet: it refuses
+		 * the code that uses it (cproc refuses long double, _Float16, __float128 and __int128 itself). */
 		.name = "i386",
 		.typevalist = &(struct type){
 			.kind = TYPEPOINTER, .prop = PROPSCALAR,
