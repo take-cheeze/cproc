@@ -1,0 +1,42 @@
+export
+function $f(l %.1, l %.3) {
+@start.1
+	%.2 =l alloc8 8
+	storel %.1, %.2
+	%.4 =l alloc8 8
+	storel %.3, %.4
+@body.2
+	%.5 =l loadl %.2
+	%.6 =l loadl %.4
+	blit %.6, %.5, 24
+	ret
+}
+export
+function l $g(l %.1, l %.3, l %.5) {
+@start.3
+	%.2 =l alloc8 8
+	storel %.1, %.2
+	%.4 =l alloc8 8
+	storel %.3, %.4
+	%.6 =l alloc8 8
+	storel %.5, %.6
+@body.4
+	%.7 =l loadl %.2
+	%.8 =l loadl %.4
+	%.9 =l loadl %.2
+	%.10 =l loadl %.4
+	%.11 =l loadl %.6
+	%.12 =l call extern $memcpy(l %.9, l %.10, l %.11)
+	ret %.12
+}
+export
+function $h(l %.1) {
+@start.5
+	%.2 =l alloc8 8
+	storel %.1, %.2
+@body.6
+	%.3 =l loadl %.2
+	%.4 =l call extern $memcpy(l extern $big, l %.3, l 200)
+	ret
+}
+export data $big = align 1 { z 200 }

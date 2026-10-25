@@ -2279,6 +2279,33 @@ funcexpr(struct func *f, struct expr *e)
 			callee = callee->base;  /* a function designator, decayed to a pointer */
 		if (callee->kind == EXPRIDENT && callee->u.ident.decl->kind == DECLFUNC && (e->type->kind == TYPEFLOAT128 || anyf128arg(e)))
 			addf128call(callee->u.ident.decl);
+		/* memcpy of a constant size up to 128 bytes is a blit (QBE expands it into loads and stores), as compilers
+		 * lower the library function: mrustc's C copies values with memcpy(&a, &b, sizeof(T)), and each was a call to
+		 * libc. Not memmove: the blit copies in one direction, which overlapping objects need not allow. Under
+		 * -fsanitize=address the call stays, so that libasan checks it. */
+		if (!asanon && callee->kind == EXPRIDENT && callee->u.ident.decl->kind == DECLFUNC
+		 && callee->u.ident.decl->linkage == LINKEXTERN && strcmp(callee->u.ident.decl->name, "memcpy") == 0
+		 && e->u.call.nargs == 3) {
+			struct expr *n = e->u.call.args->next->next;
+
+			while (n->kind == EXPRCAST && n->type->prop & PROPINT && n->base->type->prop & PROPINT)
+				n = n->base;
+			if (n->kind == EXPRCONST && n->type->prop & PROPINT && n->u.constant.u <= 128) {
+				struct value *dst, *src;
+				struct inst *inst;
+
+				dst = funcexpr(f, e->u.call.args);
+				src = funcexpr(f, e->u.call.args->next);
+				if (n->u.constant.u > 0) {
+					inst = mkinst(f, IBLIT, 0, src, dst);
+					inst->arg[2] = mkintconst(n->u.constant.u);
+					if (f->end->jump.kind)
+						funclabel(f, mkblock("dead"));
+					arrayaddptr(&f->end->insts, inst);
+				}
+				return dst;
+			}
+		}
 		argvals = xreallocarray(NULL, e->u.call.nargs, sizeof(argvals[0]));
 		for (arg = e->u.call.args, i = 0; arg; arg = arg->next, ++i) {
 			emittype(arg->type);
