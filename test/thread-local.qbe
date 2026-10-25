@@ -1,8 +1,6 @@
 thread export data $a = align 4 { w 1, }
 thread data $b = align 4 { w 2, }
 thread export data $c = align 4 { w 3, }
-thread export data $d = align 4 { z 4 }
-thread data $e = align 4 { z 4 }
 thread data $.Lx.2 = align 4 { w 6, }
 export
 function w $main() {
@@ -21,3 +19,5 @@ function w $main() {
 	%.11 =w sub %.9, %.10
 	ret %.11
 }
+thread export data $d = align 4 { z 4 }
+thread data $e = align 4 { z 4 }
