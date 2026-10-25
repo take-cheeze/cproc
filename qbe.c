@@ -3346,27 +3346,69 @@ static const char *const regname[16][4] = {
 static const int rpool[] = {RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11};
 
 /*
+The i386 targets (the kernel's real-mode code): the same numbers for the eight registers they have, with their names.
+%esi and %edi have no byte form (an empty name), so a byte operand takes one of the other four.
+*/
+static const char *const regname386[8][4] = {
+	{"eax","eax","ax","al"}, {"ecx","ecx","cx","cl"}, {"edx","edx","dx","dl"}, {"ebx","ebx","bx","bl"},
+	{"esi","esi","si",""},   {"edi","edi","di",""},   {"ebp","ebp","bp",""},   {"esp","esp","sp",""},
+};
+static const int rpool386[] = {RAX, RCX, RDX};
+static const int callee386[] = {RBX, RSI, RDI};
+static const char *const (*regs)[4] = regname;   /* the names of the target being compiled */
+static bool asmi386;       /* an i386 target: the thunk is 32-bit, its slot pointer in %eax (i386_regparm3) or at 4(%esp) */
+static bool asmregparm3;
+static char psfx = 'q';                 /* the suffix of push and pop */
+static const char *msfx = "qlwb";       /* the suffix of a move, by column (regsizecol) */
+
+/* the name of register r at column col: an empty name is a register the target has no form of at that size */
+static const char *
+asmregname(int r, int col)
+{
+	if (!*regs[r][col])
+		error(&tok.loc, "asm operand needs a register the target has no %s form of", col == 3 ? "byte" : "this size");
+	return regs[r][col];
+}
+
+/*
 The register of an operand the constraint leaves to the compiler: a caller-saved one from the pool, else -- every one
 is taken, as by the kernel's call_on_stack(), whose asm clobbers them all for the call it makes -- a callee-saved one,
 which the thunk preserves; one is left for the thunk's slot pointer.
 */
+static bool
+bytereg(int r)
+{
+	return !asmi386 || r == RAX || r == RCX || r == RDX || r == RBX;
+}
+
+static bool
+asmcallee(int r)
+{
+	if (asmi386)
+		return r == RBX || r == RSI || r == RDI || r == RBP;
+	return r == RBX || r == R12 || r == R13 || r == R14 || r == R15 || r == RBP;
+}
+
+/* a register for an operand the constraint leaves to the compiler; byte: it needs a byte form (i386) */
 static int
-asmpoolreg(const bool *used, unsigned *pool)
+asmpoolreg(const bool *used, unsigned *pool, bool byte)
 {
 	static const int callee[] = {R12, R13, R14, R15, RBX};
+	const int *pl = asmi386 ? rpool386 : rpool, *ce = asmi386 ? callee386 : callee;
+	unsigned npool = asmi386 ? countof(rpool386) : countof(rpool), nce = asmi386 ? countof(callee386) : countof(callee);
 	unsigned k, nfree = 0;
 
-	while (*pool < countof(rpool) && used[rpool[*pool]])
+	while (*pool < npool && used[pl[*pool]])
 		++*pool;
-	if (*pool < countof(rpool))
-		return rpool[(*pool)++];
-	for (k = 0; k < countof(callee); ++k)
-		nfree += !used[callee[k]];
+	if (*pool < npool)
+		return pl[(*pool)++];
+	for (k = 0; k < nce; ++k)
+		nfree += !used[ce[k]];
 	if (nfree < 2)
 		error(&tok.loc, "too many register asm operands");
-	for (k = 0; used[callee[k]]; ++k)
+	for (k = 0; used[ce[k]] || byte && !bytereg(ce[k]); ++k)
 		;
-	return callee[k];
+	return ce[k];
 }
 static int
 regsizecol(int sz)
@@ -3397,9 +3439,9 @@ clobberreg(const char *name)
 
 	if (*name == '%')
 		++name;
-	for (r = 0; r < 16; ++r)
+	for (r = 0; r < (asmi386 ? 8 : 16); ++r)
 		for (s = 0; s < 4; ++s)
-			if (strcmp(name, regname[r][s]) == 0)
+			if (*regs[r][s] && strcmp(name, regs[r][s]) == 0)
 				return r;
 	return -1;
 }
@@ -3435,7 +3477,7 @@ asmregvar(struct expr *e)
 static int
 asmopsize(struct type *t)
 {
-	if (!(t->prop & PROPSCALAR) || t->size == 0 || t->size > 8)
+	if (!(t->prop & PROPSCALAR) || t->size == 0 || t->size > 8 || asmi386 && t->size == 8)
 		error(&tok.loc, "unsupported type for an asm operand");
 	return t->size;
 }
@@ -3554,14 +3596,14 @@ asmsubst(struct asmrec *rec, unsigned total, int mod, unsigned idx)
 		fprintf(asmout, "%s", r->immsym);
 		if (r->imm)
 			fprintf(asmout, "%+ld", r->imm);
-		if (mod == 'a')
+		if (mod == 'a' && !asmi386)
 			fputs("(%rip)", asmout);
 		return;
 	}
 	if (r->mem) {   /* memory: the object's address is in the register; P changes only a symbol */
 		switch (mod) {
 		case 0: case 'a': case 'b': case 'w': case 'k': case 'q': case 'P':
-			fprintf(asmout, "(%%%s)", regname[r->reg][0]);
+			fprintf(asmout, "(%%%s)", asmregname(r->reg, 0));
 			return;
 		}
 		error(&tok.loc, "unsupported asm operand modifier '%%%c' on a memory operand", mod);
@@ -3575,12 +3617,12 @@ asmsubst(struct asmrec *rec, unsigned total, int mod, unsigned idx)
 		return;
 	}
 	switch (mod) {
-	case 'b': fprintf(asmout, "%%%s", regname[r->reg][3]); break;
-	case 'w': fprintf(asmout, "%%%s", regname[r->reg][2]); break;
-	case 'k': fprintf(asmout, "%%%s", regname[r->reg][1]); break;
-	case 'q': fprintf(asmout, "%%%s", regname[r->reg][0]); break;
-	case 'a': fprintf(asmout, "(%%%s)", regname[r->reg][0]); break;   /* the address in the register */
-	case 0:   fprintf(asmout, "%%%s", regname[r->reg][regsizecol(r->size)]); break;
+	case 'b': fprintf(asmout, "%%%s", asmregname(r->reg, 3)); break;
+	case 'w': fprintf(asmout, "%%%s", asmregname(r->reg, 2)); break;
+	case 'k': fprintf(asmout, "%%%s", asmregname(r->reg, 1)); break;
+	case 'q': fprintf(asmout, "%%%s", asmregname(r->reg, 0)); break;
+	case 'a': fprintf(asmout, "(%%%s)", asmregname(r->reg, 0)); break;   /* the address in the register */
+	case 0:   fprintf(asmout, "%%%s", asmregname(r->reg, regsizecol(r->size))); break;
 	default:  error(&tok.loc, "unsupported asm operand modifier '%%%c'", mod);
 	}
 }
@@ -3670,8 +3712,13 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 	struct type *t;
 
 	(void)isvolatile;   /* every lowered asm is a call, which QBE never reorders or removes */
-	if (strcmp(targ->name, "x86_64-sysv") != 0)
-		error(&tok.loc, "inline assembly is only supported on x86_64");
+	asmi386 = strncmp(targ->name, "i386", 4) == 0;
+	asmregparm3 = strcmp(targ->name, "i386_regparm3") == 0;
+	regs = asmi386 ? regname386 : regname;
+	psfx = asmi386 ? 'l' : 'q';
+	msfx = asmi386 ? "llwb" : "qlwb";
+	if (strcmp(targ->name, "x86_64-sysv") != 0 && !asmi386)
+		error(&tok.loc, "inline assembly is only supported on x86_64 and i386");
 	if (!asmout)
 		error(&tok.loc, "inline assembly is not available in this compilation mode");
 	if (total > 32)
@@ -3704,7 +3751,7 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 	/* parse every operand: assign registers, lay out the slot, classify direction */
 	for (i = 0; i < total; ++i) {
 		struct asmoperand *op = i < nout ? &out[i] : &in[i - nout];
-		bool isout, inout, isin = i >= nout;
+		bool isout, inout, isin = i >= nout, hasq = false;
 		const char *body = asmconstraintbody(op->constraint, &isout, &inout);
 		int fr;
 
@@ -3741,7 +3788,7 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 				error(&tok.loc, "asm flag output must have integer type");
 			rec[i].flag = body + 3;
 			rec[i].feed = rec[i].prestore = false;
-			rec[i].reg = asmpoolreg(used, &pool);
+			rec[i].reg = asmpoolreg(used, &pool, asmi386);   /* setcc: a byte register */
 			used[rec[i].reg] = true;
 			rec[i].size = asmopsize(op->expr->type);
 			rec[i].slot = slotsize;
@@ -3777,7 +3824,8 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 			fr = -1;
 			for (c = alt; *c; ++c) {
 				switch (*c) {
-				case 'r': case 'q': case 'Q': case 'R': case 'l': anyreg = hasreg = true; break;
+				case 'q': case 'Q': hasq = true; /* fall through */
+				case 'r': case 'R': case 'l': anyreg = hasreg = true; break;
 				case 'g': anyreg = hasreg = hasmem = hasimm = true; break;
 				/* an address: a symbol (plus an offset) as an immediate, otherwise the pointer in a register (%a) */
 				case 'p': anyreg = hasreg = hasimm = true; break;
@@ -3830,10 +3878,10 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 		if (fr >= 0) {
 			rec[i].reg = fr;
 		} else {
-			rec[i].reg = asmpoolreg(used, &pool);
+			rec[i].reg = asmpoolreg(used, &pool, asmi386 && (hasq || op->expr->type->size == 1));
 			used[rec[i].reg] = true;
 		}
-		rec[i].size = rec[i].mem ? 8 : asmopsize(op->expr->type);
+		rec[i].size = rec[i].mem ? asmi386 ? 4 : 8 : asmopsize(op->expr->type);
 		rec[i].slot = slotsize;
 		slotsize += 8;
 		if (isin)
@@ -3848,25 +3896,26 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 	}
 
 	/* choose a callee-saved register to hold the slot pointer; preserve it and any clobbered callee-saved register */
-	for (j = 0; j < 5; ++j) {
-		static const int cand[] = {RBX, R12, R13, R14, R15};
-		if (!used[cand[j]]) { holder = cand[j]; break; }
+	for (j = 0; j < (asmi386 ? 3 : 5); ++j) {
+		static const int cand[] = {RBX, R12, R13, R14, R15}, cand386[] = {RBX, RSI, RDI};
+		int c = asmi386 ? cand386[j] : cand[j];
+
+		if (!used[c]) { holder = c; break; }
 	}
 	if (holder < 0)
 		error(&tok.loc, "asm uses too many registers");
-	save[RBX] = save[R12] = save[R13] = save[R14] = save[R15] = save[RBP] = save[holder];
-	/* recompute: only callee-saved registers that are clobbered (or a callee-saved fixed operand) need saving */
+	/* only callee-saved registers that are clobbered (or a callee-saved operand) need saving */
 	for (i = 0; i < 16; ++i)
 		save[i] = false;
 	for (i = 0; i < nclob; ++i) {
 		int r = (strcmp(clob[i], "memory") && strcmp(clob[i], "cc")) ? clobberreg(clob[i]) : -1;
-		if (r >= 0 && (r == RBX || r == R12 || r == R13 || r == R14 || r == R15))
+		if (r >= 0 && asmcallee(r))
 			save[r] = true;
 	}
 	for (i = 0; i < total; ++i) {   /* a callee-saved operand register ("b", or asmpoolreg's) is written: preserve it */
 		int r = rec[i].reg;
 
-		if (r == RBX || r == R12 || r == R13 || r == R14 || r == R15)
+		if (r >= 0 && asmcallee(r))
 			save[r] = true;
 	}
 	save[holder] = false;   /* the holder is pushed and popped separately */
@@ -3895,7 +3944,7 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 		t = rec[i].expr->type;
 		addr = rec[i].slot ? funcinst(f, IADD, ptrclass, base, mkintconst(rec[i].slot)) : base;
 		if (rec[i].mem) {   /* "=m"/"+m": the slot carries the destination's address */
-			funcinst(f, ISTOREL, 0, rec[i].lval.addr, addr);
+			funcinst(f, asmi386 ? ISTOREW : ISTOREL, 0, rec[i].lval.addr, addr);
 			continue;
 		}
 		v = funcload(f, t, rec[i].lval);
@@ -3931,7 +3980,7 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 				funcstore(f, me->type, 0, (struct lvalue){.addr = tmpd->value}, funcexpr(f, me));
 				v = tmpd->value;
 			}
-			funcinst(f, ISTOREL, 0, v, addr);
+			funcinst(f, asmi386 ? ISTOREW : ISTOREL, 0, v, addr);
 			continue;
 		}
 		v = funcexpr(f, rec[i].expr);
@@ -3967,42 +4016,49 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 	/* keep %rsp 16-aligned for a call inside the template: 8 mod 16 on entry, so an even number of pushes (the holder
 	 * and the saves) needs 8 more */
 	pad = (1 + nsave) % 2 ? 0 : 8;
+	if (asmi386)   /* i386 keeps no alignment promise (-mpreferred-stack-boundary=2): no pad */
+		pad = 0;
+	/* the slot pointer: the first argument, in %rdi (x86_64) or %eax (i386_regparm3), or on the stack (i386, cdecl:
+	 * above the holder's push) */
 	fprintf(asmout, "\t.text\n\t.p2align 4\nnfcxx_asm_thunk.%u:\n", expid);
-	fprintf(asmout, "\tpushq %%%s\n", regname[holder][0]);
+	fprintf(asmout, "\tpush%c %%%s\n", psfx, regs[holder][0]);
+	if (asmi386)
+		fprintf(asmout, asmregparm3 ? "\tmovl %%eax, %%%s\n" : "\tmovl 8(%%esp), %%%s\n", regs[holder][0]);
 	for (i = 0; i < 16; ++i)
 		if (save[i])
-			fprintf(asmout, "\tpushq %%%s\n", regname[i][0]);
+			fprintf(asmout, "\tpush%c %%%s\n", psfx, regs[i][0]);
 	if (pad)
 		fprintf(asmout, "\tsubq $8, %%rsp\n");
-	fprintf(asmout, "\tmovq %%rdi, %%%s\n", regname[holder][0]);
+	if (!asmi386)
+		fprintf(asmout, "\tmovq %%rdi, %%%s\n", regs[holder][0]);
 	for (i = 0; i < total; ++i)   /* load fed operands from the slot */
 		if (rec[i].slot >= 0 && rec[i].feed) {
 			int col = regsizecol(rec[i].feedsize > rec[i].size ? rec[i].feedsize : rec[i].size);
-			fprintf(asmout, "\tmov%c %ld(%%%s), %%%s\n", "qlwb"[col], rec[i].slot, regname[holder][0], regname[rec[i].reg][col]);
+			fprintf(asmout, "\tmov%c %ld(%%%s), %%%s\n", msfx[col], rec[i].slot, regs[holder][0], asmregname(rec[i].reg, col));
 		}
 	fputs("\t", asmout);
 	asmtemplate(template, rec, total, names, expid, labnames, nlab);
 	fputc('\n', asmout);
 	if (nlab)   /* asm goto: the template fell through (mov does not change the flags) */
-		fprintf(asmout, "\tmovl $0, %ld(%%%s)\n.Lnfcxx_gend_%u:\n", idxslot, regname[holder][0], expid);
+		fprintf(asmout, "\tmovl $0, %ld(%%%s)\n.Lnfcxx_gend_%u:\n", idxslot, regs[holder][0], expid);
 	for (i = 0; i < total; ++i)   /* flag outputs, before anything can change the flags (set and movzbl do not) */
 		if (rec[i].flag)
-			fprintf(asmout, "\tset%s %%%s\n\tmovzbl %%%s, %%%s\n", rec[i].flag, regname[rec[i].reg][3],
-				regname[rec[i].reg][3], regname[rec[i].reg][1]);
+			fprintf(asmout, "\tset%s %%%s\n\tmovzbl %%%s, %%%s\n", rec[i].flag, asmregname(rec[i].reg, 3),
+				asmregname(rec[i].reg, 3), asmregname(rec[i].reg, 1));
 	for (i = 0; i < total; ++i)   /* store written-back operands to the slot */
 		if (rec[i].slot >= 0 && rec[i].back) {
 			int col = regsizecol(rec[i].size);
-			fprintf(asmout, "\tmov%c %%%s, %ld(%%%s)\n", "qlwb"[col], regname[rec[i].reg][col], rec[i].slot, regname[holder][0]);
+			fprintf(asmout, "\tmov%c %%%s, %ld(%%%s)\n", msfx[col], asmregname(rec[i].reg, col), rec[i].slot, regs[holder][0]);
 		}
 	if (pad)
 		fprintf(asmout, "\taddq $8, %%rsp\n");
 	for (i = 16; i-- > 0;)
 		if (save[i])
-			fprintf(asmout, "\tpopq %%%s\n", regname[i][0]);
-	fprintf(asmout, "\tpopq %%%s\n\tret\n", regname[holder][0]);
+			fprintf(asmout, "\tpop%c %%%s\n", psfx, regs[i][0]);
+	fprintf(asmout, "\tpop%c %%%s\n\tret\n", psfx, regs[holder][0]);
 	for (j = 0; j < nlab; ++j)   /* asm goto: each label's stub records it and leaves the way a fall-through does */
 		fprintf(asmout, ".Lnfcxx_goto_%u_%u:\n\tmovl $%u, %ld(%%%s)\n\tjmp .Lnfcxx_gend_%u\n", expid, j, j + 1, idxslot,
-			regname[holder][0], expid);
+			regs[holder][0], expid);
 }
 
 /* the IL name of a global value as emitname spells it, without the sigil: what cproc -p's pruning calls the item */
