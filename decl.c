@@ -651,9 +651,9 @@ done:
 		error(&tok.loc, "invalid combination of type specifiers");
 	}
 	/* i386: gcc's long double is a 12-byte x87 value and there is no __int128; cproc's are 16-byte soft types */
-	if (targ->ilp32 && t && (t == &typeldouble || t == &typefloat128 || t == &typefloat16 || t->kind == TYPEINT128))
-		error(&tok.loc, "%s is not supported on %s", t->kind == TYPEINT128 ? "__int128" : t == &typeldouble ? "long double" :
-			t == &typefloat16 ? "_Float16" : "__float128", targ->name);
+	/* i386: no __int128 (as gcc -m32), no _Float16 (gcc -m32 needs SSE2) */
+	if (targ->ilp32 && t && (t == &typefloat16 || t->kind == TYPEINT128))
+		error(&tok.loc, "%s is not supported on %s", t->kind == TYPEINT128 ? "__int128" : "_Float16", targ->name);
 	if (tq & QUALRESTRICT) {
 		/* C23 6.7.4.1p2 */
 		other = t;

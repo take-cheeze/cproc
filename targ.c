@@ -44,7 +44,7 @@ static const struct target alltargs[] = {
 		/* i386 (System V, Linux; the kernel's -m16 real-mode code is this too): ILP32, va_list a char *, wchar_t a
 		 * long, and long long and double aligned on 4 in structs; the calling convention (cdecl or gcc's
 		 * -mregparm=3) is QBE's target (i386 or i386_regparm3). QBE has no floating point on i386 yet: it refuses
-		 * the code that uses it (cproc refuses long double, _Float16, __float128 and __int128 itself). */
+		 * the code that uses it (cproc refuses long double and __float128 values, _Float16 and __int128 itself). */
 		.name = "i386",
 		.typevalist = &(struct type){
 			.kind = TYPEPOINTER, .prop = PROPSCALAR,
@@ -93,6 +93,9 @@ targinit(const char *name)
 		typelong.u.arith.width = typeulong.u.arith.width = 32;
 		typellong.align = typeullong.align = 4;
 		typedouble.align = 4;
+#ifndef typeldouble   /* the Apple arm64 host's is double (cc.h) */
+		typeldouble.size = 12, typeldouble.align = 4;   /* gcc's x87 long double; its values are refused (qbe.c) */
+#endif
 		typenullptr.size = typenullptr.align = 4;
 	}
 	qual = QUALNONE;

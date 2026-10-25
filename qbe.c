@@ -272,6 +272,14 @@ mkfltconst(int kind, double n)
 	return v;
 }
 
+/* ILP32 (i386): long double (gcc's 12-byte x87 value) and __float128 are declared with gcc's layout, but cproc's
+ * values of them are 16-byte soft values: a value of them, a parameter or a return, or an initializer is refused */
+static bool
+softvalue(struct type *t)
+{
+	return t->kind == TYPELDOUBLE || t->kind == TYPEFLOAT128;
+}
+
 static struct qbetype
 qbetype(struct type *t)
 {
@@ -1894,6 +1902,13 @@ mkfunc(struct decl *decl, char *name, struct type *t, struct scope *s)
 	mapinit(&f->gotos, 8);
 	if (t->u.func.abi)
 		error(&tok.loc, "a function with the %s calling convention is not supported", t->u.func.abi);
+	if (targ->ilp32) {
+		if (softvalue(t->base))
+			error(&tok.loc, "a function returning %s is not supported on %s", t->base->kind == TYPELDOUBLE ? "long double" : "__float128", targ->name);
+		for (d = t->u.func.params; d; d = d->next)
+			if (softvalue(d->type))
+				error(&tok.loc, "a %s parameter is not supported on %s", d->type->kind == TYPELDOUBLE ? "long double" : "__float128", targ->name);
+	}
 	emittype(t->base);
 
 	/* allocate space for parameters */
@@ -2599,6 +2614,8 @@ funcexpr(struct func *f, struct expr *e)
 	size_t i;
 
 	calcvla(f, e->type);
+	if (targ->ilp32 && softvalue(e->type))
+		error(&e->loc, "a %s value is not supported on %s", e->type->kind == TYPELDOUBLE ? "long double" : "__float128", targ->name);
 	switch (e->kind) {
 	case EXPRSTMT:
 		if (e->u.stmt.done)
@@ -4344,8 +4361,9 @@ emittype(struct type *t)
 			}
 			qoff += m->type->size;
 		}
-		if (targ->ilp32 && sub->size == 8 && sub->prop & PROPSCALAR && !(sub->prop & PROPSOFT)) {
-			/* ILP32: an 8-byte scalar (long long, double) is aligned on 4 in a struct; QBE's l and d are on 8 */
+		if (targ->ilp32 && sub->prop & PROPSCALAR && (sub->size == 8 && !(sub->prop & PROPSOFT) || sub->kind == TYPELDOUBLE)) {
+			/* ILP32: an 8-byte scalar (long long, double) is aligned on 4 in a struct, QBE's l and d are on 8; a
+			 * long double is 12 bytes on 4 */
 			printf("w %llu", m->type->size / 4);
 		} else {
 			emitclass(qbetype(sub).data, sub->value);
@@ -4726,6 +4744,8 @@ emitdata(struct decl *d, struct init *init)
 			if (t->kind == TYPEARRAY)
 				t = t->base;
 			if (t->prop & PROPSOFT) {
+				if (targ->ilp32 && softvalue(t))
+					error(&tok.loc, "a %s initializer is not supported on %s", t->kind == TYPELDOUBLE ? "long double" : "__float128", targ->name);
 				if (cur->expr->kind != EXPRCONST)
 					error(&tok.loc, "initializer is not a constant expression");
 				printf("l %llu, l %llu, ", cur->expr->u.constant.soft[0], cur->expr->u.constant.soft[1]);
