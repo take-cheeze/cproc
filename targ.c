@@ -56,6 +56,19 @@ static const struct target alltargs[] = {
 		.ilp32 = 1,
 	},
 	{
+		/* the same ABI as "i386" for cproc: QBE's i386_regparm3 (gcc's -mregparm=3, the kernel's real-mode code) passes
+		 * the first three words in %eax, %edx and %ecx; the volatile helpers of -V are written for it */
+		.name = "i386_regparm3",
+		.typevalist = &(struct type){
+			.kind = TYPEPOINTER, .prop = PROPSCALAR,
+			.align = 4, .size = 4,
+			.base = &typechar,
+		},
+		.typewchar = &typelong,
+		.signedchar = 1,
+		.ilp32 = 1,
+	},
+	{
 		.name = "riscv64",
 		.typevalist = &(struct type){
 			.kind = TYPEPOINTER, .prop = PROPSCALAR,

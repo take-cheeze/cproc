@@ -27,9 +27,10 @@ for t; do
 		case $tgt in i386_regparm3) rp=-mregparm=3 ;; *) rp= ;; esac
 		n=$((n + 1))
 		ok=
+		# -V: the volatile accesses are helpers of the side file (-a), appended to the assembly
 		if $CC32 -E -P -ffreestanding -I$dir -o $tmp.i "$t" &&
-		   $CCQBE -t i386 -o $tmp.ssa $tmp.i &&
-		   $QBE -t $tgt -o $tmp.s $tmp.ssa &&
+		   : > $tmp.asm && $CCQBE -t $tgt -V -a $tmp.asm -o $tmp.ssa $tmp.i &&
+		   $QBE -t $tgt -o $tmp.s $tmp.ssa && cat $tmp.asm >> $tmp.s &&
 		   $CC32 $rp -w $cflags -o $tmp.exe $tmp.s $gcc $dir/rt.c &&
 		   $CC32 $rp -w -O1 $cflags -I$dir -o $tmp.ref "$t" $gcc $dir/rt.c; then
 			$tmp.exe >$tmp.out 2>&1; echo "exit $?" >>$tmp.out

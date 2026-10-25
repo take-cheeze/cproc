@@ -1733,17 +1733,33 @@ funcvolatile(struct func *f, struct type *t, struct lvalue lval, struct value *v
 		[4] = "movl (%rdi), %eax", [8] = "movq (%rdi), %rax"};
 	static const char *const st[9] = {[1] = "movb %sil, (%rdi)", [2] = "movw %si, (%rdi)",
 		[4] = "movl %esi, (%rdi)", [8] = "movq %rsi, (%rdi)"};
+	/* i386 (QBE's i386_regparm3; cdecl takes them from the stack, the same bodies at 4(%esp) and up): the value of an 8-byte
+	 * access is the pair %edx:%eax (a load returns it in %edx:%eax, a store takes it in %edx and %ecx) */
+	static const char *const i386ld[9] = {[1] = "\tmovzbl (%eax), %eax\n", [2] = "\tmovzwl (%eax), %eax\n",
+		[4] = "\tmovl (%eax), %eax\n", [8] = "\tmovl 4(%eax), %edx\n\tmovl (%eax), %eax\n"};
+	static const char *const i386st[9] = {[1] = "\tmovb %dl, (%eax)\n", [2] = "\tmovw %dx, (%eax)\n",
+		[4] = "\tmovl %edx, (%eax)\n", [8] = "\tmovl %edx, (%eax)\n\tmovl %ecx, 4(%eax)\n"};
+	/* cdecl (target i386): the address at 4(%esp), a store's value after it, and the same bodies after these loads */
+	static const char *const i386cdecl[2][9] = {
+		[0] = {[1] = "\tmovl 4(%esp), %eax\n", [2] = "\tmovl 4(%esp), %eax\n", [4] = "\tmovl 4(%esp), %eax\n",
+			[8] = "\tmovl 4(%esp), %eax\n"},
+		[1] = {[1] = "\tmovl 4(%esp), %eax\n\tmovl 8(%esp), %edx\n", [2] = "\tmovl 4(%esp), %eax\n\tmovl 8(%esp), %edx\n",
+			[4] = "\tmovl 4(%esp), %eax\n\tmovl 8(%esp), %edx\n",
+			[8] = "\tmovl 4(%esp), %eax\n\tmovl 8(%esp), %edx\n\tmovl 12(%esp), %ecx\n"},
+	};
 	static const int ldop[9] = {[1] = ILOADUB, [2] = ILOADUH, [4] = ILOADW, [8] = ILOADL};
 	static const int stop[9] = {[1] = ISTOREB, [2] = ISTOREH, [4] = ISTOREW, [8] = ISTOREL};
 	struct value *fn, *r;
 	size_t size;
-	bool store = v != NULL, agg;
+	bool store = v != NULL, agg, i386, regparm;
 	int class;
 
 	if (!volatilecalls || !asmout || lval.bits.before || lval.bits.after)
 		return NULL;
-	if (strcmp(targ->name, "x86_64-sysv") != 0)
-		error(&tok.loc, "volatile access helpers (-V) are only supported on x86_64");
+	regparm = strcmp(targ->name, "i386_regparm3") == 0;
+	i386 = regparm || strcmp(targ->name, "i386") == 0;
+	if (!i386 && strcmp(targ->name, "x86_64-sysv") != 0)
+		error(&tok.loc, "volatile access helpers (-V) are only supported on x86_64 and i386");
 	if (t->kind == TYPEPOINTER)
 		t = &typeulong;
 	/* an aggregate of 1, 2, 4 or 8 bytes (the kernel's pte_t through WRITE_ONCE and READ_ONCE) is one access of
@@ -1755,8 +1771,12 @@ funcvolatile(struct func *f, struct type *t, struct lvalue lval, struct value *v
 	if (size != 1 && size != 2 && size != 4 && size != 8)
 		return NULL;
 	if (!done[store][size]) {
-		fprintf(asmout, "#nfcxx:keep\n\t.text\n\t.p2align 4\nnfcxx_v%s%zu:\n\t%s\n\tret\n", store ? "store" : "load", size,
-			store ? st[size] : ld[size]);
+		if (i386)   /* the arguments in %eax, %edx and %ecx (i386_regparm3), or on the stack (i386, cdecl) */
+			fprintf(asmout, "#nfcxx:keep\n\t.text\n\t.p2align 4\nnfcxx_v%s%zu:\n%s%s\tret\n", store ? "store" : "load", size,
+				regparm ? "" : i386cdecl[store][size], store ? i386st[size] : i386ld[size]);
+		else
+			fprintf(asmout, "#nfcxx:keep\n\t.text\n\t.p2align 4\nnfcxx_v%s%zu:\n\t%s\n\tret\n", store ? "store" : "load", size,
+				store ? st[size] : ld[size]);
 		done[store][size] = true;
 	}
 	fn = xmalloc(sizeof(*fn));
