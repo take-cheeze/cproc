@@ -22,14 +22,17 @@ extern bool asanon;
 cproc -p: drop the internal functions and data that nothing live references, as gcc does at -O. Headers such as the
 Linux kernel's define hundreds of static inline functions per translation unit; emitting the unused ones would leave
 references to symbols the program does not have. The IL cproc writes is captured and pruned at the end: an item is
-live when it is exported, marked "# nfcxx:keep" (GNU used), or referenced ($name) by a live item -- a named section
-alone does not keep it, as gcc drops an unreferenced static __init function; type definitions and other top-level
-lines are always kept. A live item that contains "# nfcxx:error MSG" (a construct cproc can only refuse, parsed in a
+live when it is exported, marked "# nfcxx:keep" (GNU used), marked "# nfcxx:keepwith F" (a used static in function F)
+while F is live, or referenced ($name) by a live item -- a named section alone does not keep it, as gcc drops an
+unreferenced static __init function; type definitions and other top-level lines are always kept. A live item that contains "# nfcxx:error MSG" (a construct cproc can only refuse, parsed in a
 function that might have been dropped) is reported then.
 
 An internal function that is only called, and only from functions in one init section (.init.text and the like), is
 put in that section, where gcc's inlined copy of it would be: the kernel's always_inline memblock_alloc, emitted out of
-line by cproc, would otherwise be lasting code calling __init code, which the kernel's modpost refuses.
+line by cproc, would otherwise be lasting code calling __init code, which the kernel's modpost refuses. One called from
+.ref.text (the kernel's __ref: lasting code allowed to call init code) and init sections, or from different init
+sections, is put in .ref.text: sparse_index_alloc() is __ref and calls memblock_alloc_node() before the slab
+allocator is up, as __init functions do.
 */
 struct ilitem {
 	size_t off, len;
@@ -37,6 +40,7 @@ struct ilitem {
 	bool root, live;
 	bool func, exported;
 	char *section;     /* the section NAME of its section line, or null */
+	char *owner;       /* "# nfcxx:keepwith NAME": a used static in function NAME, live when NAME is */
 	bool addrtaken;    /* referenced by a live item other than by a call */
 	bool moved;        /* given the section of its callers (ilsection) */
 };
@@ -117,6 +121,13 @@ initsection(const char *s)
 	return s && (strncmp(s, ".init.", 6) == 0 || strncmp(s, ".meminit.", 9) == 0 || strncmp(s, ".exit.", 6) == 0);
 }
 
+/* a text section an internal function can be moved to: an init one, or .ref.text */
+static bool
+reftext(const char *s)
+{
+	return initsection(s) && strstr(s, "text") || strcmp(s, ".ref.text") == 0;
+}
+
 /* the init sections for internal functions called only from one of them (see above), to a fixpoint */
 static void
 ilsection(const char *buf)
@@ -161,14 +172,14 @@ ilsection(const char *buf)
 				if (!callsec[j])
 					callsec[j] = sec;
 				else if (strcmp(callsec[j], sec) != 0)
-					callsec[j] = "";
+					callsec[j] = reftext(callsec[j]) && reftext(sec) ? ".ref.text" : "";
 			}
 		}
 		for (i = 0; i < nilitems; ++i) {
 			struct ilitem *it = &ilitems[i];
 
 			if (!it->live || !it->func || it->exported || it->section || it->addrtaken || !callsec[i] ||
-			    !initsection(callsec[i]) || strstr(callsec[i], "text") == NULL)
+			    !reftext(callsec[i]))
 				continue;
 			it->section = xmalloc(strlen(callsec[i]) + 1);
 			strcpy(it->section, callsec[i]);
@@ -185,6 +196,7 @@ ilprune(const char *buf, size_t size, FILE *out)
 	struct ilitem *it = NULL;
 	size_t *stack, nstack = 0, i, n;
 	int depth = 0, infunc = 0;
+	size_t nowned = 0;
 
 	/* split the IL into items: linkage lines and markers start an item, which a function's closing '}' or the end of a
 	 * data or type definition (its braces balanced) finishes */
@@ -196,8 +208,15 @@ ilprune(const char *buf, size_t size, FILE *out)
 		if (!infunc && !depth) {
 			const char *q = line, *kw;
 
-			if (strncmp(q, "# nfcxx:keep", 12) == 0)
+			if (strncmp(q, "# nfcxx:keepwith ", 17) == 0) {
+				n = eol - (q + 17) - (eol[-1] == '\n');
+				it->owner = xmalloc(n + 1);
+				memcpy(it->owner, q + 17, n);
+				it->owner[n] = 0;
+				++nowned;
+			} else if (strncmp(q, "# nfcxx:keep", 12) == 0) {
 				it->root = true;
+			}
 			while (q < eol && (*q == ' ' || *q == '\t'))
 				++q;
 			/* a section does not keep an item: gcc drops an unreferenced static __init function too */
@@ -288,6 +307,12 @@ ilprune(const char *buf, size_t size, FILE *out)
 		const char *s = buf + l->off, *e = s + l->len;
 		int j;
 
+		for (i = 0; nowned && l->name && i < nilitems; ++i) {
+			if (ilitems[i].owner && !ilitems[i].live && strcmp(ilitems[i].owner, l->name) == 0) {
+				ilitems[i].live = true;
+				stack[nstack++] = i;
+			}
+		}
 		for (; (s = ilref(s, e)); s += 1 + n) {
 			n = ilnamelen(s + 1, e);
 			j = ilfind(s + 1, n);

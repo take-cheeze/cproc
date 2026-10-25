@@ -397,6 +397,13 @@ mkbinaryexpr(struct location *loc, enum tokenkind op, struct expr *l, struct exp
 		if (!(rp & PROPSCALAR))
 			error(loc, "right operand of '%s' operator must be scalar", tokenstr(op));
 		t = &typeint;
+		/* x && 0 is 0 and x || 1 is 1 when evaluating x has no effect, as x & 0 below: the kernel's
+		 * dax_mapping() is mapping->host && IS_DAX(mapping->host), with S_DAX 0 */
+		if (prune && rp & PROPINT && nosideeffects(l)) {
+			e = eval(r);
+			if (e->kind == EXPRCONST && (op == TLAND) == (e->u.constant.u == 0))
+				return mkconstexpr(t, op == TLOR);
+		}
 		break;
 	case TEQL:
 	case TNEQ:

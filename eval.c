@@ -484,7 +484,7 @@ eval(struct expr *expr)
 		if (d->u.obj.storage != SDSTATIC)
 			break;
 		d->value = mkglobal(d);
-		emitdata(d, expr->u.compound.init);
+		emitdata(d, expr->u.compound.init, NULL);
 		expr->kind = EXPRIDENT;
 		expr->u.ident.decl = d;
 		break;
