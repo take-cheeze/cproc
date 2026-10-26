@@ -408,6 +408,7 @@ void tokeninit(void);
 int tokenget(const void *, size_t);
 int iscident(enum tokenkind);
 extern bool stdc23;
+extern bool curclone;   /* a funcclone body is being parsed (decl.c) */
 void tokenprint(const struct token *, FILE *);
 char *tokenstr(enum tokenkind);
 char *tokencheck(const struct token *, enum tokenkind, const char *);

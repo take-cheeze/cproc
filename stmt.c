@@ -521,6 +521,10 @@ stmt(struct func *f, struct scope *s)
 				ops[*n].symname = sym;
 				expect(TLPAREN, "before asm operand");
 				ops[*n].expr = assignexpr(s);
+				/* a funcclone's pointer parameter is the address of an object, not an lvalue: an output of it keeps
+				 * the call on the function (the error is taken in funcclone, before the clone's code is emitted) */
+				if (sect == 0 && curclone && !ops[*n].expr->lvalue)
+					error(&tok.loc, "asm output of a funcclone parameter");
 				expect(TRPAREN, "after asm operand");
 				++*n;
 				if (!consume(TCOMMA))

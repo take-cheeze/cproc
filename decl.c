@@ -72,7 +72,7 @@ struct structbuilder {
 };
 
 struct func *curfunc;
-static bool curclone;   /* a clone's body is being parsed (funcclone): nothing is recorded */
+bool curclone;   /* a clone's body is being parsed (funcclone): nothing is recorded */
 static bool alignasseen;   /* the declaration being parsed has an _Alignas (not only GNU aligned) */
 
 /* GNU mode on a declaration of an integer type (glibc's typedef int register_t __attribute__((__mode__(__word__)))):
