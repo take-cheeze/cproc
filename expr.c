@@ -952,6 +952,16 @@ primaryexpr(struct scope *s)
 			d = scopegetdecl(s, tokenstr(tok.kind), 1);
 			if (!d)
 				error(&tok.loc, "undeclared identifier: %s", tokenstr(tok.kind));
+			if (d->addrof) {   /* a funcclone's pointer parameter: the address of the object it was called with */
+				struct expr *g = mkexpr(EXPRIDENT, d->addrof->type, NULL);
+
+				g->qual = d->addrof->qual;
+				g->lvalue = true;
+				g->u.ident.decl = d->addrof;
+				e = exprconvert(mkunaryexpr(TBAND, g), d->type);
+				next();
+				break;
+			}
 			e = mkexpr(EXPRIDENT, d->type, NULL);
 			e->qual = d->qual;
 			e->lvalue = d->kind == DECLOBJECT;

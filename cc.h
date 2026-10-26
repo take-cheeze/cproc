@@ -231,6 +231,7 @@ struct decl {
 	struct decl *symattrnext;
 	bool defined;
 	bool tentative;
+	struct decl *addrof;   /* a funcclone's pointer parameter bound to &addrof (decl.c): the name stands for that address */
 	struct decl *next;
 	/* where the declarator's name is (the current token when the declaration is made; -fsanitize=address's frame description) */
 	struct location loc;
@@ -260,6 +261,7 @@ struct decl {
 			 * the clones made for constant arguments (funcclone) */
 			struct array *body;
 			bool hasstatic, refused;
+			bool hasasm;   /* the body has inline asm (qbe.c funcasm1): a clone for an address argument is useful */
 			/* the body is { return C; } with C an integer constant (stmt.c): a direct call whose arguments have no
 			 * side effects is C (expr.c), as gcc's inlined and folded call is */
 			bool constret;

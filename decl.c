@@ -1400,6 +1400,41 @@ decl(struct scope *s, struct func *f)
 	return r;
 }
 
+/* a function with a pointer parameter (its body is recorded for the clones of calls with the address of an object) */
+static bool
+haspointerparam(struct type *t)
+{
+	struct decl *p;
+
+	for (p = t->u.func.params; p; p = p->next)
+		if (p->type->kind == TYPEPOINTER)
+			return true;
+	return false;
+}
+
+/* the object an argument takes the address of (&x, or an array that decays to its address), or null */
+static struct decl *
+addrarg(struct expr *a)
+{
+	struct expr *c = a;
+	struct decl *d;
+
+	while (c->kind == EXPRCAST)
+		c = c->base;
+	if (c->decayed)
+		c = c->base;
+	if (c->kind == EXPRUNARY && c->op == TBAND)
+		c = c->base;
+	if (c->decayed)
+		c = c->base;
+	if (c->kind != EXPRIDENT)
+		return NULL;
+	d = c->u.ident.decl;
+	if (d->kind != DECLOBJECT || d->u.obj.storage == SDAUTO || d->regvar || d->addrof)
+		return NULL;
+	return d;
+}
+
 static bool
 decl1(struct scope *s, struct func *f)
 {
@@ -1663,7 +1698,8 @@ decl1(struct scope *s, struct func *f)
 				curfunc = f;
 				/* an always_inline function's body is recorded for the clones of calls with constant arguments
 				 * (funcclone), under cproc -p, where its refusals are deferred */
-				if (prune && declattr.alwaysinline && (d->linkage == LINKINTERN || gnuinlineonly) && !curclone) {
+				if (prune && !curclone && ((declattr.alwaysinline && (d->linkage == LINKINTERN || gnuinlineonly)) ||
+				    (fs & FUNCINLINE && d->linkage == LINKINTERN && haspointerparam(t)))) {
 					d->u.func.body = xmalloc(sizeof(*d->u.func.body));
 					*d->u.func.body = (struct array){0};
 					arrayaddbuf(d->u.func.body, &tok, sizeof(tok));
@@ -1763,6 +1799,7 @@ taken) keeps the call on the function; a body with a static local is not cloned 
 struct funcclone {
 	unsigned n;
 	bool isconst[16];
+	struct decl *addr[16];   /* a pointer parameter's argument is the address of this object (addrarg) */
 	unsigned long long val[16];
 	struct decl *decl;
 	struct funcclone *next;
@@ -1784,15 +1821,21 @@ funcclone(struct decl *d, struct expr *args)
 	struct tokreplay savedreplay;
 	jmp_buf jb, *savedjmp;
 	char *name;
-	unsigned i, nconst = 0;
+	unsigned i, nconst = 0, naddr = 0;
 
-	if (!d->u.func.body || d->u.func.hasstatic || !d->u.func.refused || t->u.func.isvararg || !asmout)
+	if (!d->u.func.body || d->u.func.hasstatic || t->u.func.isvararg || !asmout)
 		return NULL;
 	for (p = t->u.func.params, a = args; p && a; p = p->next, a = a->next, ++key.n) {
 		struct expr *e;
 
 		if (key.n == 16)
 			return NULL;
+		/* the address of an object for a pointer parameter: the clone's uses of the parameter are that address, so the
+		 * asm operands of the body name the object (rip-relative, as gcc's inlined copies do) */
+		if (p->type->kind == TYPEPOINTER && (key.addr[key.n] = addrarg(a))) {
+			++nconst;
+			continue;
+		}
 		e = eval(a);
 		if (e->kind == EXPRCONST && e->type->prop & PROPINT && !(e->type->prop & PROPSOFT) && p->type->prop & PROPINT &&
 		    p->type->kind != TYPEBOOL && !(p->type->prop & PROPSOFT)) {
@@ -1803,9 +1846,15 @@ funcclone(struct decl *d, struct expr *args)
 	}
 	if (!nconst)
 		return NULL;
+	/* the constant-integer clones are for a refused function (the refusal is deferred, under cproc -p); the address
+	 * clones are for a function with inline asm, whose memory operand is then a symbol */
+	for (i = 0; i < key.n; ++i)
+		naddr += key.addr[i] != NULL;
+	if (naddr ? !d->u.func.hasasm : !d->u.func.refused)
+		return NULL;
 	for (cl = d->u.func.clones; cl; cl = cl->next)
 		if (cl->n == key.n && memcmp(cl->isconst, key.isconst, sizeof key.isconst) == 0 &&
-		    memcmp(cl->val, key.val, sizeof key.val) == 0)
+		    memcmp(cl->addr, key.addr, sizeof key.addr) == 0 && memcmp(cl->val, key.val, sizeof key.val) == 0)
 			return cl->decl;
 
 	/* the clone's type: the function's, with parameters of its own */
@@ -1817,6 +1866,8 @@ funcclone(struct decl *d, struct expr *args)
 	for (p = t->u.func.params, i = 0; p; p = p->next, ++i) {
 		q = mkdecl(p->name, DECLOBJECT, p->type, p->qual, LINKNONE);
 		q->u.obj.storage = SDAUTO;
+		if (i < key.n)
+			q->addrof = key.addr[i];
 		*pend = q;
 		pend = &q->next;
 		if (!p->name)

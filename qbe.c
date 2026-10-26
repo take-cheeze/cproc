@@ -3456,6 +3456,7 @@ struct asmrec {
 	bool back;    /* the thunk stores this operand to its slot on exit, and the caller reads it back */
 	bool pseudo;  /* the %rsp register variable (ASM_CALL_CONSTRAINT): named in the template, never moved */
 	bool mem;     /* a memory operand: the slot and the register carry the object's address; %N is (reg) */
+	bool memsym;  /* a memory operand of an object (immsym, imm): the template names it, rip-relative, no slot */
 	const char *flag;  /* a flag output "=@ccCOND": the condition, set from the flags right after the template */
 	char *immsym; /* an immediate that is a symbol's address (plus imm): "i"(&x), "i"(f) */
 	long imm;     /* immediate value, when reg == -1 */
@@ -3587,6 +3588,13 @@ asmsubst(struct asmrec *rec, unsigned total, int mod, unsigned idx)
 	if (idx >= total)
 		error(&tok.loc, "asm operand index out of range");
 	r = &rec[idx];
+	if (r->memsym) {   /* an object's memory operand: the object itself, rip-relative */
+		fputs(r->immsym, asmout);
+		if (r->imm)
+			fprintf(asmout, "%+ld", r->imm);
+		fputs("(%rip)", asmout);
+		return;
+	}
 	if (r->immsym) {   /* a symbol's address; %a addresses it, rip-relative as gcc writes it */
 		switch (mod) {
 		case 'c': case 'P': case 'p': case 'a': break;
@@ -3712,6 +3720,7 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 	struct type *t;
 
 	(void)isvolatile;   /* every lowered asm is a call, which QBE never reorders or removes */
+	funcdecl(f)->u.func.hasasm = true;
 	asmi386 = strncmp(targ->name, "i386", 4) == 0;
 	asmregparm3 = strcmp(targ->name, "i386_regparm3") == 0;
 	regs = asmi386 ? regname386 : regname;
@@ -3760,7 +3769,7 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 		rec[i].reg = -1;
 		rec[i].slot = -1;
 		rec[i].feed = rec[i].prestore = rec[i].back = false;
-		rec[i].pseudo = rec[i].mem = false;
+		rec[i].pseudo = rec[i].mem = rec[i].memsym = false;
 		rec[i].feedsize = 0;
 		rec[i].flag = NULL;
 		rec[i].immsym = NULL;
@@ -3841,6 +3850,16 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 				default:
 					error(&tok.loc, "unsupported asm constraint '%s'", op->constraint);
 				}
+			}
+			/* a memory operand of an object (*&sym: the pointer parameter of a funcclone, decl.c): the template names
+			 * the object, rip-relative, with no register or slot, as gcc's inlined copy does */
+			if (hasmem && !hasreg && !hasimm && op->expr->kind == EXPRUNARY && op->expr->op == TMUL &&
+			    asmimm(op->expr->base, "p", &rec[i])) {
+				rec[i].memsym = rec[i].mem = true;
+				rec[i].reg = -1;
+				rec[i].feed = rec[i].prestore = rec[i].back = false;
+				rec[i].size = 8;
+				continue;
 			}
 			if (hasimm && i >= nout && asmimm(op->expr, alt, &rec[i])) {
 				rec[i].size = 8;
