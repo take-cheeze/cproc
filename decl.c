@@ -1622,7 +1622,9 @@ decl1(struct scope *s, struct func *f)
 				hasinit = true;
 			} else if (sc & SCEXTERN) {
 				break;
-			} else if (d->linkage != LINKNONE && d->u.obj.storage == SDSTATIC) {
+			} else if (d->linkage != LINKNONE && (d->u.obj.storage == SDSTATIC || d->u.obj.storage == SDTHREAD)) {
+				/* a tentative definition, thread storage too (6.9.2): EDG declares a thread_local of the file before
+				 * its definition with the initializer */
 				if (!d->defined && !d->tentative) {
 					d->tentative = true;
 					*tentativedefnsend = d;
