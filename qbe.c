@@ -3588,11 +3588,12 @@ asmsubst(struct asmrec *rec, unsigned total, int mod, unsigned idx)
 	if (idx >= total)
 		error(&tok.loc, "asm operand index out of range");
 	r = &rec[idx];
-	if (r->memsym) {   /* an object's memory operand: the object itself, rip-relative */
+	if (r->memsym) {   /* an object's memory operand: the object itself, rip-relative (absolute on i386) */
 		fputs(r->immsym, asmout);
 		if (r->imm)
 			fprintf(asmout, "%+ld", r->imm);
-		fputs("(%rip)", asmout);
+		if (!asmi386)
+			fputs("(%rip)", asmout);
 		return;
 	}
 	if (r->immsym) {   /* a symbol's address; %a addresses it, rip-relative as gcc writes it */
@@ -4039,7 +4040,13 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 		pad = 0;
 	/* the slot pointer: the first argument, in %rdi (x86_64) or %eax (i386_regparm3), or on the stack (i386, cdecl:
 	 * above the holder's push) */
-	fprintf(asmout, "\t.text\n\t.p2align 4\nnfcxx_asm_thunk.%u:\n", expid);
+	/* in the function's own section, where gcc's inlined copy of the template is: a thunk of a __head or __init
+	 * function may name the object of an address clone (decl.c funcclone), which lasting .text must not */
+	if (funcdecl(f)->section)
+		fprintf(asmout, "\t.section %s,\"ax\",@progbits\n", funcdecl(f)->section);
+	else
+		fputs("\t.text\n", asmout);
+	fprintf(asmout, "\t.p2align 4\nnfcxx_asm_thunk.%u:\n", expid);
 	fprintf(asmout, "\tpush%c %%%s\n", psfx, regs[holder][0]);
 	if (asmi386)
 		fprintf(asmout, asmregparm3 ? "\tmovl %%eax, %%%s\n" : "\tmovl 8(%%esp), %%%s\n", regs[holder][0]);

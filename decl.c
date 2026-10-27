@@ -1801,6 +1801,7 @@ struct funcclone {
 	bool isconst[16];
 	struct decl *addr[16];   /* a pointer parameter's argument is the address of this object (addrarg) */
 	unsigned long long val[16];
+	char *section;   /* the clone's section: the function's, else the caller's (where gcc's inlined copy is) */
 	struct decl *decl;
 	struct funcclone *next;
 };
@@ -1852,9 +1853,11 @@ funcclone(struct decl *d, struct expr *args)
 		naddr += key.addr[i] != NULL;
 	if (naddr ? !d->u.func.hasasm : !d->u.func.refused)
 		return NULL;
+	key.section = d->section ? d->section : curfunc ? funcdecl(curfunc)->section : NULL;
 	for (cl = d->u.func.clones; cl; cl = cl->next)
 		if (cl->n == key.n && memcmp(cl->isconst, key.isconst, sizeof key.isconst) == 0 &&
-		    memcmp(cl->addr, key.addr, sizeof key.addr) == 0 && memcmp(cl->val, key.val, sizeof key.val) == 0)
+		    memcmp(cl->addr, key.addr, sizeof key.addr) == 0 && memcmp(cl->val, key.val, sizeof key.val) == 0 &&
+		    (cl->section == key.section || (cl->section && key.section && strcmp(cl->section, key.section) == 0)))
 			return cl->decl;
 
 	/* the clone's type: the function's, with parameters of its own */
@@ -1885,7 +1888,7 @@ funcclone(struct decl *d, struct expr *args)
 	sprintf(name, "%s.const%u", d->name, ++id);
 	c = mkdecl(name, DECLFUNC, t2, QUALNONE, LINKINTERN);
 	c->value = mkglobal(c);
-	c->section = d->section;
+	c->section = key.section;
 	c->u.func.isnoreturn = d->u.func.isnoreturn;
 	cl = xmalloc(sizeof(*cl));
 	*cl = key;
