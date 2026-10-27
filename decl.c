@@ -1698,8 +1698,12 @@ decl1(struct scope *s, struct func *f)
 				curfunc = f;
 				/* an always_inline function's body is recorded for the clones of calls with constant arguments
 				 * (funcclone), under cproc -p, where its refusals are deferred */
+				/* any other static function's, for the clones of calls that qbe.c funcsccp finds constant
+				 * arguments for (funcvalueclone) */
 				if (prune && !curclone && ((declattr.alwaysinline && (d->linkage == LINKINTERN || gnuinlineonly)) ||
-				    (fs & FUNCINLINE && d->linkage == LINKINTERN && haspointerparam(t)))) {
+				    (fs & FUNCINLINE && d->linkage == LINKINTERN && haspointerparam(t)) || d->linkage == LINKINTERN)) {
+					d->u.func.vclone = !(declattr.alwaysinline && (d->linkage == LINKINTERN || gnuinlineonly)) &&
+					                   !(fs & FUNCINLINE && d->linkage == LINKINTERN && haspointerparam(t));
 					d->u.func.body = xmalloc(sizeof(*d->u.func.body));
 					*d->u.func.body = (struct array){0};
 					arrayaddbuf(d->u.func.body, &tok, sizeof(tok));
@@ -1802,18 +1806,32 @@ struct funcclone {
 	struct decl *addr[16];   /* a pointer parameter's argument is the address of this object (addrarg) */
 	unsigned long long val[16];
 	char *section;   /* the clone's section: the function's, else the caller's (where gcc's inlined copy is) */
+	bool value;      /* made for funcvalueclone (its own cache: such a clone may be refused, decl then null) */
 	struct decl *decl;
 	struct funcclone *next;
 };
 
-struct decl *
-funcclone(struct decl *d, struct expr *args)
+static struct funcclone *
+clonefind(struct decl *d, struct funcclone *key)
+{
+	struct funcclone *cl;
+
+	for (cl = d->u.func.clones; cl; cl = cl->next)
+		if (cl->n == key->n && cl->value == key->value && memcmp(cl->isconst, key->isconst, sizeof key->isconst) == 0 &&
+		    memcmp(cl->addr, key->addr, sizeof key->addr) == 0 && memcmp(cl->val, key->val, sizeof key->val) == 0 &&
+		    (cl->section == key->section || (cl->section && key->section && strcmp(cl->section, key->section) == 0)))
+			return cl;
+	return NULL;
+}
+
+/* the clone of d for the constants and addresses of key, or null when its body does not compile so */
+static struct decl *
+clonemake(struct decl *d, struct funcclone *key)
 {
 	static unsigned id;
 	struct type *t = d->type, *t2;
 	struct decl *p, *q, **pend, *k, *c;
-	struct expr *a;
-	struct funcclone key = {0}, *cl;
+	struct funcclone *cl;
 	struct scope *s;
 	struct func *f;
 	struct token savedtok;
@@ -1822,9 +1840,97 @@ funcclone(struct decl *d, struct expr *args)
 	struct tokreplay savedreplay;
 	jmp_buf jb, *savedjmp;
 	char *name;
+	unsigned i;
+
+	/* the clone's type: the function's, with parameters of its own */
+	t2 = mktype(TYPEFUNC, 0);
+	*t2 = *t;
+	t2->u.func.params = NULL;
+	pend = &t2->u.func.params;
+	s = mkscope(&filescope);
+	for (p = t->u.func.params, i = 0; p; p = p->next, ++i) {
+		q = mkdecl(p->name, DECLOBJECT, p->type, p->qual, LINKNONE);
+		q->u.obj.storage = SDAUTO;
+		if (i < key->n)
+			q->addrof = key->addr[i];
+		*pend = q;
+		pend = &q->next;
+		if (!p->name)
+			continue;
+		if (i < key->n && key->isconst[i]) {
+			k = mkdecl(p->name, DECLCONST, p->type, QUALNONE, LINKNONE);
+			k->u.enumconst = key->val[i];
+			k->value = mkintconst(key->val[i]);
+			scopeputdecl(s, k);
+		} else {
+			scopeputdecl(s, q);
+		}
+	}
+	name = xmalloc(strlen(d->name) + 24);
+	sprintf(name, "%s.const%u", d->name, ++id);
+	c = mkdecl(name, DECLFUNC, t2, QUALNONE, LINKINTERN);
+	c->value = mkglobal(c);
+	c->section = key->section;
+	c->u.func.isnoreturn = d->u.func.isnoreturn;
+	cl = xmalloc(sizeof(*cl));
+	*cl = *key;
+	cl->decl = c;
+	cl->next = d->u.func.clones;
+	d->u.func.clones = cl;   /* before the body, for a call in it with the same constants */
+
+	savedtok = tok;
+	savedfunc = curfunc;
+	savedclone = curclone;
+	savedjmp = errorjmp;
+	tokreplay(&savedreplay, d->u.func.body->val, d->u.func.body->len / sizeof(struct token));
+	next();
+	if (setjmp(jb)) {   /* it does not compile with constants: the call stays on the function */
+		errorjmp = savedjmp;
+		curfunc = savedfunc;
+		curclone = savedclone;
+		tokreplayend(&savedreplay);
+		tok = savedtok;
+		if (key->value)
+			cl->decl = NULL;   /* not again */
+		else
+			d->u.func.clones = cl->next;
+		return NULL;
+	}
+	errorjmp = &jb;
+	curclone = true;
+	f = mkfunc(c, name, t2, s);
+	curfunc = f;
+	stmt(f, s);
+	funcgotoflush(f);
+	if (c->u.func.isnoreturn)
+		funchlt(f);
+	errorjmp = savedjmp;
+	curfunc = savedfunc;
+	curclone = savedclone;
+	tokreplayend(&savedreplay);
+	tok = savedtok;
+	/* a clone for constants funcsccp found is kept only where the constants take away a reference of the function's
+	 * (the call that gcc's specialized copy does not make), not for every call with a constant argument */
+	if (key->value && !funcclonegain(f, d)) {
+		delfunc(f);
+		cl->decl = NULL;
+		return NULL;
+	}
+	emitfunc(f, false);
+	delfunc(f);
+	return c;
+}
+
+struct decl *
+funcclone(struct decl *d, struct expr *args)
+{
+	struct type *t = d->type;
+	struct decl *p;
+	struct expr *a;
+	struct funcclone key = {0}, *cl;
 	unsigned i, nconst = 0, naddr = 0;
 
-	if (!d->u.func.body || d->u.func.hasstatic || t->u.func.isvararg || !asmout)
+	if (!d->u.func.body || d->u.func.vclone || d->u.func.hasstatic || t->u.func.isvararg || !asmout)
 		return NULL;
 	for (p = t->u.func.params, a = args; p && a; p = p->next, a = a->next, ++key.n) {
 		struct expr *e;
@@ -1854,77 +1960,55 @@ funcclone(struct decl *d, struct expr *args)
 	if (naddr ? !d->u.func.hasasm : !d->u.func.refused)
 		return NULL;
 	key.section = d->section ? d->section : curfunc ? funcdecl(curfunc)->section : NULL;
-	for (cl = d->u.func.clones; cl; cl = cl->next)
-		if (cl->n == key.n && memcmp(cl->isconst, key.isconst, sizeof key.isconst) == 0 &&
-		    memcmp(cl->addr, key.addr, sizeof key.addr) == 0 && memcmp(cl->val, key.val, sizeof key.val) == 0 &&
-		    (cl->section == key.section || (cl->section && key.section && strcmp(cl->section, key.section) == 0)))
-			return cl->decl;
+	if ((cl = clonefind(d, &key)))
+		return cl->decl;
+	return clonemake(d, &key);
+}
 
-	/* the clone's type: the function's, with parameters of its own */
-	t2 = mktype(TYPEFUNC, 0);
-	*t2 = *t;
-	t2->u.func.params = NULL;
-	pend = &t2->u.func.params;
-	s = mkscope(&filescope);
-	for (p = t->u.func.params, i = 0; p; p = p->next, ++i) {
-		q = mkdecl(p->name, DECLOBJECT, p->type, p->qual, LINKNONE);
-		q->u.obj.storage = SDAUTO;
-		if (i < key.n)
-			q->addrof = key.addr[i];
-		*pend = q;
-		pend = &q->next;
-		if (!p->name)
-			continue;
-		if (i < key.n && key.isconst[i]) {
-			k = mkdecl(p->name, DECLCONST, p->type, QUALNONE, LINKNONE);
-			k->u.enumconst = key.val[i];
-			k->value = mkintconst(key.val[i]);
-			scopeputdecl(s, k);
-		} else {
-			scopeputdecl(s, q);
-		}
-	}
-	name = xmalloc(strlen(d->name) + 24);
-	sprintf(name, "%s.const%u", d->name, ++id);
-	c = mkdecl(name, DECLFUNC, t2, QUALNONE, LINKINTERN);
-	c->value = mkglobal(c);
-	c->section = key.section;
-	c->u.func.isnoreturn = d->u.func.isnoreturn;
-	cl = xmalloc(sizeof(*cl));
-	*cl = key;
-	cl->decl = c;
-	cl->next = d->u.func.clones;
-	d->u.func.clones = cl;   /* before the body, for a call in it with the same constants */
+/*
+A clone of a static function for a direct call whose integer arguments qbe.c funcsccp found constant (n values, the
+constant ones marked; section is the caller's): gcc propagates the constants into the function it calls (inlined or a
+specialized copy), and what they make unreachable there is gone. The clone is NAME.constN as for funcclone, kept only
+when it references less than the function (funcclonegain): the kernel's __fpu_restore_sig(), whose ia32_fxstate is
+false at its one call, and the conversion it guards names a function this configuration does not have.
+*/
+struct decl *
+funcvalueclone(struct decl *d, unsigned n, const bool *isconst, const unsigned long long *val, char *section)
+{
+	static unsigned depth;
+	struct type *t = d->type;
+	struct funcclone key = {0}, *cl;
+	struct decl *p, *c;
+	unsigned i, nconst = 0;
 
-	savedtok = tok;
-	savedfunc = curfunc;
-	savedclone = curclone;
-	savedjmp = errorjmp;
-	tokreplay(&savedreplay, d->u.func.body->val, d->u.func.body->len / sizeof(struct token));
-	next();
-	if (setjmp(jb)) {   /* it does not compile with constants: the call stays on the function */
-		errorjmp = savedjmp;
-		curfunc = savedfunc;
-		curclone = savedclone;
-		tokreplayend(&savedreplay);
-		tok = savedtok;
-		d->u.func.clones = cl->next;
+	if (!d->u.func.body || d->u.func.hasstatic || t->u.func.isvararg || !asmout || n != t->u.func.nparam || n > 16 ||
+	    depth >= 4 || d->weak || d->noipa)
 		return NULL;
+	key.n = n;
+	key.value = true;
+	for (p = t->u.func.params, i = 0; p; p = p->next, ++i) {
+		unsigned long long v = val[i];
+
+		if (!isconst[i] || !(p->type->prop & PROPINT) || p->type->prop & PROPSOFT || p->type->size > 8)
+			continue;
+		/* the argument as a value of the parameter's type: QBE passes a w or l, extended from it */
+		if (p->type->kind == TYPEBOOL)
+			v = v != 0;
+		else if (p->type->size < 8 && p->type->u.arith.issigned)
+			v = (unsigned long long)((long long)(v << (64 - p->type->size * 8)) >> (64 - p->type->size * 8));
+		else if (p->type->size < 8)
+			v &= (1ull << p->type->size * 8) - 1;
+		key.isconst[i] = true;
+		key.val[i] = v;
+		++nconst;
 	}
-	errorjmp = &jb;
-	curclone = true;
-	f = mkfunc(c, name, t2, s);
-	curfunc = f;
-	stmt(f, s);
-	funcgotoflush(f);
-	if (c->u.func.isnoreturn)
-		funchlt(f);
-	errorjmp = savedjmp;
-	curfunc = savedfunc;
-	curclone = savedclone;
-	tokreplayend(&savedreplay);
-	tok = savedtok;
-	emitfunc(f, false);
-	delfunc(f);
+	if (!nconst)
+		return NULL;
+	key.section = d->section ? d->section : section;
+	if ((cl = clonefind(d, &key)))
+		return cl->decl;
+	++depth;
+	c = clonemake(d, &key);
+	--depth;
 	return c;
 }

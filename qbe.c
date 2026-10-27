@@ -30,6 +30,7 @@ struct value {
 		unsigned long long i;
 		double f;
 	} u;
+	struct decl *decl;   /* a global's declaration (mkglobal), for funcsccp's calls; null for cproc's own names */
 };
 
 struct lvalue {
@@ -88,6 +89,7 @@ struct block {
 	struct array thunks, asmrefs;
 	char *lazyerror;
 	bool reach;
+	unsigned idx;   /* funcsccp: the block's number */
 
 	struct block *next;
 };
@@ -217,6 +219,7 @@ mkglobal(struct decl *d)
 		v->u.name = d->name;
 		v->id = d->linkage == LINKNONE ? ++id : 0;
 	}
+	v->decl = d;
 
 	return v;
 }
@@ -373,6 +376,7 @@ asanfn(const char *name)
 	fn->kind = VALUE_GLOBAL;
 	fn->u.name = s;
 	fn->id = 0;
+	fn->decl = NULL;
 	return fn;
 }
 
@@ -519,6 +523,7 @@ softname(struct type *t, const char *op)
 	v->kind = VALUE_GLOBAL;
 	v->u.name = name;
 	v->id = 0;
+	v->decl = NULL;
 	return v;
 }
 
@@ -3946,6 +3951,7 @@ funcasm1(struct func *f, char *template, struct asmoperand *out, unsigned nout, 
 	fn->u.name = xmalloc(32);
 	snprintf(fn->u.name, 32, "nfcxx_asm_thunk.%u", expid);
 	fn->id = 0;
+	fn->decl = NULL;
 
 	/* ---- call site: build the slot, feed inputs, call, read outputs back ---- */
 	base = NULL;
@@ -4591,6 +4597,542 @@ emitjump(struct jump *j)
 	}
 }
 
+/*
+cproc -p (the kernel): sparse conditional constant propagation through the function's temporaries and its stack slots
+whose address only loads and stores use (no call, arithmetic, blit or jump sees it, so nothing else reads or writes the
+slot). A conditional jump whose condition is the same constant on every way that reaches it becomes a jump, and what only
+the other way reached is unreachable (emitfunc's "# nfcxx:dead", main.c's pruning), as gcc folds it: the kernel's
+fpu/signal.c clears a flag with &= IS_ENABLED(CONFIG_IA32_EMULATION), and the call that the flag guards names a function
+this configuration does not have. Only under -p -V, where a volatile access is a call (funcvolatile), and not with
+-fsanitize=address, a landing pad or a setjmp (whose second return the slots do not show). A function in which a
+condition is still undetermined at the end is left as it is.
+*/
+enum { SCTOP, SCCON, SCBOT };
+
+struct scval {
+	unsigned char kind, size;   /* size: a slot's, the bytes of the store that set it */
+	unsigned long long c;
+};
+
+struct sccp {
+	struct scval *tmp;   /* by temporary id */
+	int *slot;           /* by temporary id: the slot's number, or -1 */
+	unsigned ntmp, nslot, nblk;
+	struct block **blk;  /* by number */
+	struct scval *in;    /* nblk by nslot: the slots where the block begins */
+	bool *exec;          /* by number: the block can be reached */
+	bool (*edge)[2];     /* by number: the block's ways (scsucc) that can be taken */
+	bool changed;
+};
+
+static const struct scval scbot = {SCBOT};
+
+static struct scval
+scmeet(struct scval a, struct scval b)
+{
+	if (a.kind == SCTOP)
+		return b;
+	if (b.kind == SCTOP || (a.kind == SCCON && b.kind == SCCON && a.c == b.c && a.size == b.size))
+		return a;
+	return scbot;
+}
+
+static bool
+scsame(struct scval a, struct scval b)
+{
+	return a.kind == b.kind && (a.kind != SCCON || (a.c == b.c && a.size == b.size));
+}
+
+static struct scval
+sccon(unsigned long long c)
+{
+	return (struct scval){SCCON, 0, c};
+}
+
+static unsigned long long
+scmask(unsigned bytes)
+{
+	return bytes >= 8 ? ~0ull : (1ull << bytes * 8) - 1;
+}
+
+static unsigned long long
+scsext(unsigned long long c, unsigned bytes)
+{
+	unsigned shift = 64 - bytes * 8;
+
+	return shift ? (unsigned long long)((long long)(c << shift) >> shift) : c;
+}
+
+static struct block *
+scsucc(struct block *b, int i)
+{
+	switch (b->jump.kind) {
+	case JUMP_NONE: return i == 0 ? b->next : NULL;
+	case JUMP_JMP:  return i == 0 ? b->jump.blk[0] : NULL;
+	case JUMP_JNZ:  return b->jump.blk[i];
+	default:        return NULL;
+	}
+}
+
+static struct scval
+scvalue(struct sccp *s, struct value *v)
+{
+	if (v && v->kind == VALUE_INTCONST)
+		return sccon(v->u.i);
+	if (v && v->kind == VALUE_TEMP && v->id < s->ntmp)
+		return s->tmp[v->id];
+	return scbot;
+}
+
+static int
+scslot(struct sccp *s, struct value *v)
+{
+	return v && v->kind == VALUE_TEMP && v->id < s->ntmp ? s->slot[v->id] : -1;
+}
+
+static void
+scset(struct sccp *s, struct value *res, struct scval v)
+{
+	struct scval m;
+
+	if (res->kind != VALUE_TEMP || res->id >= s->ntmp)
+		return;
+	m = scmeet(s->tmp[res->id], v);
+	if (!scsame(m, s->tmp[res->id])) {
+		s->tmp[res->id] = m;
+		s->changed = true;
+	}
+}
+
+/* the bytes a load or store of the slot moves, or 0 for one that is not an integer's */
+static unsigned
+scaccess(int kind)
+{
+	switch (kind) {
+	case ILOADL: case ISTOREL: return 8;
+	case ILOADW: case ISTOREW: return 4;
+	case ILOADSH: case ILOADUH: case ISTOREH: return 2;
+	case ILOADSB: case ILOADUB: case ISTOREB: return 1;
+	}
+	return 0;
+}
+
+/* an integer instruction's result from constant operands (class w or l), or false */
+static bool
+scfold(int op, int class, unsigned long long a, unsigned long long b, unsigned long long *r)
+{
+	unsigned bytes = class == 'w' ? 4 : 8, bits = bytes * 8;
+	unsigned long long m = scmask(bytes);
+	long long sa = scsext(a, bytes), sb = scsext(b, bytes);
+	long long smin = bytes == 4 ? INT32_MIN : INT64_MIN;
+	bool w = op >= ICEQW && op <= ICUGTW;
+
+	if (op >= ICEQW && op <= ICUGTL) {   /* the operands' width is the comparison's, the result is 0 or 1 */
+		unsigned cb = w ? 4 : 8;
+		unsigned long long ua = a & scmask(cb), ub = b & scmask(cb);
+		long long xa = scsext(a, cb), xb = scsext(b, cb);
+
+		switch (w ? op : op - (ICEQL - ICEQW)) {
+		case ICEQW:  *r = ua == ub; break;
+		case ICNEW:  *r = ua != ub; break;
+		case ICSLEW: *r = xa <= xb; break;
+		case ICSLTW: *r = xa < xb; break;
+		case ICSGEW: *r = xa >= xb; break;
+		case ICSGTW: *r = xa > xb; break;
+		case ICULEW: *r = ua <= ub; break;
+		case ICULTW: *r = ua < ub; break;
+		case ICUGEW: *r = ua >= ub; break;
+		case ICUGTW: *r = ua > ub; break;
+		default: return false;
+		}
+		return true;
+	}
+	if (class != 'w' && class != 'l')
+		return false;
+	a &= m, b &= m;
+	switch (op) {
+	case IADD: *r = a + b; break;
+	case ISUB: *r = a - b; break;
+	case IMUL: *r = a * b; break;
+	case IAND: *r = a & b; break;
+	case IOR:  *r = a | b; break;
+	case IXOR: *r = a ^ b; break;
+	case INEG: *r = -a; break;
+	case ISHL: *r = a << (b & (bits - 1)); break;
+	case ISHR: *r = a >> (b & (bits - 1)); break;
+	case ISAR: *r = (unsigned long long)(sa >> (b & (bits - 1))); break;
+	case IUDIV: if (!b) return false; *r = a / b; break;
+	case IUREM: if (!b) return false; *r = a % b; break;
+	case IDIV: if (!b || (sb == -1 && sa == smin)) return false; *r = (unsigned long long)(sa / sb); break;
+	case IREM: if (!b || (sb == -1 && sa == smin)) return false; *r = (unsigned long long)(sa % sb); break;
+	case IEXTSW: *r = scsext(a, 4); break;
+	case IEXTUW: *r = a & scmask(4); break;
+	case IEXTSH: *r = scsext(a, 2); break;
+	case IEXTUH: *r = a & scmask(2); break;
+	case IEXTSB: *r = scsext(a, 1); break;
+	case IEXTUB: *r = a & scmask(1); break;
+	case ICOPY: *r = a; break;
+	default: return false;
+	}
+	*r &= m;
+	return true;
+}
+
+static struct scval
+scinst(struct sccp *s, struct inst *inst, struct scval *cur)
+{
+	unsigned bytes = scaccess(inst->kind);
+	unsigned long long m = scmask(inst->class == 'w' ? 4 : 8), r;
+	struct scval a, b;
+	int k;
+
+	if (bytes && inst->kind >= ILOADD && inst->kind <= ILOADUB) {
+		k = scslot(s, inst->arg[0]);
+		if (k < 0 || cur[k].kind == SCBOT)
+			return scbot;
+		if (cur[k].kind == SCTOP)
+			return cur[k];
+		if (cur[k].size != bytes)
+			return scbot;
+		r = cur[k].c;
+		if (inst->kind != ILOADUH && inst->kind != ILOADUB)
+			r = scsext(r, bytes);
+		return sccon(r & m);
+	}
+	if (inst->kind == IAND || inst->kind == IMUL || inst->kind == IOR) {
+		/* x & 0 and x * 0 are 0, x | ~0 is ~0, whatever x is */
+		a = scvalue(s, inst->arg[0]), b = scvalue(s, inst->arg[1]);
+		if (a.kind == SCCON && b.kind != SCCON)
+			b = a, a = scvalue(s, inst->arg[1]);
+		if (b.kind == SCCON && a.kind != SCCON && (inst->class == 'w' || inst->class == 'l')) {
+			if (inst->kind != IOR && (b.c & m) == 0)
+				return sccon(0);
+			if (inst->kind == IOR && (b.c & m) == m)
+				return sccon(m);
+		}
+	}
+	switch (inst->kind) {
+	case IADD: case ISUB: case IMUL: case IUDIV: case IUREM: case IDIV: case IREM:
+	case IOR: case IXOR: case IAND: case ISAR: case ISHR: case ISHL:
+	case INEG: case IEXTSW: case IEXTUW: case IEXTSH: case IEXTUH: case IEXTSB: case IEXTUB: case ICOPY:
+	case ICEQW: case ICNEW: case ICSLEW: case ICSLTW: case ICSGEW: case ICSGTW: case ICULEW: case ICULTW: case ICUGEW: case ICUGTW:
+	case ICEQL: case ICNEL: case ICSLEL: case ICSLTL: case ICSGEL: case ICSGTL: case ICULEL: case ICULTL: case ICUGEL: case ICUGTL:
+		a = scvalue(s, inst->arg[0]);
+		b = inst->arg[1] ? scvalue(s, inst->arg[1]) : sccon(0);
+		if (a.kind == SCBOT || b.kind == SCBOT)
+			return scbot;
+		if (a.kind == SCTOP || b.kind == SCTOP)
+			return (struct scval){SCTOP};
+		return scfold(inst->kind, inst->class, a.c, b.c, &r) ? sccon(r) : scbot;
+	}
+	return scbot;
+}
+
+/* the block from where it begins, with the slots in cur (updated): its temporaries, then the ways out */
+static void
+scblock(struct sccp *s, struct block *b, struct scval *cur)
+{
+	struct inst **ip, **end;
+	struct block *p, *succ;
+	struct scval v, c;
+	unsigned i, j, k;
+
+	if (b->phi.res.kind) {
+		v = (struct scval){SCTOP};
+		for (i = 0; i < 2; ++i) {
+			if (!(p = b->phi.blk[i]) || !s->exec[p->idx])
+				continue;
+			for (j = 0; j < 2; ++j)
+				if (s->edge[p->idx][j] && scsucc(p, j) == b)
+					v = scmeet(v, scvalue(s, b->phi.val[i]));
+		}
+		scset(s, &b->phi.res, v);
+	}
+	end = (struct inst **)((char *)b->insts.val + b->insts.len);
+	for (ip = b->insts.val; ip != end; ++ip) {
+		struct inst *inst = *ip;
+		unsigned bytes = scaccess(inst->kind);
+
+		if (inst->kind >= ISTORED && inst->kind <= ISTOREB) {
+			int sl = scslot(s, inst->arg[1]);
+
+			if (sl >= 0) {
+				v = bytes ? scvalue(s, inst->arg[0]) : scbot;
+				if (v.kind == SCCON)
+					v.c &= scmask(bytes);
+				v.size = bytes;
+				cur[sl] = v;
+			}
+			continue;
+		}
+		if (inst->res.kind == VALUE_TEMP)
+			scset(s, &inst->res, scinst(s, inst, cur));
+	}
+	c = b->jump.kind == JUMP_JNZ ? scvalue(s, b->jump.arg) : scbot;
+	for (i = 0; i < 2; ++i) {
+		if (!(succ = scsucc(b, i)))
+			continue;
+		if (b->jump.kind == JUMP_JNZ && (c.kind == SCTOP || (c.kind == SCCON && (c.c != 0) != (i == 0))))
+			continue;
+		if (!s->edge[b->idx][i])
+			s->edge[b->idx][i] = s->changed = true;
+		if (!s->exec[succ->idx]) {
+			s->exec[succ->idx] = s->changed = true;
+			memcpy(s->in + (size_t)succ->idx * s->nslot, cur, s->nslot * sizeof(*cur));
+			continue;
+		}
+		for (k = 0; k < s->nslot; ++k) {
+			struct scval *t = s->in + (size_t)succ->idx * s->nslot + k;
+
+			v = scmeet(*t, cur[k]);
+			if (!scsame(v, *t)) {
+				*t = v;
+				s->changed = true;
+			}
+		}
+	}
+}
+
+static void
+funcsccp(struct func *f)
+{
+	struct sccp s = {0};
+	struct block *b;
+	struct inst **ip, **end;
+	struct scval *cur;
+	struct value *v;
+	unsigned i, j, rounds;
+	bool ok = true;
+
+	if (!prune || !volatilecalls || asanon || f->ehobjs.len)
+		return;
+	s.ntmp = f->lastid + 1;
+	for (b = f->start; b; b = b->next)
+		b->idx = s.nblk++;
+	s.blk = xreallocarray(NULL, s.nblk, sizeof(*s.blk));
+	for (b = f->start; b; b = b->next)
+		s.blk[b->idx] = b;
+	s.slot = xreallocarray(NULL, s.ntmp, sizeof(*s.slot));
+	for (i = 0; i < s.ntmp; ++i)
+		s.slot[i] = -1;
+	/* the slots: the allocations, then those whose address is used other than as a load's or store's address go */
+	for (b = f->start; b; b = b->next) {
+		end = (struct inst **)((char *)b->insts.val + b->insts.len);
+		for (ip = b->insts.val; ip != end; ++ip) {
+			if ((*ip)->kind >= IALLOC4 && (*ip)->kind <= IALLOC16 && (*ip)->res.kind == VALUE_TEMP && (*ip)->res.id < s.ntmp)
+				s.slot[(*ip)->res.id] = 0;
+			if ((*ip)->kind == ICALL && (v = (*ip)->arg[0]) && (v->kind & 0xf) == VALUE_GLOBAL && v->u.name &&
+			    asansetjmpname(v->u.name))
+				ok = false;
+		}
+	}
+	for (b = f->start; b; b = b->next) {
+		end = (struct inst **)((char *)b->insts.val + b->insts.len);
+		for (ip = b->insts.val; ip != end; ++ip)
+			for (j = 0; j < 3; ++j) {
+				int kind = (*ip)->kind;
+
+				v = (*ip)->arg[j];
+				if (!v || v->kind != VALUE_TEMP || v->id >= s.ntmp || s.slot[v->id] < 0)
+					continue;
+				if ((j == 0 && kind >= ILOADD && kind <= ILOADUB) || (j == 1 && kind >= ISTORED && kind <= ISTOREB))
+					continue;
+				s.slot[v->id] = -2;
+			}
+		for (j = 0; j < 2; ++j)
+			if ((v = b->phi.val[j]) && b->phi.res.kind && v->kind == VALUE_TEMP && v->id < s.ntmp && s.slot[v->id] >= 0)
+				s.slot[v->id] = -2;
+		if ((b->jump.kind == JUMP_JNZ || b->jump.kind == JUMP_RET) && (v = b->jump.arg) && v->kind == VALUE_TEMP &&
+		    v->id < s.ntmp && s.slot[v->id] >= 0)
+			s.slot[v->id] = -2;
+	}
+	for (i = 0; i < s.ntmp; ++i)
+		s.slot[i] = s.slot[i] == 0 ? (int)s.nslot++ : -1;
+	if (!ok || (size_t)s.nblk * (s.nslot + 1) > 1u << 22)
+		goto out;
+	s.tmp = xreallocarray(NULL, s.ntmp, sizeof(*s.tmp));
+	for (i = 0; i < s.ntmp; ++i)
+		s.tmp[i] = (struct scval){SCTOP};
+	for (i = 0; i < f->type->u.func.nparam; ++i)
+		if (f->paramtemps[i].kind == VALUE_TEMP && f->paramtemps[i].id < s.ntmp)
+			s.tmp[f->paramtemps[i].id] = scbot;
+	s.in = xreallocarray(NULL, (size_t)s.nblk * s.nslot + 1, sizeof(*s.in));
+	s.exec = xmalloc(s.nblk);
+	memset(s.exec, 0, s.nblk);
+	s.edge = xreallocarray(NULL, s.nblk, sizeof(*s.edge));
+	memset(s.edge, 0, s.nblk * sizeof(*s.edge));
+	cur = xreallocarray(NULL, s.nslot + 1, sizeof(*cur));
+	s.exec[0] = true;
+	for (i = 0; i < s.nslot; ++i)
+		s.in[i] = scbot;   /* nothing is known of a slot where the function begins */
+	rounds = 0;
+	do {
+		s.changed = false;
+		for (b = f->start; b; b = b->next) {
+			if (!s.exec[b->idx])
+				continue;
+			memcpy(cur, s.in + (size_t)b->idx * s.nslot, s.nslot * sizeof(*cur));
+			scblock(&s, b, cur);
+		}
+	} while (s.changed && ++rounds < 1000);
+	if (s.changed)
+		ok = false;
+	/* a condition still undetermined where it can be reached: something here is not followed, change nothing */
+	for (b = f->start; b && ok; b = b->next)
+		if (s.exec[b->idx] && b->jump.kind == JUMP_JNZ && scvalue(&s, b->jump.arg).kind == SCTOP)
+			ok = false;
+	for (b = f->start; b && ok; b = b->next) {
+		struct scval c;
+		struct block *taken, *other;
+
+		if (!s.exec[b->idx] || b->jump.kind != JUMP_JNZ || (c = scvalue(&s, b->jump.arg)).kind != SCCON)
+			continue;
+		taken = b->jump.blk[c.c ? 0 : 1];
+		other = b->jump.blk[c.c ? 1 : 0];
+		if (other != taken && other->phi.res.kind)
+			for (j = 0; j < 2; ++j)
+				if (other->phi.blk[j] == b)
+					other->phi.blk[j] = NULL;   /* no longer a predecessor (emitfunc writes the others) */
+		b->jump.kind = JUMP_JMP;
+		b->jump.blk[0] = taken;
+		b->jump.blk[1] = NULL;
+		b->jump.arg = NULL;
+	}
+	/* a direct call of a static function with constant arguments may go to a clone of it (decl.c funcvalueclone) */
+	for (b = f->start; b && ok; b = b->next) {
+		if (!s.exec[b->idx])
+			continue;
+		end = (struct inst **)((char *)b->insts.val + b->insts.len);
+		for (ip = b->insts.val; ip != end; ++ip) {
+			struct inst **jp;
+			struct decl *d, *c;
+			bool isconst[16] = {0};
+			unsigned long long val[16];
+			unsigned n = 0, nconst = 0;
+
+			if ((*ip)->kind != ICALL || !(v = (*ip)->arg[0]) || (v->kind & 0xf) != VALUE_GLOBAL || !(d = v->decl) ||
+			    d->kind != DECLFUNC || d->linkage != LINKINTERN || !d->u.func.body)
+				continue;
+			for (jp = ip + 1; jp != end && (*jp)->kind == IARG && n < 16; ++jp, ++n) {
+				struct scval a = scvalue(&s, (*jp)->arg[0]);
+
+				if (a.kind == SCCON) {
+					isconst[n] = true;
+					val[n] = a.c;
+					++nconst;
+				}
+			}
+			if (!nconst || (jp != end && ((*jp)->kind == IARG || (*jp)->kind == IVARARG)))
+				continue;
+			if ((c = funcvalueclone(d, n, isconst, val, f->decl->section)))
+				(*ip)->arg[0] = c->value;
+		}
+	}
+	free(cur);
+out:
+	free(s.tmp);
+	free(s.slot);
+	free(s.blk);
+	free(s.in);
+	free(s.exec);
+	free(s.edge);
+}
+
+/* a global name the function references: a declaration at file scope (not a string, a block-scope static, cproc's own
+ * helpers or thunks, whose names differ from one compile of a body to the next) */
+static void
+funcref(struct array *out, struct value *v)
+{
+	char name[256], **n, *c;
+
+	if (!v || (v->kind & 0xf) != VALUE_GLOBAL || !v->decl || v->decl->linkage == LINKNONE)
+		return;
+	valuename(v, name, sizeof name);
+	arrayforeach(out, n)
+		if (strcmp(*n, name) == 0)
+			return;
+	c = xmalloc(strlen(name) + 1);
+	strcpy(c, name);
+	arrayaddptr(out, c);
+}
+
+/* the global names that the blocks reachable from the start reference, each once */
+static void
+funcrefs(struct func *f, struct array *out)
+{
+	struct array stack = {0};
+	struct block *b, *t;
+	struct inst **ip, **end;
+	struct value **r;
+	bool *seen;
+	unsigned n = 0, i, j;
+
+	for (b = f->start; b; b = b->next)
+		b->idx = n++;
+	seen = xmalloc(n);
+	memset(seen, 0, n);
+	seen[0] = true;
+	arrayaddptr(&stack, f->start);
+	while (stack.len) {
+		stack.len -= sizeof(b);
+		b = *(struct block **)((char *)stack.val + stack.len);
+		for (i = 0; i < 2; ++i)
+			if ((t = scsucc(b, i)) && !seen[t->idx]) {
+				seen[t->idx] = true;
+				arrayaddptr(&stack, t);
+			}
+	}
+	free(stack.val);
+	for (b = f->start; b; b = b->next) {
+		if (!seen[b->idx])
+			continue;
+		end = (struct inst **)((char *)b->insts.val + b->insts.len);
+		for (ip = b->insts.val; ip != end; ++ip)
+			for (j = 0; j < 3; ++j)
+				funcref(out, (*ip)->arg[j]);
+		if (b->phi.res.kind)
+			for (i = 0; i < 2; ++i)
+				if (b->phi.blk[i])
+					funcref(out, b->phi.val[i]);
+		if (b->jump.kind == JUMP_JNZ || b->jump.kind == JUMP_RET)
+			funcref(out, b->jump.arg);
+		arrayforeach(&b->asmrefs, r)
+			funcref(out, *r);
+	}
+	free(seen);
+}
+
+/* decl.c funcvalueclone: whether the clone f of orig references less than orig (a name orig's code reached, gone) */
+bool
+funcclonegain(struct func *f, struct decl *orig)
+{
+	struct array refs = {0};
+	char **o, **r, self[256];
+	bool gain = false, found;
+
+	funcsccp(f);
+	funcrefs(f, &refs);
+	valuename(orig->value, self, sizeof self);
+	arrayforeach(&orig->u.func.refs, o) {
+		if (strcmp(*o, self) == 0)   /* a recursive call: the clone's goes to the clone */
+			continue;
+		found = false;
+		arrayforeach(&refs, r)
+			if (strcmp(*o, *r) == 0) {
+				found = true;
+				break;
+			}
+		if (!found) {
+			gain = true;
+			break;
+		}
+	}
+	arrayforeach(&refs, r)
+		free(*r);
+	free(refs.val);
+	return gain;
+}
+
 void
 emitfunc(struct func *f, bool global)
 {
@@ -4627,6 +5169,10 @@ emitfunc(struct func *f, bool global)
 		asanfree(f);
 	if (asanon && f->asanlo)
 		asandynret(f);
+	funcsccp(f);
+	/* what a function with a recorded body references, for its clones (funcclonegain) */
+	if (prune && f->decl->u.func.body && !f->decl->u.func.refs.len)
+		funcrefs(f, &f->decl->u.func.refs);
 	/* GNU used and section (cproc -p keeps a "# nfcxx:keep" item even when nothing references it; a section alone
 	 * does not keep it) */
 	if (f->decl->used && prune)
@@ -4663,17 +5209,26 @@ emitfunc(struct func *f, bool global)
 		if (prune && !b->reach)
 			puts("# nfcxx:dead");
 		if (b->phi.res.kind) {
+			int i, n = 0;
+
 			putchar('\t');
 			emitvalue(&b->phi.res);
-			printf(" =%c phi ", b->phi.class);
-			emitname(&b->phi.blk[0]->label);
-			putchar(' ');
-			emitvalue(b->phi.val[0]);
-			fputs(", ", stdout);
-			emitname(&b->phi.blk[1]->label);
-			putchar(' ');
-			emitvalue(b->phi.val[1]);
-			putchar('\n');
+			/* funcsccp drops the entry of a way it found is not taken; with none left the block cannot be reached */
+			if (!b->phi.blk[0] && !b->phi.blk[1]) {
+				printf(" =%c copy 0\n", b->phi.class);
+			} else {
+				printf(" =%c phi ", b->phi.class);
+				for (i = 0; i < 2; ++i) {
+					if (!b->phi.blk[i])
+						continue;
+					if (n++)
+						fputs(", ", stdout);
+					emitname(&b->phi.blk[i]->label);
+					putchar(' ');
+					emitvalue(b->phi.val[i]);
+				}
+				putchar('\n');
+			}
 		}
 		instend = (struct inst **)((char *)b->insts.val + b->insts.len);
 		for (inst = b->insts.val; inst != instend;)

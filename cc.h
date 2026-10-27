@@ -262,6 +262,10 @@ struct decl {
 			struct array *body;
 			bool hasstatic, refused;
 			bool hasasm;   /* the body has inline asm (qbe.c funcasm1): a clone for an address argument is useful */
+			/* a static function's body recorded only for the clones of the calls whose arguments qbe.c funcsccp
+			 * finds constant (funcvalueclone), and the names its reachable code references (qbe.c funcrefs) */
+			bool vclone;
+			struct array refs;
 			/* the body is { return C; } with C an integer constant (stmt.c): a direct call whose arguments have no
 			 * side effects is C (expr.c), as gcc's inlined and folded call is */
 			bool constret;
@@ -661,6 +665,7 @@ struct value *mkintconst(unsigned long long);
 
 struct func *mkfunc(struct decl *, char *, struct type *, struct scope *);
 struct decl *funcclone(struct decl *, struct expr *);
+struct decl *funcvalueclone(struct decl *, unsigned, const bool *, const unsigned long long *, char *);
 void funcalloc(struct func *, struct decl *);   /* the storage of an automatic object */
 /* cproc -G, GNU cleanup semantics (qbe.c): the cleanup of a block-scope object runs when it leaves its scope */
 extern bool gnucleanup;
@@ -707,4 +712,5 @@ void emitsymattr(struct decl *);   /* a file-scope asm's text, to the side file 
 void funcinit(struct func *, struct decl *, struct init *, bool);
 
 void emitfunc(struct func *, bool);
+bool funcclonegain(struct func *, struct decl *);   /* funcvalueclone: the clone drops a reference of the function's */
 void emitdata(struct decl *, struct init *, struct func *);
