@@ -75,6 +75,7 @@ mktype(enum typekind kind, enum typeprop prop)
 	struct type *t;
 
 	t = xmalloc(sizeof(*t));
+	memset(t, 0, sizeof(*t));   /* the function's abi and the other unset fields read as NULL */
 	t->kind = kind;
 	t->prop = prop;
 	t->value = NULL;
