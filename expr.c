@@ -905,6 +905,9 @@ primaryexpr(struct scope *s)
 				e->type = &typefloat128;
 			else
 				error(&tok.loc, "invalid floating constant suffix '%s'", end);
+			/* a float literal is a float: round it (1e50f is HUGE_VALF, so INFINITY is not a finite double) */
+			if (e->type == &typefloat)
+				e->u.constant.f = (float)e->u.constant.f;
 			if (e->type == &typefloat128)
 				softliteral(e->u.constant.soft, tok.lit);
 #ifndef typeldouble
